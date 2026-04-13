@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: bash tools/search-workspace [options] <pattern>
+
+Search across the workspace repositories:
+  - opencti
+  - filigran-copilot
+
+Options:
+  -r, --repo <name>     Limit search to a repository. Repeatable.
+  -g, --glob <glob>     Filter files with an rg glob. Repeatable.
+  -t, --type <type>     Restrict to an rg file type. Repeatable.
+  -C, --context <n>     Show n lines of context around each match.
+  -i, --ignore-case     Force case-insensitive search.
+  -l, --files           List matching files only.
+  -w, --word-regexp     Match whole words only.
+  -h, --help            Show this help.
+EOF
+}
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+workspace_root="$(cd -- "${script_dir}/.." && pwd)"
+
+repo_path_for() {
+  case "$1" in
+    opencti)
+      printf '%s\n' "opencti"
+      ;;
+    filigran-copilot)
+      printf '%s\n' "filigran-copilot"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+selected_repos=()
+globs=()
+types=()
+rg_args=(--color never --line-number --column --smart-case)
+files_only=false
+
+while (($# > 0)); do
+  case "$1" in
+    -r|--repo)
+      shift
+      if (($# == 0)); then
+        echo "Missing repository name after --repo" >&2
+        exit 1
+      fi
+      if ! repo_path_for "$1" >/dev/null; then
+        echo "Unknown repository: $1" >&2
+        echo "Supported values: opencti, filigran-copilot" >&2
+        exit 1
+      fi
+      selected_repos+=("$1")
+      shift
+      ;;
+    -g|--glob)
+      shift
+      if (($# == 0)); then
+        echo "Missing glob after --glob" >&2
+        exit 1
+      fi
+      globs+=("$1")
+      shift
+      ;;
+    -t|--type)
+      shift
+      if (($# == 0)); then
+        echo "Missing type after --type" >&2
+        exit 1
+      fi
+      types+=("$1")
+      shift
+      ;;
+    -C|--context)
+      shift
+      if (($# == 0)); then
+        echo "Missing value after --context" >&2
+        exit 1
+      fi
+      rg_args+=(--context "$1")
+      shift
+      ;;
+    -i|--ignore-case)
+      rg_args+=(--ignore-case)
+      shift
+      ;;
+    -l|--files)
+      files_only=true
+      shift
+      ;;
+    -w|--word-regexp)
+      rg_args+=(--word-regexp)
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if (($# == 0)); then
+  usage >&2
+  exit 1
+fi
+
+pattern="$*"
+
+if ((${#selected_repos[@]} == 0)); then
+  selected_repos=(opencti filigran-copilot)
+fi
+
+if [[ "${files_only}" == true ]]; then
+  rg_args+=(-l)
+fi
+
+if ((${#globs[@]} > 0)); then
+  for glob in "${globs[@]}"; do
+    rg_args+=(--glob "$glob")
+  done
+fi
+
+if ((${#types[@]} > 0)); then
+  for type_name in "${types[@]}"; do
+    rg_args+=(--type "$type_name")
+  done
+fi
+
+search_paths=()
+for repo in "${selected_repos[@]}"; do
+  repo_path="$(repo_path_for "$repo")"
+  if [[ ! -d "${workspace_root}/${repo_path}" ]]; then
+    echo "Missing repository directory: ${workspace_root}/${repo_path}" >&2
+    exit 1
+  fi
+  search_paths+=("$repo_path")
+done
+
+cd "${workspace_root}"
+exec rg "${rg_args[@]}" -- "${pattern}" "${search_paths[@]}"

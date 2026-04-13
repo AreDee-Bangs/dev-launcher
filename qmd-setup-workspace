@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+workspace_root="$(cd -- "${script_dir}/.." && pwd)"
+
+require_qmd() {
+  if ! command -v qmd >/dev/null 2>&1; then
+    echo "qmd is not installed or not on PATH" >&2
+    exit 1
+  fi
+}
+
+path_exists() {
+  local path="$1"
+  [[ -e "${path}" ]]
+}
+
+collection_exists() {
+  local name="$1"
+  qmd collection list | rg -q "^${name} \\(qmd://"
+}
+
+context_exists() {
+  local path="$1"
+  qmd context list | rg -q "^${path}:"
+}
+
+add_collection_if_missing() {
+  local name="$1"
+  local path="$2"
+  local mask="$3"
+
+  if ! path_exists "${path}"; then
+    echo "Skipping collection '${name}': ${path} does not exist"
+    return
+  fi
+
+  if collection_exists "$name"; then
+    echo "Collection '${name}' already exists"
+    return
+  fi
+
+  echo "Adding collection '${name}' from ${path}"
+  qmd collection add "${path}" --name "${name}" --mask "${mask}"
+}
+
+add_context_if_missing() {
+  local path="$1"
+  local description="$2"
+  local collection_name="${path#qmd://}"
+  collection_name="${collection_name%/}"
+
+  if ! collection_exists "${collection_name}"; then
+    echo "Skipping context '${path}': collection does not exist"
+    return
+  fi
+
+  if context_exists "$path"; then
+    echo "Context '${path}' already exists"
+    return
+  fi
+
+  echo "Adding context for ${path}"
+  qmd context add "${path}" "${description}"
+}
+
+require_qmd
+
+code_mask="**/*.{py,ts,tsx,js,jsx,mjs,cjs,md,mdx,json,yml,yaml,graphql,gql,sql,sh,css,html}"
+docs_mask="**/*.{md,mdx,txt,json,yml,yaml}"
+openaev_mask="**/*.{java,ts,tsx,js,jsx,md,mdx,json,yml,yaml,sql,xml,properties,html,css,scss,sh}"
+
+add_collection_if_missing "docs" "${workspace_root}/docs" "${docs_mask}"
+add_collection_if_missing "opencti" "${workspace_root}/opencti" "${code_mask}"
+add_collection_if_missing "filigran-copilot" "${workspace_root}/filigran-copilot" "${code_mask}"
+add_collection_if_missing "openaev" "${workspace_root}/openaev" "${openaev_mask}"
+
+add_context_if_missing \
+  "qmd://docs/" \
+  "Workspace documentation: product notes, drafts, design documents, and reference materials."
+
+add_context_if_missing \
+  "qmd://opencti/" \
+  "OpenCTI codebase: GraphQL platform, frontend, workers, migrations, tests, and documentation."
+
+add_context_if_missing \
+  "qmd://filigran-copilot/" \
+  "Filigran Copilot codebase: FastAPI backend, worker flows, React frontend, integrations, and documentation."
+
+add_context_if_missing \
+  "qmd://openaev/" \
+  "OpenAEV codebase: Spring Boot backend, React frontend, database migrations, tenant-aware security, and product documentation."
+
+echo "Generating embeddings for any newly indexed files"
+qmd embed

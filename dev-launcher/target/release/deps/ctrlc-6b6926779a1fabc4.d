@@ -1,0 +1,11 @@
+/Users/rdelelis/Development/filigran/tools/dev-launcher/target/release/deps/ctrlc-6b6926779a1fabc4.d: /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/lib.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/error.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/platform/mod.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/platform/unix/mod.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/signal.rs
+
+/Users/rdelelis/Development/filigran/tools/dev-launcher/target/release/deps/libctrlc-6b6926779a1fabc4.rlib: /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/lib.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/error.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/platform/mod.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/platform/unix/mod.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/signal.rs
+
+/Users/rdelelis/Development/filigran/tools/dev-launcher/target/release/deps/libctrlc-6b6926779a1fabc4.rmeta: /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/lib.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/error.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/platform/mod.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/platform/unix/mod.rs /Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/signal.rs
+
+/Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/lib.rs:
+/Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/error.rs:
+/Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/platform/mod.rs:
+/Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/platform/unix/mod.rs:
+/Users/rdelelis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctrlc-3.5.2/src/signal.rs:

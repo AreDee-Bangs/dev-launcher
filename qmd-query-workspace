@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: bash tools/qmd-query-workspace [options] <query>
+
+Run the same QMD search against the workspace collections:
+  - docs
+  - filigran-copilot
+  - opencti
+  - openaev
+
+Options:
+  -m, --mode <mode>      One of: query, search, vsearch. Default: query
+  -n, --num <count>      Number of results per repository. Default: 5
+  -f, --format <format>  One of: md, json, files. Default: md
+  -h, --help             Show this help
+EOF
+}
+
+mode="query"
+count="5"
+format="md"
+
+while (($# > 0)); do
+  case "$1" in
+    -m|--mode)
+      shift
+      mode="${1:-}"
+      shift
+      ;;
+    -n|--num)
+      shift
+      count="${1:-}"
+      shift
+      ;;
+    -f|--format)
+      shift
+      format="${1:-}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if (($# == 0)); then
+  usage >&2
+  exit 1
+fi
+
+case "${mode}" in
+  query|search|vsearch)
+    ;;
+  *)
+    echo "Unsupported mode: ${mode}" >&2
+    exit 1
+    ;;
+esac
+
+case "${format}" in
+  md|json|files)
+    ;;
+  *)
+    echo "Unsupported format: ${format}" >&2
+    exit 1
+    ;;
+esac
+
+query_text="$*"
+format_flag="--${format}"
+
+collection_exists() {
+  local name="$1"
+  qmd collection list | rg -q "^${name} \\(qmd://"
+}
+
+for collection in docs filigran-copilot opencti openaev; do
+  if ! collection_exists "${collection}"; then
+    continue
+  fi
+
+  printf '## %s\n' "${collection}"
+  qmd "${mode}" "${query_text}" -c "${collection}" -n "${count}" "${format_flag}" || true
+  printf '\n'
+done
