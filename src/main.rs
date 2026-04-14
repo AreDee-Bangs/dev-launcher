@@ -34,6 +34,40 @@ const YLW:  &str = "\x1b[33m";
 const RED:  &str = "\x1b[31m";
 const CYN:  &str = "\x1b[36m";
 
+// ── Finding kinds ─────────────────────────────────────────────────────────────
+// Each finding has a stable kind string so the recipe catalog (RECIPE_CATALOG)
+// can declare whether a fix is implemented.  Kinds starting with "info/" are
+// purely informational and never trigger the "report missing recipe" prompt.
+
+const _KIND_INFO:             &str = "info/generic";  // baseline kind; specific variants below
+const KIND_INFO_LOG_TAIL:     &str = "info/log-tail";
+const KIND_INFO_LOG_PATTERNS: &str = "info/log-patterns";
+const KIND_INFO_NO_ISSUES:    &str = "info/no-issues";
+const KIND_INFO_BOOTSTRAP_CHECK: &str = "info/bootstrap-check";
+
+const KIND_PYTHON_VENV:       &str = "python-venv-missing";
+const KIND_NODE_MODULES:      &str = "node-modules-missing";
+const KIND_ENV_PLACEHOLDER:   &str = "env-placeholder-credentials";
+const KIND_BOOTSTRAP_RUN:     &str = "bootstrap-command-needed";
+const KIND_DEGRADED_UNKNOWN:  &str = "service-degraded-unknown";
+
+/// Kinds that have a known, implemented recipe in this binary.
+/// A finding whose kind is NOT in this list (and is not an info/ kind) will
+/// offer the user a shortcut to file a GitHub issue requesting the recipe.
+const RECIPE_CATALOG: &[&str] = &[
+    KIND_PYTHON_VENV,
+    KIND_NODE_MODULES,
+    KIND_ENV_PLACEHOLDER,
+    KIND_BOOTSTRAP_RUN,
+];
+
+/// Returns true when the finding represents an issue with no implemented recipe,
+/// meaning the user should be prompted to report it.
+fn needs_recipe(f: &Finding) -> bool {
+    if f.kind.starts_with("info/") { return false; }
+    !RECIPE_CATALOG.contains(&f.kind)
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -845,6 +879,7 @@ enum InputEvent {
     Follow,      // f — toggle live-follow in log view
     Credentials, // e — show .env credentials overlay
     Diagnose,    // d — run on-demand service diagnosis from log view
+    Report,      // r — report missing recipe (Diagnose mode only)
 }
 
 fn spawn_input_thread(tx: mpsc::SyncSender<InputEvent>, stopping: Arc<AtomicBool>) {
@@ -877,6 +912,8 @@ fn spawn_input_thread(tx: mpsc::SyncSender<InputEvent>, stopping: Arc<AtomicBool
                 [b'e'] => Some(InputEvent::Credentials),
                 // d — run on-demand diagnosis
                 [b'd'] => Some(InputEvent::Diagnose),
+                // r — report missing recipe (Diagnose mode)
+                [b'r'] => Some(InputEvent::Report),
                 _ => None,
             };
             if let Some(e) = event {
@@ -1050,6 +1087,7 @@ impl FixAction {
 /// A single diagnosed issue, optionally with a runnable fix.
 #[derive(Clone)]
 struct Finding {
+    kind:     &'static str,
     title:    String,
     body:     Vec<String>,
     fix:      Option<FixAction>,
@@ -1057,11 +1095,11 @@ struct Finding {
 }
 
 impl Finding {
-    fn info(title: impl Into<String>, body: Vec<String>) -> Self {
-        Self { title: title.into(), body, fix: None, resolved: false }
+    fn info(kind: &'static str, title: impl Into<String>, body: Vec<String>) -> Self {
+        Self { kind, title: title.into(), body, fix: None, resolved: false }
     }
-    fn fixable(title: impl Into<String>, body: Vec<String>, fix: FixAction) -> Self {
-        Self { title: title.into(), body, fix: Some(fix), resolved: false }
+    fn fixable(kind: &'static str, title: impl Into<String>, body: Vec<String>, fix: FixAction) -> Self {
+        Self { kind, title: title.into(), body, fix: Some(fix), resolved: false }
     }
 }
 
@@ -1087,6 +1125,40 @@ fn run_fix_action(action: &FixAction) {
         FixAction::EnvWizard { env_path, vars, product } => {
             run_env_wizard(env_path, vars, product);
         }
+    }
+}
+
+/// Open a GitHub issue on the dev-launcher repo requesting a new recipe for the
+/// given finding.  Returns the issue URL on success or an error string.
+fn create_github_issue(kind: &str, svc_name: &str, title: &str, body_lines: &[String]) -> Result<String, String> {
+    let issue_title = format!("recipe needed: {} ({})", title, kind);
+    let issue_body  = format!(
+        "## Missing fix recipe\n\n\
+         A finding was encountered that has no automated fix yet.\n\n\
+         | Field   | Value |\n\
+         |---------|-------|\n\
+         | **Kind**    | `{kind}` |\n\
+         | **Service** | `{svc_name}` |\n\
+         | **Finding** | {title} |\n\n\
+         ### Details\n\
+         ```\n{details}\n```\n\n\
+         Please implement a recipe (fix action) for this kind in `diagnose_service`.",
+        details = body_lines.join("\n"),
+    );
+
+    let out = Command::new("gh")
+        .args(["issue", "create",
+               "--repo",  "AreDee-Bangs/dev-launcher",
+               "--title", &issue_title,
+               "--body",  &issue_body,
+               "--label", "recipe-needed"])
+        .output()
+        .map_err(|e| format!("gh not found: {e}"))?;
+
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
 
@@ -1163,10 +1235,20 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
             None
         };
 
-        findings.push(if let Some(f) = fix {
-            Finding::fixable("Service did not start", body, f)
+        let kind = if fix.is_some() {
+            // Resolve kind from the matched fix type so RECIPE_CATALOG is accurate.
+            if msg.contains("venv") || msg.contains(".venv")                         { KIND_PYTHON_VENV }
+            else if msg.contains("node_modules")                                     { KIND_NODE_MODULES }
+            else if msg.contains("APP__ADMIN__PASSWORD") || msg.contains("credentials")
+                 || msg.contains("OPENCTI_TOKEN")                                    { KIND_ENV_PLACEHOLDER }
+            else                                                                     { KIND_DEGRADED_UNKNOWN }
         } else {
-            Finding::info("Service did not start", body)
+            KIND_DEGRADED_UNKNOWN
+        };
+        findings.push(if let Some(f) = fix {
+            Finding::fixable(kind, "Service did not start", body, f)
+        } else {
+            Finding::info(kind, "Service did not start", body)
         });
     }
 
@@ -1185,7 +1267,7 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
             }
         }
         if !matched.is_empty() {
-            findings.push(Finding::info("Log patterns detected", matched));
+            findings.push(Finding::info(KIND_INFO_LOG_PATTERNS, "Log patterns detected", matched));
         }
     }
 
@@ -1213,6 +1295,7 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
             .collect();
         if !bad_keys.is_empty() {
             findings.push(Finding::fixable(
+                KIND_ENV_PLACEHOLDER,
                 format!("Placeholder credentials in {}", ec.label),
                 bad_keys,
                 FixAction::EnvWizard { env_path: ec.path.clone(), vars: ec.vars, product: ec.product },
@@ -1230,6 +1313,7 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
         let venv_python = backend_dir.join(".venv/bin/python");
         if !venv_python.exists() {
             findings.push(Finding::fixable(
+                KIND_PYTHON_VENV,
                 "Python virtual environment missing",
                 vec![format!("  Expected: {}", venv_python.display())],
                 FixAction::Steps {
@@ -1246,6 +1330,7 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
         for fe_dir in &fe_candidates {
             if fe_dir.is_dir() && !fe_dir.join("node_modules").is_dir() {
                 findings.push(Finding::fixable(
+                    KIND_NODE_MODULES,
                     "JavaScript dependencies not installed",
                     vec![format!("  node_modules missing in {}", fe_dir.display())],
                     FixAction::Steps {
@@ -1266,6 +1351,7 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
                 BootstrapDef::Check { path, missing_hint } => {
                     if !repo_dir.join(path).exists() {
                         findings.push(Finding::info(
+                            KIND_INFO_BOOTSTRAP_CHECK,
                             "Bootstrap check failed",
                             vec![format!("  {missing_hint}")],
                         ));
@@ -1280,6 +1366,7 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
                             let mut all_args = vec![prog.as_str()];
                             all_args.extend(args.iter().map(|s| s.as_str()));
                             findings.push(Finding::fixable(
+                                KIND_BOOTSTRAP_RUN,
                                 format!("Bootstrap step needed: {}", prog),
                                 vec![format!("  Triggers when {} is missing", check)],
                                 FixAction::Steps {
@@ -1298,11 +1385,12 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
     let tail = tail_file(&svc.log_path, 20);
     if !tail.is_empty() {
         let body = tail.iter().map(|l| format!("  {DIM}{l}{R}")).collect();
-        findings.push(Finding::info("Recent log output", body));
+        findings.push(Finding::info(KIND_INFO_LOG_TAIL, "Recent log output", body));
     }
 
     if findings.is_empty() {
         findings.push(Finding::info(
+            KIND_INFO_NO_ISSUES,
             "No issues detected",
             vec![
                 "  Service appears healthy.".into(),
@@ -1354,6 +1442,8 @@ fn render_diagnose(svc: &Svc, findings: &[Finding], cursor: usize) {
             } else {
                 lines.push(format!("       {CYN}→ Enter to run:{R}  {}", fix.label()));
             }
+        } else if needs_recipe(f) {
+            lines.push(format!("       {DIM}no recipe yet — press r to report{R}"));
         }
         lines.push(String::new());
     }
@@ -1381,9 +1471,14 @@ fn render_diagnose(svc: &Svc, findings: &[Finding], cursor: usize) {
 
     // ── Footer ────────────────────────────────────────────────────────────────
     println!("  {DIM}{sep}{R}");
-    let fixable_count = findings.iter().filter(|f| f.fix.is_some() && !f.resolved).count();
-    if fixable_count > 0 {
+    let fixable_count  = findings.iter().filter(|f| f.fix.is_some() && !f.resolved).count();
+    let cursor_reportable = findings.get(cursor).map(|f| needs_recipe(f)).unwrap_or(false);
+    if fixable_count > 0 && cursor_reportable {
+        println!("  {DIM}↑↓ navigate   Enter run fix   r report   q / ← back{R}   {YLW}{fixable_count} fix(es) available{R}");
+    } else if fixable_count > 0 {
         println!("  {DIM}↑↓ navigate   Enter run fix   q / ← back{R}   {YLW}{fixable_count} fix(es) available{R}");
+    } else if cursor_reportable {
+        println!("  {DIM}↑↓ navigate   r report missing recipe   q / ← back{R}");
     } else {
         println!("  {DIM}↑↓ navigate   q / ← back{R}");
     }
@@ -4408,6 +4503,60 @@ fn main() {
                                     cursor:   cur.min(findings.len().saturating_sub(1)),
                                 };
                                 force_render = true;
+                            }
+                        }
+                        InputEvent::Report => {
+                            let idx = *svc_idx;
+                            let cur = *cursor;
+                            let finding = findings.get(cur).cloned();
+                            if let Some(f) = finding {
+                                if needs_recipe(&f) {
+                                    let svc_name = {
+                                        let svcs = state.lock().unwrap();
+                                        svcs.get(idx).map(|s| s.name.clone()).unwrap_or_default()
+                                    };
+                                    drop(raw_mode.take());
+                                    print!("\x1b[H\x1b[2J");
+                                    let _ = io::stdout().flush();
+                                    println!("\n  {BOLD}Report missing recipe{R}");
+                                    println!();
+                                    println!("  Service : {CYN}{svc_name}{R}");
+                                    println!("  Finding : {}", f.title);
+                                    println!("  Kind    : {DIM}{}{R}", f.kind);
+                                    println!();
+                                    println!("  This will open an issue at AreDee-Bangs/dev-launcher");
+                                    println!("  so the recipe can be implemented.");
+                                    println!();
+                                    print!("  Press Enter to create the issue, or q to cancel: ");
+                                    let _ = io::stdout().flush();
+                                    let mut line = String::new();
+                                    let _ = io::stdin().read_line(&mut line);
+                                    if line.trim() != "q" && !line.trim().starts_with('q') {
+                                        match create_github_issue(f.kind, &svc_name, &f.title, &f.body) {
+                                            Ok(url)  => println!("\n  {GRN}✓{R}  Issue created: {url}"),
+                                            Err(err) => println!("\n  {RED}✗{R}  Failed: {err}"),
+                                        }
+                                    } else {
+                                        println!("  Cancelled.");
+                                    }
+                                    println!();
+                                    print!("  Press any key to return to diagnosis…");
+                                    let _ = io::stdout().flush();
+                                    let mut _b = [0u8; 1];
+                                    unsafe { libc::read(libc::STDIN_FILENO, _b.as_mut_ptr() as *mut libc::c_void, 1) };
+                                    raw_mode = RawMode::enter();
+                                    let new_findings = {
+                                        let svcs = state.lock().unwrap();
+                                        svcs.get(idx).map(|svc| diagnose_service(svc, &paths))
+                                            .unwrap_or_default()
+                                    };
+                                    mode = Mode::Diagnose {
+                                        svc_idx:  idx,
+                                        findings: new_findings,
+                                        cursor:   cur.min(findings.len().saturating_sub(1)),
+                                    };
+                                    force_render = true;
+                                }
                             }
                         }
                         _ => {}
