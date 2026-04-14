@@ -764,24 +764,49 @@ fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_dir:
     println!();
 
     // ── 3. Docker compose down ─────────────────────────────────────────────────
+    let ws_hash = config.hash.as_str();
     for entry in &config.entries {
         if !entry.enabled || entry.branch.is_empty() { continue; }
         if entry.repo == "connectors" { continue; } // shares OpenCTI docker
+
         let slug = branch_to_slug(&entry.branch);
         let wt   = workspace_root.join(format!("{}-{}", entry.repo, slug));
-        let dir  = if wt.is_dir() { &wt } else { &workspace_root.join(&entry.repo) };
-        if let Some((project, compose_file)) = resolve_product_docker_for_down(&entry.repo, dir) {
-            if compose_file.exists() {
-                println!("  Stopping {} Docker containers…", entry.repo);
-                let file_str = compose_file.to_str().unwrap_or("");
-                let code = run_blocking("docker", &["compose", "-p", &project, "-f", file_str, "down"], dir);
-                if code == 0 {
-                    println!("  {GRN}✓{R}  {} containers stopped", entry.repo);
-                } else {
-                    println!("  {YLW}⚠{R}  {} docker down returned {code} (may already be stopped)", entry.repo);
-                }
-            }
+        let dir_buf = if wt.is_dir() { wt.clone() } else { workspace_root.join(&entry.repo) };
+        let dir  = dir_buf.as_path();
+
+        let Some((ws_project, base_project, compose_file)) =
+            resolve_product_docker_for_down(&entry.repo, dir, ws_hash) else { continue };
+
+        if !compose_file.exists() { continue; }
+        let file_str = compose_file.to_str().unwrap_or("");
+
+        println!("  Stopping {} Docker containers…", entry.repo);
+
+        // (a) Try to bring down the workspace-scoped project (containers named
+        //     with the ws-hash suffix — the new scheme).
+        let ws_override = write_compose_override(&compose_file, ws_hash);
+        let mut argv_ws: Vec<&str> = vec!["compose", "-p", &ws_project, "-f", file_str];
+        let ov_str: String;
+        if let Some(ref ov) = ws_override {
+            ov_str = ov.to_string_lossy().into_owned();
+            argv_ws.extend_from_slice(&["-f", &ov_str]);
         }
+        argv_ws.push("down");
+        let _ = run_blocking("docker", &argv_ws, dir);
+
+        // (b) Also bring down the base project name (containers without suffix —
+        //     the old scheme, or containers started by ./dev.sh / docker compose
+        //     directly).
+        let _ = run_blocking("docker",
+            &["compose", "-p", &base_project, "-f", file_str, "down"], dir);
+
+        // (c) Straggler sweep: force-remove any remaining containers whose name
+        //     still contains the product prefix (catches containers with explicit
+        //     `container_name:` that slipped through both compose-down calls).
+        let container_prefix = base_project.split('-').next().unwrap_or(&base_project);
+        docker_kill_by_name_fragment(container_prefix);
+
+        println!("  {GRN}✓{R}  {} containers stopped", entry.repo);
     }
 
     // ── 4. Worktree removal ────────────────────────────────────────────────────
@@ -1694,6 +1719,94 @@ fn parse_compose_project_name(compose_file: &Path) -> Option<String> {
     None
 }
 
+/// Build a workspace-scoped Docker project name: `{base}-{ws_hash[..8]}`.
+/// This ensures each workspace gets its own isolated set of containers even
+/// when the compose file has hardcoded `container_name:` directives.
+fn ws_docker_project(base: &str, ws_hash: &str) -> String {
+    format!("{}-{}", base, &ws_hash[..8.min(ws_hash.len())])
+}
+
+/// Parse a docker-compose file and return `(service_name, container_name)` pairs
+/// for every service that has an explicit `container_name:` directive.
+fn parse_compose_container_names(compose_file: &Path) -> Vec<(String, String)> {
+    let content = match fs::read_to_string(compose_file) {
+        Ok(c) => c, Err(_) => return Vec::new(),
+    };
+    let mut result    = Vec::new();
+    let mut in_svcs   = false;
+    let mut cur_svc   = String::new();
+
+    for line in content.lines() {
+        // Top-level `services:` section marker.
+        if line == "services:" { in_svcs = true; continue; }
+        if !in_svcs { continue; }
+
+        // A line at exactly 2-space indent that ends with `:` and has no spaces
+        // in the name is a service declaration.
+        if let Some(rest) = line.strip_prefix("  ") {
+            if !rest.starts_with(' ') && !rest.starts_with('#') {
+                if let Some(svc) = rest.strip_suffix(':') {
+                    if !svc.is_empty() && !svc.contains(' ') {
+                        cur_svc = svc.to_string();
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // `container_name:` at 4-space indent inside a service block.
+        if !cur_svc.is_empty() {
+            if let Some(rest) = line.strip_prefix("    container_name:") {
+                let cn = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+                if !cn.is_empty() {
+                    result.push((cur_svc.clone(), cn));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Write a compose override file to `/tmp` that appends `{ws_hash[..8]}` to every
+/// explicit `container_name:` in the given compose file.
+///
+/// Returns `None` if the compose file has no explicit container names (no override
+/// needed in that case — Docker Compose auto-names already include the project name).
+fn write_compose_override(compose_file: &Path, ws_hash: &str) -> Option<PathBuf> {
+    let mappings = parse_compose_container_names(compose_file);
+    if mappings.is_empty() { return None; }
+
+    let suffix   = &ws_hash[..8.min(ws_hash.len())];
+    let out_path = PathBuf::from(format!("/tmp/dev-feature-override-{suffix}.yml"));
+
+    let mut lines = vec!["services:".to_string()];
+    for (svc, cn) in &mappings {
+        lines.push(format!("  {}:", svc));
+        lines.push(format!("    container_name: {cn}-{suffix}"));
+    }
+    fs::write(&out_path, lines.join("\n") + "\n").ok()?;
+    Some(out_path)
+}
+
+/// Stop and remove any containers whose name contains `name_fragment`, regardless
+/// of which compose project they belong to.  Used as a straggler sweep after
+/// `docker compose down` to catch containers started outside dev-feature.
+fn docker_kill_by_name_fragment(name_fragment: &str) {
+    let out = Command::new("docker")
+        .args(["ps", "-a", "-q", "--filter", &format!("name={name_fragment}")])
+        .stdin(Stdio::null()).stderr(Stdio::null()).output();
+    let ids: Vec<String> = out.ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).collect())
+        .unwrap_or_default();
+    for id in &ids {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", id])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn split_health_url_parts(full: Option<&str>) -> (Option<String>, String) {
     match full {
         None => (None, String::new()),
@@ -2008,39 +2121,61 @@ fn load_repo_manifest(repo_dir: &Path, repo_name: &str) -> RepoManifest {
     manifest
 }
 
-fn resolve_docker_project(repo_dir: &Path, manifest: &RepoManifest) -> String {
+/// Derive the base Docker project name for a repo (without workspace suffix).
+fn resolve_docker_project_base(repo_dir: &Path, manifest: &RepoManifest) -> String {
     if let Some(p) = &manifest.docker.project { return p.clone(); }
     let compose_file = manifest.docker.compose_dev.as_deref().unwrap_or("docker-compose.dev.yml");
     if let Some(name) = parse_compose_project_name(&repo_dir.join(compose_file)) { return name; }
     repo_dir.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}-dev")).unwrap_or_else(|| "dev".to_string())
 }
 
-/// Resolve the docker project name and compose file path for a product during
-/// workspace *removal* — read-only, never auto-generates `.dev-launcher.conf`.
+/// Full workspace-scoped Docker project name: `{base}-{ws_hash[..8]}`.
+fn resolve_docker_project(repo_dir: &Path, manifest: &RepoManifest, ws_hash: &str) -> String {
+    ws_docker_project(&resolve_docker_project_base(repo_dir, manifest), ws_hash)
+}
+
+/// Resolve the workspace-scoped docker project name and compose file path for a
+/// product during workspace *removal* — read-only, never auto-generates config.
 ///
-/// Returns `None` when the product has no independent docker compose file
-/// (e.g. `connectors` shares OpenCTI docker) or the compose file doesn't exist.
-fn resolve_product_docker_for_down(repo: &str, repo_dir: &Path) -> Option<(String, PathBuf)> {
-    // Connector shares OpenCTI docker — caller skips it; return None explicitly.
+/// Returns `(ws_project, base_project, compose_file)` so the caller can run
+/// `compose down` with the workspace-scoped name and fall back to the base name
+/// for containers that predate the workspace-isolation change.
+///
+/// Returns `None` when the product shares another product's docker (connectors).
+fn resolve_product_docker_for_down(
+    repo:     &str,
+    repo_dir: &Path,
+    ws_hash:  &str,
+) -> Option<(String, String, PathBuf)> {
+    // Connector shares OpenCTI docker — caller handles it separately.
     if repo == "connectors" { return None; }
 
-    // OpenCTI: hardcoded compose location (not in a standard docker-compose.dev.yml).
+    // OpenCTI: hardcoded compose location.
     if repo == "opencti" {
-        let compose = repo_dir.join("opencti-platform/opencti-dev/docker-compose.yml");
-        return Some(("opencti-dev".to_string(), compose));
+        let compose  = repo_dir.join("opencti-platform/opencti-dev/docker-compose.yml");
+        let base     = "opencti-dev".to_string();
+        let ws_proj  = ws_docker_project(&base, ws_hash);
+        return Some((ws_proj, base, compose));
     }
 
-    // All other repos: try .dev-launcher.conf (parse-only, no auto-generate),
-    // then fall back to docker-compose.dev.yml for the project name.
+    // OpenAEV: compose lives under openaev-dev/
+    if repo == "openaev" {
+        let dev_dir  = repo_dir.join("openaev-dev");
+        let compose  = dev_dir.join("docker-compose.yml");
+        let conf     = parse_dev_launcher_conf(&repo_dir.join(".dev-launcher.conf")).unwrap_or_default();
+        let base     = conf.docker.project.unwrap_or_else(|| "openaev-dev".to_string());
+        let ws_proj  = ws_docker_project(&base, ws_hash);
+        return Some((ws_proj, base, compose));
+    }
+
+    // All other repos (copilot, etc.): try .dev-launcher.conf then docker-compose.dev.yml.
     let conf_path = repo_dir.join(".dev-launcher.conf");
     let manifest  = parse_dev_launcher_conf(&conf_path).unwrap_or_default();
 
-    let compose_name = manifest.docker.compose_dev.as_deref()
-        .unwrap_or("docker-compose.dev.yml");
+    let compose_name = manifest.docker.compose_dev.as_deref().unwrap_or("docker-compose.dev.yml");
     let compose_file = repo_dir.join(compose_name);
 
-    // Derive project name with the same priority chain as startup.
-    let project = if let Some(p) = manifest.docker.project {
+    let base = if let Some(p) = manifest.docker.project {
         p
     } else if let Some(name) = parse_compose_project_name(&compose_file) {
         name
@@ -2051,7 +2186,8 @@ fn resolve_product_docker_for_down(repo: &str, repo_dir: &Path) -> Option<(Strin
             .unwrap_or_else(|| "dev".to_string())
     };
 
-    Some((project, compose_file))
+    let ws_proj = ws_docker_project(&base, ws_hash);
+    Some((ws_proj, base, compose_file))
 }
 
 fn run_manifest_bootstrap(repo_dir: &Path, manifest: &RepoManifest) -> bool {
@@ -2153,24 +2289,18 @@ fn docker_compose_up(label: &str, project: &str, compose_file: &Path, work_dir: 
         }
         true
     } else {
-        // Compose can fail when containers with explicit `container_name` already
-        // exist from a previous session started under a different project name
-        // (e.g. via `./dev.sh` before `name:` was added to the compose file).
-        // Check whether the containers are actually up via a broad name-prefix
-        // filter before treating this as a hard failure.
-        let prefix = project.split('-').next().unwrap_or(project);
-        let already_up = Command::new("docker")
-            .args(["ps", "-q", "--filter", &format!("name={}", prefix)])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
+        // Compose can fail when containers with explicit `container_name` directives
+        // already exist under a different project label (e.g. from `./dev.sh`, or
+        // from a session before workspace-scoped naming was introduced).
+        // Check via the Docker project label — exact project name — before failing hard.
+        let label_already_up = Command::new("docker")
+            .args(["ps", "-q", "--filter", &format!("label=com.docker.compose.project={project}")])
+            .stdin(Stdio::null()).stderr(Stdio::null()).output()
+            .ok().and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or(0);
-        if already_up > 0 {
-            println!("  {YLW}⚠{R}  {label} docker deps: {already_up} container(s) already running from a previous session — proceeding");
-            println!("  {DIM}  Tip: run `docker compose down` in the repo directory to clean up old containers{R}");
+        if label_already_up > 0 {
+            println!("  {GRN}✓{R}  {label} docker deps already up ({label_already_up} containers)");
             return true;
         }
         println!("  {RED}✗{R}  {label} docker deps failed (exit {code}) — services depending on them will degrade");
@@ -3942,12 +4072,12 @@ fn main() {
     ensure_corepack();
 
     // ── Docker deps (blocking) ────────────────────────────────────────────────
-    // Pass an explicit `-p` project name so every run — main branch or any feature
-    // worktree — maps to the same Docker project.  Without this, docker compose
-    // derives the project name from the working directory, so stopped containers
-    // from a different worktree run produce "container name already in use" errors.
+    // Each workspace gets its own Docker project name (`{base}-{ws_hash[..8]}`).
+    // A compose override file is generated in /tmp that renames explicit
+    // `container_name:` directives with the same suffix, giving full container
+    // isolation between workspaces even when the compose files use hardcoded names.
     //
-    // docker_compose_up() is idempotent: already-running containers are left alone,
+    // docker_compose_up() is idempotent: running containers are left alone,
     // stopped containers are restarted, missing ones are created.
     print!("  Checking Docker… ");
     let _ = io::stdout().flush();
@@ -3972,23 +4102,32 @@ fn main() {
 
     if docker_ok {
         if !no_copilot && paths.copilot.is_dir() {
-            let (project, dc) = if let Some(ref m) = copilot_manifest {
-                (resolve_docker_project(&paths.copilot, m),
-                 paths.copilot.join(m.docker.compose_dev.as_deref().unwrap_or("docker-compose.dev.yml")))
+            let (dc, project) = if let Some(ref m) = copilot_manifest {
+                let f = paths.copilot.join(m.docker.compose_dev.as_deref().unwrap_or("docker-compose.dev.yml"));
+                (f, resolve_docker_project(&paths.copilot, m, &slug))
             } else {
-                ("copilot-dev".to_string(), paths.copilot.join("docker-compose.dev.yml"))
+                let f = paths.copilot.join("docker-compose.dev.yml");
+                (f, ws_docker_project("copilot-dev", &slug))
             };
             if dc.exists() {
-                copilot_docker_ok = docker_compose_up("Copilot", &project, &dc, &paths.copilot, &[]);
+                // Generate a per-workspace override that renames containers.
+                let ov      = write_compose_override(&dc, &slug);
+                let ov_str  = ov.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let extra: Vec<&str> = if ov.is_some() { vec!["-f", &ov_str] } else { vec![] };
+                copilot_docker_ok = docker_compose_up("Copilot", &project, &dc, &paths.copilot, &extra);
             }
         }
         if !no_opencti && paths.opencti.is_dir() {
             let dc = paths.opencti.join("opencti-platform/opencti-dev/docker-compose.yml");
             if dc.exists() {
-                let project = opencti_manifest.as_ref()
+                let base = opencti_manifest.as_ref()
                     .and_then(|m| m.docker.project.clone())
                     .unwrap_or_else(|| "opencti-dev".to_string());
-                opencti_docker_ok = docker_compose_up("OpenCTI", &project, &dc, &paths.opencti, &[]);
+                let project = ws_docker_project(&base, &slug);
+                let ov      = write_compose_override(&dc, &slug);
+                let ov_str  = ov.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let extra: Vec<&str> = if ov.is_some() { vec!["-f", &ov_str] } else { vec![] };
+                opencti_docker_ok = docker_compose_up("OpenCTI", &project, &dc, &paths.opencti, &extra);
             }
         }
         if !no_openaev && paths.openaev.is_dir() {
@@ -3997,11 +4136,15 @@ fn main() {
             if dc.exists() {
                 ensure_openaev_dev_env(&dev_dir);
                 let env_file = dev_dir.join(".env").to_string_lossy().into_owned();
-                let project = openaev_manifest.as_ref()
+                let base = openaev_manifest.as_ref()
                     .and_then(|m| m.docker.project.clone())
                     .unwrap_or_else(|| "openaev-dev".to_string());
-                openaev_docker_ok = docker_compose_up("OpenAEV", &project, &dc, &dev_dir,
-                    &["--env-file", &env_file]);
+                let project = ws_docker_project(&base, &slug);
+                let ov      = write_compose_override(&dc, &slug);
+                let ov_str  = ov.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let mut extra: Vec<&str> = vec!["--env-file", &env_file];
+                if ov.is_some() { extra.extend_from_slice(&["-f", &ov_str]); }
+                openaev_docker_ok = docker_compose_up("OpenAEV", &project, &dc, &dev_dir, &extra);
             }
         }
     } else {
