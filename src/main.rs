@@ -39,7 +39,7 @@ const CYN:  &str = "\x1b[36m";
 // can declare whether a fix is implemented.  Kinds starting with "info/" are
 // purely informational and never trigger the "report missing recipe" prompt.
 
-const _KIND_INFO:             &str = "info/generic";  // baseline kind; specific variants below
+const KIND_INFO:              &str = "info/generic";  // baseline kind; specific variants below
 const KIND_INFO_LOG_TAIL:     &str = "info/log-tail";
 const KIND_INFO_LOG_PATTERNS: &str = "info/log-patterns";
 const KIND_INFO_NO_ISSUES:    &str = "info/no-issues";
@@ -1295,52 +1295,96 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
     if let Health::Degraded(msg) = &svc.health {
         let body = vec![msg.clone()];
 
-        let fix: Option<FixAction> = if msg.contains("venv") || msg.contains(".venv") {
-            // Python venv missing — determine backend dir and build fix steps
-            let backend_dir = if repo_dir.join("backend").is_dir() {
+        // Helper closures for resolved-condition checks — used to avoid offering
+        // a fix that was already applied but whose effect the service hasn't
+        // reflected yet (because it hasn't restarted).
+        let backend_dir_for_check = || {
+            if repo_dir.join("backend").is_dir() {
                 repo_dir.join("backend")
             } else {
                 repo_dir.to_path_buf()
-            };
-            Some(FixAction::Steps {
-                label: "Create Python virtual environment and install dependencies".into(),
-                steps: venv_fix_steps(&backend_dir),
-            })
-        } else if msg.contains("node_modules") {
-            let fe_dir = if repo_dir.join("frontend").is_dir() {
+            }
+        };
+        let fe_dir_for_check = || {
+            if repo_dir.join("frontend").is_dir() {
                 repo_dir.join("frontend")
             } else {
                 repo_dir.to_path_buf()
-            };
-            Some(FixAction::Steps {
-                label: "Install JavaScript dependencies (yarn install)".into(),
-                steps: vec![FixStep::new(&["yarn", "install"], &fe_dir)],
-            })
-        } else if msg.contains("APP__ADMIN__PASSWORD") || msg.contains("credentials") {
-            let env_path = paths.opencti.join("opencti-platform/opencti-graphql/.env.dev");
-            Some(FixAction::EnvWizard { env_path, vars: OPENCTI_ENV_VARS, product: "OpenCTI" })
-        } else if msg.contains("OPENCTI_TOKEN") {
-            let env_path = paths.connector.join(".env.dev");
-            Some(FixAction::EnvWizard { env_path, vars: CONNECTOR_ENV_VARS, product: "ImportDocumentAI connector" })
-        } else {
-            None
+            }
         };
 
-        let kind = if fix.is_some() {
-            // Resolve kind from the matched fix type so RECIPE_CATALOG is accurate.
-            if msg.contains("venv") || msg.contains(".venv")                         { KIND_PYTHON_VENV }
-            else if msg.contains("node_modules")                                     { KIND_NODE_MODULES }
-            else if msg.contains("APP__ADMIN__PASSWORD") || msg.contains("credentials")
-                 || msg.contains("OPENCTI_TOKEN")                                    { KIND_ENV_PLACEHOLDER }
-            else                                                                     { KIND_DEGRADED_UNKNOWN }
+        enum DegradedOutcome {
+            NeedsRestart,           // fix was applied, condition resolved, just needs service restart
+            Fixable(FixAction, &'static str), // (fix, kind)
+            Unknown,
+        }
+
+        let outcome = if msg.contains("venv") || msg.contains(".venv") {
+            let bd = backend_dir_for_check();
+            // Check both `python` and versioned symlinks (e.g. python3.14).
+            let venv_ok = bd.join(".venv/bin/python").exists()
+                || bd.join(".venv/bin/python3").exists()
+                || fs::read_dir(bd.join(".venv/bin")).ok()
+                    .and_then(|mut d| d.next())
+                    .is_some();
+            if venv_ok {
+                DegradedOutcome::NeedsRestart
+            } else {
+                DegradedOutcome::Fixable(
+                    FixAction::Steps {
+                        label: "Create Python virtual environment and install dependencies".into(),
+                        steps: venv_fix_steps(&bd),
+                    },
+                    KIND_PYTHON_VENV,
+                )
+            }
+        } else if msg.contains("node_modules") {
+            let fe = fe_dir_for_check();
+            if fe.join("node_modules").is_dir() {
+                DegradedOutcome::NeedsRestart
+            } else {
+                DegradedOutcome::Fixable(
+                    FixAction::Steps {
+                        label: "Install JavaScript dependencies (yarn install)".into(),
+                        steps: vec![FixStep::new(&["yarn", "install"], &fe)],
+                    },
+                    KIND_NODE_MODULES,
+                )
+            }
+        } else if msg.contains("APP__ADMIN__PASSWORD") || msg.contains("credentials") {
+            let env_path = paths.opencti.join("opencti-platform/opencti-graphql/.env.dev");
+            DegradedOutcome::Fixable(
+                FixAction::EnvWizard { env_path, vars: OPENCTI_ENV_VARS, product: "OpenCTI" },
+                KIND_ENV_PLACEHOLDER,
+            )
+        } else if msg.contains("OPENCTI_TOKEN") {
+            let env_path = paths.connector.join(".env.dev");
+            DegradedOutcome::Fixable(
+                FixAction::EnvWizard { env_path, vars: CONNECTOR_ENV_VARS, product: "ImportDocumentAI connector" },
+                KIND_ENV_PLACEHOLDER,
+            )
         } else {
-            KIND_DEGRADED_UNKNOWN
+            DegradedOutcome::Unknown
         };
-        findings.push(if let Some(f) = fix {
-            Finding::fixable(kind, "Service did not start", body, f)
-        } else {
-            Finding::info(kind, "Service did not start", body)
-        });
+
+        match outcome {
+            DegradedOutcome::NeedsRestart => {
+                // The underlying condition is already fixed; the service just
+                // hasn't been restarted yet.  Show an info finding — no fix action.
+                let mut restart_body = body;
+                restart_body.push("  Fix already applied — restart the service to pick it up.".into());
+                restart_body.push("  Press Ctrl+C and run dev-feature again.".into());
+                let mut f = Finding::info(KIND_INFO, "Dependency installed — restart needed", restart_body);
+                f.resolved = true;
+                findings.push(f);
+            }
+            DegradedOutcome::Fixable(fix, kind) => {
+                findings.push(Finding::fixable(kind, "Service did not start", body, fix));
+            }
+            DegradedOutcome::Unknown => {
+                findings.push(Finding::info(KIND_DEGRADED_UNKNOWN, "Service did not start", body));
+            }
+        }
     }
 
     // ── 2. Log pattern analysis ───────────────────────────────────────────────
@@ -4696,20 +4740,28 @@ fn main() {
                                 println!();
                                 print!("  Press any key to return to diagnosis…");
                                 let _ = io::stdout().flush();
-                                let mut _b = [0u8; 1];
-                                unsafe { libc::read(libc::STDIN_FILENO, _b.as_mut_ptr() as *mut libc::c_void, 1) };
+                                // Re-enter raw mode before waiting for the key so we get a
+                                // true single-keystroke read (no newline needed) and don't
+                                // leave cooked-mode bytes buffered for the event loop.
                                 raw_mode = RawMode::enter();
-                                // Mark finding as resolved if the fix appears to have worked,
-                                // then re-run diagnosis to pick up any remaining issues.
+                                let mut _b = [0u8; 16];
+                                unsafe { libc::read(libc::STDIN_FILENO, _b.as_mut_ptr() as *mut libc::c_void, _b.len()) };
+                                // Discard any further buffered input (e.g. leftover \n bytes).
+                                unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
+                                // Re-run diagnosis; advance cursor to the first still-actionable
+                                // finding so the user doesn't accidentally re-trigger the same fix.
                                 let new_findings = {
                                     let svcs = state.lock().unwrap();
                                     svcs.get(idx).map(|svc| diagnose_service(svc, &paths))
                                         .unwrap_or_default()
                                 };
+                                let new_cursor = new_findings.iter()
+                                    .position(|f| f.fix.is_some() && !f.resolved)
+                                    .unwrap_or(0);
                                 mode = Mode::Diagnose {
                                     svc_idx:  idx,
                                     findings: new_findings,
-                                    cursor:   cur.min(findings.len().saturating_sub(1)),
+                                    cursor:   new_cursor,
                                 };
                                 force_render = true;
                             }
@@ -4751,9 +4803,10 @@ fn main() {
                                     println!();
                                     print!("  Press any key to return to diagnosis…");
                                     let _ = io::stdout().flush();
-                                    let mut _b = [0u8; 1];
-                                    unsafe { libc::read(libc::STDIN_FILENO, _b.as_mut_ptr() as *mut libc::c_void, 1) };
                                     raw_mode = RawMode::enter();
+                                    let mut _b = [0u8; 16];
+                                    unsafe { libc::read(libc::STDIN_FILENO, _b.as_mut_ptr() as *mut libc::c_void, _b.len()) };
+                                    unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
                                     let new_findings = {
                                         let svcs = state.lock().unwrap();
                                         svcs.get(idx).map(|svc| diagnose_service(svc, &paths))
