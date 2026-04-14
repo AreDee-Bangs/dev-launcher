@@ -713,28 +713,60 @@ fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_dir:
     println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}remove workspace {}{R}", config.hash);
     println!("\n  {DIM}{sep}{R}");
 
-    // ── 1. Git status check ────────────────────────────────────────────────────
+    // ── 1. Classify entries ────────────────────────────────────────────────────
+    // Separate entries into:
+    //   - worktrees_to_remove : extra git worktrees created by dev-feature
+    //   - main_checkouts      : main repo dirs (never removed — shared infra)
     struct DirtyEntry { repo: String, worktree: PathBuf, reasons: Vec<String> }
     let mut dirty: Vec<DirtyEntry> = Vec::new();
-    let mut worktrees_to_remove: Vec<(String, PathBuf)> = Vec::new(); // (repo, worktree_path)
+    let mut worktrees_to_remove: Vec<(String, PathBuf)> = Vec::new();
+    let mut main_checkouts:       Vec<(String, PathBuf)> = Vec::new();
 
     for entry in &config.entries {
-        if !entry.enabled || entry.branch.is_empty() { continue; }
-        let slug   = branch_to_slug(&entry.branch);
-        let wt     = workspace_root.join(format!("{}-{}", entry.repo, slug));
-        let main   = workspace_root.join(&entry.repo);
-        // Only remove real worktrees — if the main checkout is on this branch, skip.
-        if !wt.is_dir() || wt == main { continue; }
-        let reasons = worktree_dirty_reasons(&wt);
-        if !reasons.is_empty() {
-            dirty.push(DirtyEntry { repo: entry.repo.clone(), worktree: wt.clone(), reasons });
+        if !entry.enabled { continue; }
+        let main = workspace_root.join(&entry.repo);
+
+        if entry.branch.is_empty() {
+            // Product was included using its main checkout directly (no branch).
+            if main.is_dir() { main_checkouts.push((entry.repo.clone(), main)); }
+            continue;
         }
-        worktrees_to_remove.push((entry.repo.clone(), wt));
+
+        let slug = branch_to_slug(&entry.branch);
+        let wt   = workspace_root.join(format!("{}-{}", entry.repo, slug));
+
+        if !wt.is_dir() || wt == main {
+            // Either no worktree was created (main was already on this branch),
+            // or the worktree path IS the main checkout (same path).
+            if main.is_dir() { main_checkouts.push((entry.repo.clone(), main)); }
+        } else {
+            // A real separate worktree exists at wt — collect for removal.
+            let reasons = worktree_dirty_reasons(&wt);
+            if !reasons.is_empty() {
+                dirty.push(DirtyEntry { repo: entry.repo.clone(), worktree: wt.clone(), reasons });
+            }
+            worktrees_to_remove.push((entry.repo.clone(), wt));
+        }
     }
 
-    // ── 2. Confirmation ────────────────────────────────────────────────────────
+    // ── 2. Preview what will happen ────────────────────────────────────────────
+    if !worktrees_to_remove.is_empty() {
+        println!("  Worktrees to be removed:");
+        for (_, wt) in &worktrees_to_remove {
+            println!("    {RED}–{R}  {}", wt.display());
+        }
+    }
+    if !main_checkouts.is_empty() {
+        println!("  Main checkouts preserved (shared across all workspaces):");
+        for (repo, dir) in &main_checkouts {
+            println!("    {DIM}·{R}  {}  {DIM}({}){R}", dir.display(), repo);
+        }
+    }
+    println!();
+
+    // ── 3. Confirmation ────────────────────────────────────────────────────────
     if !dirty.is_empty() {
-        println!("  {YLW}{BOLD}Warning: the following repos have ongoing work:{R}\n");
+        println!("  {YLW}{BOLD}Warning: the following worktrees have ongoing work:{R}\n");
         for d in &dirty {
             println!("  {YLW}▶{R}  {BOLD}{}{R}  ({})", d.repo, d.reasons.join(", "));
             println!("     {DIM}{}{R}", d.worktree.display());
@@ -763,16 +795,24 @@ fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_dir:
 
     println!();
 
-    // ── 3. Docker compose down ─────────────────────────────────────────────────
+    // ── 4. Docker compose down ─────────────────────────────────────────────────
+    // Run for ALL enabled entries regardless of branch — Docker was started for
+    // every enabled product, including those using the main checkout directly.
     let ws_hash = config.hash.as_str();
     for entry in &config.entries {
-        if !entry.enabled || entry.branch.is_empty() { continue; }
+        if !entry.enabled { continue; }
         if entry.repo == "connectors" { continue; } // shares OpenCTI docker
 
+        // Resolve the dir to run compose from: worktree if it exists, else main.
         let slug = branch_to_slug(&entry.branch);
         let wt   = workspace_root.join(format!("{}-{}", entry.repo, slug));
-        let dir_buf = if wt.is_dir() { wt.clone() } else { workspace_root.join(&entry.repo) };
-        let dir  = dir_buf.as_path();
+        let dir_buf = if !entry.branch.is_empty() && wt.is_dir() {
+            wt
+        } else {
+            workspace_root.join(&entry.repo)
+        };
+        let dir = dir_buf.as_path();
+        if !dir.is_dir() { continue; }
 
         let Some((ws_project, base_project, compose_file)) =
             resolve_product_docker_for_down(&entry.repo, dir, ws_hash) else { continue };
@@ -780,10 +820,10 @@ fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_dir:
         if !compose_file.exists() { continue; }
         let file_str = compose_file.to_str().unwrap_or("");
 
-        println!("  Stopping {} Docker containers…", entry.repo);
+        print!("  Stopping {} Docker containers… ", entry.repo);
+        let _ = io::stdout().flush();
 
-        // (a) Try to bring down the workspace-scoped project (containers named
-        //     with the ws-hash suffix — the new scheme).
+        // (a) Workspace-scoped project (new naming scheme with hash suffix).
         let ws_override = write_compose_override(&compose_file, ws_hash);
         let mut argv_ws: Vec<&str> = vec!["compose", "-p", &ws_project, "-f", file_str];
         let ov_str: String;
@@ -794,57 +834,83 @@ fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_dir:
         argv_ws.push("down");
         let _ = run_blocking("docker", &argv_ws, dir);
 
-        // (b) Also bring down the base project name (containers without suffix —
-        //     the old scheme, or containers started by ./dev.sh / docker compose
-        //     directly).
+        // (b) Base project name (old scheme / started by ./dev.sh or plain compose).
         let _ = run_blocking("docker",
             &["compose", "-p", &base_project, "-f", file_str, "down"], dir);
 
         // (c) Straggler sweep: force-remove any remaining containers whose name
-        //     still contains the product prefix (catches containers with explicit
-        //     `container_name:` that slipped through both compose-down calls).
+        //     still starts with the product prefix (catches containers with explicit
+        //     container_name: that slipped through both compose-down calls).
         let container_prefix = base_project.split('-').next().unwrap_or(&base_project);
         docker_kill_by_name_fragment(container_prefix);
 
-        println!("  {GRN}✓{R}  {} containers stopped", entry.repo);
+        println!("{GRN}done{R}");
     }
 
-    // ── 4. Worktree removal ────────────────────────────────────────────────────
+    // ── 5. Worktree removal ────────────────────────────────────────────────────
     for (repo, wt) in &worktrees_to_remove {
         let main_repo = workspace_root.join(repo);
         let wt_str    = wt.to_str().unwrap_or("");
-        println!("  Removing worktree {}…", wt.display());
-        let ok = Command::new("git")
+
+        print!("  Removing worktree {}… ", wt.display());
+        let _ = io::stdout().flush();
+
+        let git_ok = Command::new("git")
             .args(["worktree", "remove", "--force", wt_str])
             .current_dir(&main_repo)
             .stdin(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        if ok {
-            // Also prune the local tracking branch for this worktree.
-            let slug = wt.file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix(&format!("{}-", repo)))
-                .unwrap_or("")
-                .to_string();
-            if !slug.is_empty() {
-                let _ = Command::new("git")
-                    .args(["branch", "-D", &slug])
-                    .current_dir(&main_repo)
-                    .stdin(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-            println!("  {GRN}✓{R}  Removed worktree {}", wt.display());
+
+        // If git couldn't remove it (already pruned from git's registry), the
+        // directory might still exist as a plain dir — force-remove it.
+        if !git_ok && wt.is_dir() {
+            let _ = fs::remove_dir_all(wt);
+        }
+
+        // Prune dangling git worktree reference.
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&main_repo)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status();
+
+        // Also delete the local branch that tracked this worktree, if it still exists.
+        let slug = wt.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(&format!("{}-", repo)))
+            .unwrap_or("")
+            .to_string();
+        if !slug.is_empty() {
+            let _ = Command::new("git")
+                .args(["branch", "-D", &slug])
+                .current_dir(&main_repo)
+                .stdin(Stdio::null()).stderr(Stdio::null())
+                .status();
+        }
+
+        if !wt.is_dir() {
+            println!("{GRN}done{R}");
         } else {
-            println!("  {YLW}⚠{R}  Could not remove worktree {} — remove manually", wt.display());
+            println!("{YLW}could not remove — delete manually:{R}");
+            println!("    rm -rf {}", wt.display());
         }
     }
 
-    // ── 5. Tombstone ──────────────────────────────────────────────────────────
+    // ── 6. Tombstone ──────────────────────────────────────────────────────────
     tombstone_workspace(ws_dir, &config.hash);
-    println!("\n  {GRN}✓{R}  Workspace {BOLD}{}{R} removed.\n", config.hash);
+
+    println!("\n  {GRN}✓{R}  Workspace {BOLD}{}{R} deleted.", config.hash);
+    if !worktrees_to_remove.is_empty() {
+        println!("  {DIM}Worktree directories removed.{R}");
+    }
+    if !main_checkouts.is_empty() {
+        println!("  {DIM}Main repo directories kept — they are shared across all workspaces.{R}");
+        println!("  {DIM}To fully reset, delete {} manually.{R}", workspace_root.display());
+    }
+    println!();
 }
 
 // ── Terminal ──────────────────────────────────────────────────────────────────
