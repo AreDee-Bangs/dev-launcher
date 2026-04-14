@@ -1,0 +1,4457 @@
+//! dev-feature — multi-product stack launcher with process-tree management, health monitoring,
+//! and an interactive TUI for diving into per-service logs.
+//!
+//! Spawns every service in its own process group, polls health endpoints concurrently,
+//! and terminates the entire tree on Ctrl+C — no orphan processes.
+//!
+//! Keys (when stdin is a TTY):
+//!   Overview : ↑↓ / j k  navigate   Enter / → / l  open logs   q  quit
+//!   Log view : ↑↓ / j k  scroll ±5   PgUp/PgDn  scroll ±20   f  follow tail
+//!              q / ← / Esc  back to overview
+
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, Write};
+use std::os::unix::process::CommandExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
+use std::time::{Duration, Instant};
+use std::thread;
+
+use clap::Parser;
+
+// ── ANSI ──────────────────────────────────────────────────────────────────────
+
+const R:    &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM:  &str = "\x1b[2m";
+const GRN:  &str = "\x1b[32m";
+const YLW:  &str = "\x1b[33m";
+const RED:  &str = "\x1b[31m";
+const CYN:  &str = "\x1b[36m";
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(
+    name    = "dev-feature",
+    about   = "Launch the full multi-product dev stack for a feature branch.\n\
+               Each service runs in its own process group; Ctrl+C kills the entire tree.",
+    version
+)]
+struct Args {
+    // ── Workspace shortcuts ───────────────────────────────────────────────────
+
+    /// Open an existing workspace by its 8-char hash ID (shown in the workspace list).
+    #[arg(long)] workspace: Option<String>,
+
+    /// Branch for Filigran Copilot — creates or finds a workspace matching all supplied branches.
+    #[arg(long)] copilot_branch: Option<String>,
+
+    /// Branch for OpenCTI.
+    #[arg(long)] opencti_branch: Option<String>,
+
+    /// Branch for OpenAEV.
+    #[arg(long)] openaev_branch: Option<String>,
+
+    /// Branch for the ImportDoc connector.
+    #[arg(long)] connector_branch: Option<String>,
+
+    // ── Runtime-only overrides (not saved to workspace) ───────────────────────
+
+    /// Skip the OpenCTI React frontend only.
+    #[arg(long)] no_opencti_front: bool,
+
+    /// Skip the OpenAEV React frontend only.
+    #[arg(long)] no_openaev_front: bool,
+
+    /// Override the log directory (default: /tmp/dev-feature-logs/{workspace-hash}).
+    #[arg(long)] logs_dir: Option<PathBuf>,
+
+    // ── Root configuration ────────────────────────────────────────────────────
+
+    /// Path to the filigran workspace root (overrides env var and config file).
+    /// Same effect as setting FILIGRAN_WORKSPACE_ROOT.
+    #[arg(long)] workspace_root: Option<PathBuf>,
+}
+
+// ── Health state ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum Health {
+    Pending,
+    Launching,
+    Probing(u32),
+    Up,
+    Running,
+    Degraded(String),
+    Crashed(i32),
+}
+
+impl Health {
+    fn label(&self) -> String {
+        match self {
+            Health::Pending       => format!("{DIM}pending{R}"),
+            Health::Launching     => format!("{YLW}launching{R}"),
+            Health::Probing(n)    => format!("{YLW}health probe #{n}{R}"),
+            Health::Up            => format!("{GRN}up{R}"),
+            Health::Running       => format!("{CYN}running{R}"),
+            Health::Degraded(msg) => format!("{RED}degraded ({msg}){R}"),
+            Health::Crashed(code) => format!("{RED}crashed ({code}){R}"),
+        }
+    }
+
+    /// Plain-text label used when ANSI codes would break column alignment.
+    fn label_plain(&self) -> String {
+        match self {
+            Health::Pending       => "pending".into(),
+            Health::Launching     => "launching".into(),
+            Health::Probing(n)    => format!("health probe #{n}"),
+            Health::Up            => "up".into(),
+            Health::Running       => "running".into(),
+            Health::Degraded(msg) => format!("degraded ({msg})"),
+            Health::Crashed(code) => format!("crashed ({code})"),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        matches!(self, Health::Up | Health::Running | Health::Degraded(_) | Health::Crashed(_))
+    }
+}
+
+// ── Log diagnosis patterns ────────────────────────────────────────────────────
+
+/// Known failure signatures. Each entry is `(needle_lowercase, human_reason)`.
+/// Patterns are checked against log lines converted to lowercase.
+const DIAG_PATTERNS: &[(&str, &str)] = &[
+    ("econnrefused",                             "Connection refused — is the required service running?"),
+    ("amqp: connection refused",                 "RabbitMQ is not reachable — check Docker container"),
+    ("connection refused to localhost:5672",      "RabbitMQ port 5672 not reachable"),
+    ("connection refused to localhost:5432",      "PostgreSQL not reachable — check Docker container"),
+    ("could not connect to server: connection refused", "PostgreSQL is not reachable"),
+    ("redis: could not connect",                 "Redis is not reachable — check Docker container"),
+    ("error connecting to redis",                "Redis connection failed"),
+    ("connection refused to localhost:6379",      "Redis port 6379 not reachable"),
+    ("elasticsearch: no living connections",      "Elasticsearch cluster is unreachable"),
+    ("connection refused to localhost:9200",      "Elasticsearch port 9200 not reachable"),
+    ("minio: connection refused",                "MinIO/S3 is not reachable"),
+    ("connection refused to localhost:9000",      "MinIO port 9000 not reachable"),
+    ("address already in use",                   "Port conflict — another process is using this port"),
+    ("eaddrinuse",                               "Port already in use — stop the conflicting process"),
+    ("no module named",                          "Python module missing — run pip install or recreate venv"),
+    ("modulenotfounderror",                      "Python module not found — check venv"),
+    ("cannot find module",                       "Node.js module missing — run yarn install"),
+    ("error: cannot find module",                "Node.js module missing — run yarn install"),
+    ("changeme",                                 "Placeholder credentials detected — edit .env.dev"),
+    ("invalid pem",                              "Invalid PEM certificate — check CONNECTOR_LICENCE_KEY_PEM"),
+    ("certificate verify failed",                "TLS certificate verification failed"),
+    ("permission denied",                        "Permission denied — check file/directory ownership"),
+    ("killed",                                   "Process killed — possibly out of memory (OOM)"),
+    ("out of memory",                            "Out of memory — free RAM or increase system swap"),
+    ("no space left on device",                  "Disk full — free up space before restarting"),
+];
+
+// ── LLM provider ──────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+enum LlmProvider {
+    /// Anthropic Messages API format (`/v1/messages`, `x-api-key` header).
+    Anthropic,
+    /// OpenAI-compatible Chat Completions format (`/chat/completions`, Bearer auth).
+    /// Works with OpenAI, Ollama, LiteLLM, Azure OpenAI, Mistral, etc.
+    OpenAICompatible,
+}
+
+#[derive(Clone, Debug)]
+struct LlmConfig {
+    provider: LlmProvider,
+    /// API key — sent as `x-api-key` (Anthropic) or `Authorization: Bearer` (OpenAI-compat).
+    api_key:  String,
+    model:    String,
+    /// Base URL for the provider, without trailing slash.
+    /// Anthropic default : `https://api.anthropic.com/v1`
+    /// OpenAI default    : `https://api.openai.com/v1`
+    /// Custom example    : `http://localhost:4000/v1` (LiteLLM / Ollama)
+    base_url: String,
+}
+
+// ── Diagnosis event (diag thread → main loop) ─────────────────────────────────
+
+enum DiagEvent {
+    Result { svc_idx: usize, msg: String },
+}
+
+// ── Service display state (shared with health thread) ─────────────────────────
+
+#[derive(Debug)]
+struct Svc {
+    name:            String,
+    url:             Option<String>,
+    health_path:     String,
+    health:          Health,
+    pid:             Option<u32>,
+    started_at:      Option<Instant>,
+    startup_timeout: Duration,
+    log_path:        PathBuf,
+    /// Diagnosis message set by the log daemon after a crash.
+    diagnosis:       Option<String>,
+}
+
+impl Svc {
+    fn new(
+        name: impl Into<String>,
+        url: Option<impl Into<String>>,
+        health_path: impl Into<String>,
+        timeout_secs: u64,
+        log_path: PathBuf,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            url: url.map(Into::into),
+            health_path: health_path.into(),
+            health: Health::Pending,
+            pid: None,
+            started_at: None,
+            startup_timeout: Duration::from_secs(timeout_secs),
+            log_path,
+            diagnosis: None,
+        }
+    }
+
+    fn health_url(&self) -> Option<String> {
+        self.url.as_deref().map(|b| format!("{b}{}", self.health_path))
+    }
+
+    fn secs(&self) -> u64 {
+        self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    }
+}
+
+type State = Arc<Mutex<Vec<Svc>>>;
+
+// ── Repo manifest ─────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct ManifestDocker {
+    compose_dev: Option<String>,
+    project:     Option<String>,
+}
+
+struct SvcDef {
+    name:            String,
+    args:            Vec<String>,
+    cwd:             String,
+    health:          Option<String>,
+    timeout_secs:    u64,
+    requires_docker: bool,
+    log_name:        Option<String>,
+}
+
+enum BootstrapDef {
+    Check { path: String, missing_hint: String },
+    RunIfMissing { check: String, command: Vec<String>, cwd: Option<String> },
+}
+
+#[derive(Default)]
+struct RepoManifest {
+    docker:    ManifestDocker,
+    services:  Vec<SvcDef>,
+    bootstrap: Vec<BootstrapDef>,
+}
+
+// ── Managed children (owned by main thread) ───────────────────────────────────
+
+struct Proc {
+    idx:   usize,
+    pgid:  i32,
+    child: Child,
+}
+
+impl Proc {
+    fn kill(&mut self) {
+        unsafe { libc::kill(-self.pgid, libc::SIGTERM); }
+    }
+
+    fn try_reap(&mut self) -> Option<i32> {
+        self.child.try_wait().ok().flatten().map(|s| s.code().unwrap_or(-1))
+    }
+}
+
+// ── Paths ─────────────────────────────────────────────────────────────────────
+
+struct Paths {
+    copilot:   PathBuf,
+    opencti:   PathBuf,
+    connector: PathBuf,
+    openaev:   PathBuf,
+}
+
+impl Paths {
+}
+
+// ── Git / worktree helpers ────────────────────────────────────────────────────
+
+/// Return the currently checked-out branch name for `dir`, or empty string.
+fn current_branch(dir: &Path) -> String {
+    if !dir.is_dir() { return String::new(); }
+    Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "HEAD")
+        .unwrap_or_default()
+}
+
+/// Convert a branch name to a filesystem-safe slug (e.g. `issue/123-foo` → `issue-123-foo`).
+fn branch_to_slug(branch: &str) -> String {
+    branch.replace('/', "-")
+}
+
+/// Ensure a git worktree for `branch` exists at `{workspace}/{repo}-{slug}`.
+/// If the main checkout is already on `branch`, returns the main repo path
+/// directly — no worktree needed and git would refuse to create one anyway.
+/// If missing: tries `git worktree add`, then fetches from origin and retries.
+/// Returns the worktree path regardless of whether creation succeeded.
+fn ensure_worktree(workspace: &Path, repo: &str, branch: &str) -> PathBuf {
+    let slug   = branch_to_slug(branch);
+    let target = workspace.join(format!("{}-{}", repo, slug));
+    if target.is_dir() { return target; }
+
+    let main_repo = workspace.join(repo);
+    if !main_repo.is_dir() {
+        println!("  {YLW}⚠{R}  {repo} main repo not found — cannot create worktree");
+        return target;
+    }
+
+    // If the main checkout is already on this branch a worktree would fail
+    // ("already used by worktree").  Use the main repo directly instead.
+    if current_branch(&main_repo) == branch {
+        println!("  {GRN}✓{R}  {repo} already on {branch} — using main checkout");
+        return main_repo.clone();
+    }
+
+    println!("  Creating worktree {repo} @ {branch}…");
+    let ok = Command::new("git")
+        .args(["worktree", "add", target.to_str().unwrap_or(""), branch])
+        .current_dir(&main_repo)
+        .stdin(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !ok {
+        // Branch may not exist locally — fetch and retry with tracking.
+        println!("  Fetching origin/{branch}…");
+        let _ = Command::new("git")
+            .args(["fetch", "origin", branch])
+            .current_dir(&main_repo)
+            .stdin(Stdio::null())
+            .status();
+        let ok2 = Command::new("git")
+            .args(["worktree", "add", "--track", "-b", &slug,
+                   target.to_str().unwrap_or(""), &format!("origin/{branch}")])
+            .current_dir(&main_repo)
+            .stdin(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok2 {
+            println!("  {RED}✗{R}  Could not create worktree for {repo} @ {branch}");
+        } else {
+            println!("  {GRN}✓{R}  Worktree created: {}", target.display());
+        }
+    } else {
+        println!("  {GRN}✓{R}  Worktree created: {}", target.display());
+    }
+    target
+}
+
+/// Returns a list of human-readable issues for a worktree directory:
+/// uncommitted changes and/or unpushed commits.  Empty vec = clean.
+fn worktree_dirty_reasons(dir: &Path) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !dir.is_dir() { return reasons; }
+
+    // Uncommitted changes (staged or unstaged)
+    if let Ok(out) = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(dir)
+        .stderr(Stdio::null())
+        .output()
+    {
+        let count = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        if count > 0 {
+            reasons.push(format!("{count} uncommitted file(s)"));
+        }
+    }
+
+    // Unpushed commits (silently skip if no upstream is configured)
+    if let Ok(out) = Command::new("git")
+        .args(["log", "@{u}..HEAD", "--oneline"])
+        .current_dir(dir)
+        .stderr(Stdio::null())
+        .output()
+    {
+        if out.status.success() {
+            let count = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+            if count > 0 {
+                reasons.push(format!("{count} unpushed commit(s)"));
+            }
+        }
+    }
+
+    reasons
+}
+
+// ── Workspace ─────────────────────────────────────────────────────────────────
+
+/// Fixed product registry — (repo dir, display label, short key, service desc).
+/// Order is the canonical order shown throughout the UI.
+const PRODUCTS: &[(&str, &str, &str, &str)] = &[
+    ("filigran-copilot", "Filigran Copilot", "copilot",   "backend · worker · frontend"),
+    ("opencti",          "OpenCTI",          "opencti",   "graphql · frontend"),
+    ("openaev",          "OpenAEV",           "openaev",   "backend · frontend"),
+    ("connectors",       "ImportDoc connector","connector","import-document-ai"),
+];
+
+#[derive(Clone, Debug)]
+struct WorkspaceEntry {
+    repo:    String,   // "filigran-copilot", "opencti", …
+    enabled: bool,
+    branch:  String,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceConfig {
+    hash:     String,
+    created:  String,             // "YYYY-MM-DD"
+    entries:  Vec<WorkspaceEntry>, // same order as PRODUCTS
+}
+
+impl WorkspaceConfig {
+    /// One-line human-readable summary of enabled products + branches.
+    fn summary(&self) -> String {
+        let parts: Vec<String> = self.entries.iter()
+            .zip(PRODUCTS.iter())
+            .filter(|(e, _)| e.enabled && !e.branch.is_empty())
+            .map(|(e, (_, label, _, _))| {
+                // Shorten label
+                let short = label.split_whitespace().last().unwrap_or(label);
+                format!("{}:{}", short, e.branch)
+            })
+            .collect();
+        if parts.is_empty() { "(empty)".to_string() } else { parts.join("  ") }
+    }
+}
+
+/// Return `{workspace_root}/.dev-workspaces`.
+fn workspaces_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".dev-workspaces")
+}
+
+/// Current date as "YYYY-MM-DD" using the system clock.
+fn today() -> String {
+    // Use `date` command — avoids pulling in a time crate.
+    Command::new("date").arg("+%Y-%m-%d").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// FNV-1a 32-bit hash of the sorted enabled `repo=branch` pairs → 8 hex chars.
+fn compute_workspace_hash(entries: &[WorkspaceEntry]) -> String {
+    let mut pairs: Vec<String> = entries.iter()
+        .filter(|e| e.enabled && !e.branch.is_empty())
+        .map(|e| format!("{}={}", e.repo, e.branch))
+        .collect();
+    pairs.sort();
+    let input = pairs.join("\n");
+    let mut h: u32 = 2_166_136_261;
+    for b in input.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16_777_619);
+    }
+    format!("{:08x}", h)
+}
+
+fn save_workspace(dir: &Path, config: &WorkspaceConfig) {
+    let wdir = dir.join(&config.hash);
+    let _ = fs::create_dir_all(&wdir);
+    let path = wdir.join("workspace.conf");
+    let mut out = format!("hash={}\ncreated={}\n", config.hash, config.created);
+    for (e, (_, _, key, _)) in config.entries.iter().zip(PRODUCTS.iter()) {
+        out.push_str(&format!("{}_enabled={}\n{}_branch={}\n", key, e.enabled, key, e.branch));
+    }
+    let _ = fs::write(&path, out);
+}
+
+fn load_workspace(dir: &Path, hash: &str) -> Option<WorkspaceConfig> {
+    let path = dir.join(hash).join("workspace.conf");
+    if !path.exists() { return None; }
+    let map = parse_env_file(&path);
+    // Skip tombstoned workspaces — they remain on disk for history but are invisible.
+    if map.contains_key("deleted") { return None; }
+    let entries = PRODUCTS.iter().map(|(repo, _, key, _)| {
+        WorkspaceEntry {
+            repo:    repo.to_string(),
+            enabled: map.get(&format!("{key}_enabled")).map_or(false, |v| v == "true"),
+            branch:  map.get(&format!("{key}_branch")).cloned().unwrap_or_default(),
+        }
+    }).collect();
+    Some(WorkspaceConfig {
+        hash:    hash.to_string(),
+        created: map.get("created").cloned().unwrap_or_default(),
+        entries,
+    })
+}
+
+fn list_workspaces(dir: &Path) -> Vec<WorkspaceConfig> {
+    if !dir.is_dir() { return vec![]; }
+    let mut configs: Vec<WorkspaceConfig> = fs::read_dir(dir).into_iter()
+        .flatten().flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let hash = e.file_name().to_string_lossy().to_string();
+            load_workspace(dir, &hash)
+        })
+        .collect();
+    configs.sort_by(|a, b| b.created.cmp(&a.created));
+    configs
+}
+
+/// Append a `deleted=<date>` line to `workspace.conf`, keeping the directory for history.
+/// Subsequent calls to `load_workspace` will return `None` for tombstoned entries.
+fn tombstone_workspace(dir: &Path, hash: &str) {
+    use io::Write as _;
+    let path = dir.join(hash).join("workspace.conf");
+    if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&path) {
+        let _ = writeln!(f, "deleted={}", today());
+    }
+}
+
+
+
+/// Convert a `WorkspaceConfig` back to `ProductChoice` list (for the UI and path resolution).
+fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> Vec<ProductChoice> {
+    config.entries.iter().zip(PRODUCTS.iter()).map(|(e, (repo, label, _, desc))| {
+        let path = if e.branch.is_empty() {
+            workspace_root.join(repo)
+        } else {
+            let slug = branch_to_slug(&e.branch);
+            let wt = workspace_root.join(format!("{}-{}", repo, slug));
+            if wt.is_dir() { wt } else { workspace_root.join(repo) }
+        };
+        ProductChoice {
+            label,
+            desc,
+            repo,
+            enabled:   e.enabled,
+            available: path.is_dir() || workspace_root.join(repo).is_dir(),
+            branch:    e.branch.clone(),
+        }
+    }).collect()
+}
+
+/// Convert `ProductChoice` list to a `WorkspaceConfig` (save after selection).
+fn choices_to_workspace(choices: &[ProductChoice]) -> WorkspaceConfig {
+    let entries: Vec<WorkspaceEntry> = choices.iter().map(|c| WorkspaceEntry {
+        repo:    c.repo.to_string(),
+        enabled: c.enabled,
+        branch:  c.branch.clone(),
+    }).collect();
+    let hash = compute_workspace_hash(&entries);
+    WorkspaceConfig { hash, created: today(), entries }
+}
+
+// ── Workspace selector TUI ────────────────────────────────────────────────────
+
+enum WorkspaceAction {
+    Open(WorkspaceConfig),
+    Delete(WorkspaceConfig),
+    CreateNew,
+    Quit,
+}
+
+fn render_workspace_selector(workspaces: &[WorkspaceConfig], cursor: usize) {
+    let sep = "─".repeat(72);
+    print!("\x1b[H\x1b[2J");
+    println!("\n  {BOLD}{CYN}dev-feature{R}\n");
+    println!("  {DIM}{sep}{R}");
+    println!("  {BOLD}Workspaces{R}  {DIM}— select one to start or create a new one{R}");
+    println!("  {DIM}{sep}{R}\n");
+
+    let total = workspaces.len() + 1; // +1 for "Create new"
+    for (i, ws) in workspaces.iter().enumerate() {
+        let marker = if i == cursor { format!("{CYN}{BOLD}▶{R} ") } else { "  ".to_string() };
+        let hash   = format!("{DIM}[{}]{R}", ws.hash);
+        let summary = ws.summary();
+        let date   = format!("{DIM}{}{R}", ws.created);
+        // Truncate summary if too long
+        let summary_display = if summary.len() > 52 {
+            format!("{}…", &summary[..51])
+        } else {
+            summary.clone()
+        };
+        println!("  {marker}{hash}  {:<54}{date}", summary_display);
+    }
+
+    // "Create new" entry
+    let new_idx = workspaces.len();
+    let marker = if new_idx == cursor { format!("{CYN}{BOLD}▶{R} ") } else { "  ".to_string() };
+    println!("  {marker}{GRN}[+] Create new workspace{R}");
+
+    println!();
+    println!("  {DIM}{sep}{R}");
+    if cursor < total - 1 {
+        println!("  {DIM}↑↓ navigate   Enter open   d delete   q quit{R}");
+    } else {
+        println!("  {DIM}↑↓ navigate   Enter create   q quit{R}");
+    }
+    println!();
+    let _ = io::stdout().flush();
+}
+
+fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+        return WorkspaceAction::CreateNew;
+    }
+    let mut raw = RawMode::enter();
+    let total = workspaces.len() + 1;
+    let mut cursor = 0usize;
+    let mut buf = [0u8; 16];
+    loop {
+        render_workspace_selector(workspaces, cursor);
+        thread::sleep(Duration::from_millis(20));
+        let n = unsafe {
+            libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        if n <= 0 { continue; }
+        match &buf[..n as usize] {
+            [27, b'[', b'A'] | [b'k'] => { cursor = cursor.saturating_sub(1); }
+            [27, b'[', b'B'] | [b'j'] => { if cursor + 1 < total { cursor += 1; } }
+            [b'\r'] | [b'\n'] => {
+                drop(raw.take());
+                if cursor == workspaces.len() {
+                    return WorkspaceAction::CreateNew;
+                } else {
+                    return WorkspaceAction::Open(workspaces[cursor].clone());
+                }
+            }
+            [b'd'] | [b'D'] => {
+                if cursor < workspaces.len() {
+                    drop(raw.take());
+                    return WorkspaceAction::Delete(workspaces[cursor].clone());
+                }
+            }
+            [b'q'] | [b'Q'] | [27] => {
+                drop(raw.take());
+                print!("\x1b[H\x1b[2J");
+                let _ = io::stdout().flush();
+                return WorkspaceAction::Quit;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Full workspace removal flow:
+///   1. Check each enabled worktree for uncommitted/unpushed work.
+///   2. If dirty: show per-repo details and ask for confirmation TWICE.
+///      If clean: ask once.
+///   3. On confirmed: docker compose down → remove worktrees → tombstone config.
+///
+/// Called outside raw mode (the selector drops raw before returning Delete).
+fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_dir: &Path) {
+    let sep = "─".repeat(56);
+    println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}remove workspace {}{R}", config.hash);
+    println!("\n  {DIM}{sep}{R}");
+
+    // ── 1. Git status check ────────────────────────────────────────────────────
+    struct DirtyEntry { repo: String, worktree: PathBuf, reasons: Vec<String> }
+    let mut dirty: Vec<DirtyEntry> = Vec::new();
+    let mut worktrees_to_remove: Vec<(String, PathBuf)> = Vec::new(); // (repo, worktree_path)
+
+    for entry in &config.entries {
+        if !entry.enabled || entry.branch.is_empty() { continue; }
+        let slug   = branch_to_slug(&entry.branch);
+        let wt     = workspace_root.join(format!("{}-{}", entry.repo, slug));
+        let main   = workspace_root.join(&entry.repo);
+        // Only remove real worktrees — if the main checkout is on this branch, skip.
+        if !wt.is_dir() || wt == main { continue; }
+        let reasons = worktree_dirty_reasons(&wt);
+        if !reasons.is_empty() {
+            dirty.push(DirtyEntry { repo: entry.repo.clone(), worktree: wt.clone(), reasons });
+        }
+        worktrees_to_remove.push((entry.repo.clone(), wt));
+    }
+
+    // ── 2. Confirmation ────────────────────────────────────────────────────────
+    if !dirty.is_empty() {
+        println!("  {YLW}{BOLD}Warning: the following repos have ongoing work:{R}\n");
+        for d in &dirty {
+            println!("  {YLW}▶{R}  {BOLD}{}{R}  ({})", d.repo, d.reasons.join(", "));
+            println!("     {DIM}{}{R}", d.worktree.display());
+        }
+        println!();
+        print!("  Type {BOLD}YES{R} to confirm removal despite uncommitted work: ");
+        let _ = io::stdout().flush();
+        match read_line_or_interrupt() {
+            Some(l) if l.trim() == "YES" => {}
+            _ => { println!("  Cancelled."); return; }
+        }
+        print!("  This cannot be undone.  Type {BOLD}YES{R} again to proceed: ");
+        let _ = io::stdout().flush();
+        match read_line_or_interrupt() {
+            Some(l) if l.trim() == "YES" => {}
+            _ => { println!("  Cancelled."); return; }
+        }
+    } else {
+        print!("  Remove workspace {BOLD}{}{R}? [y/N] ", config.hash);
+        let _ = io::stdout().flush();
+        match read_line_or_interrupt() {
+            Some(l) if l.trim().eq_ignore_ascii_case("y") => {}
+            _ => { println!("  Cancelled."); return; }
+        }
+    }
+
+    println!();
+
+    // ── 3. Docker compose down ─────────────────────────────────────────────────
+    for entry in &config.entries {
+        if !entry.enabled || entry.branch.is_empty() { continue; }
+        if entry.repo == "connectors" { continue; } // shares OpenCTI docker
+        let slug = branch_to_slug(&entry.branch);
+        let wt   = workspace_root.join(format!("{}-{}", entry.repo, slug));
+        let dir  = if wt.is_dir() { &wt } else { &workspace_root.join(&entry.repo) };
+        if let Some((project, compose_file)) = resolve_product_docker_for_down(&entry.repo, dir) {
+            if compose_file.exists() {
+                println!("  Stopping {} Docker containers…", entry.repo);
+                let file_str = compose_file.to_str().unwrap_or("");
+                let code = run_blocking("docker", &["compose", "-p", &project, "-f", file_str, "down"], dir);
+                if code == 0 {
+                    println!("  {GRN}✓{R}  {} containers stopped", entry.repo);
+                } else {
+                    println!("  {YLW}⚠{R}  {} docker down returned {code} (may already be stopped)", entry.repo);
+                }
+            }
+        }
+    }
+
+    // ── 4. Worktree removal ────────────────────────────────────────────────────
+    for (repo, wt) in &worktrees_to_remove {
+        let main_repo = workspace_root.join(repo);
+        let wt_str    = wt.to_str().unwrap_or("");
+        println!("  Removing worktree {}…", wt.display());
+        let ok = Command::new("git")
+            .args(["worktree", "remove", "--force", wt_str])
+            .current_dir(&main_repo)
+            .stdin(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            // Also prune the local tracking branch for this worktree.
+            let slug = wt.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(&format!("{}-", repo)))
+                .unwrap_or("")
+                .to_string();
+            if !slug.is_empty() {
+                let _ = Command::new("git")
+                    .args(["branch", "-D", &slug])
+                    .current_dir(&main_repo)
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            println!("  {GRN}✓{R}  Removed worktree {}", wt.display());
+        } else {
+            println!("  {YLW}⚠{R}  Could not remove worktree {} — remove manually", wt.display());
+        }
+    }
+
+    // ── 5. Tombstone ──────────────────────────────────────────────────────────
+    tombstone_workspace(ws_dir, &config.hash);
+    println!("\n  {GRN}✓{R}  Workspace {BOLD}{}{R} removed.\n", config.hash);
+}
+
+// ── Terminal ──────────────────────────────────────────────────────────────────
+
+fn terminal_size() -> (usize, usize) {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
+            && ws.ws_col > 0 && ws.ws_row > 0
+        {
+            (ws.ws_col as usize, ws.ws_row as usize)
+        } else {
+            (120, 40)
+        }
+    }
+}
+
+/// RAII guard: enters raw mode on creation, restores the terminal on drop.
+struct RawMode { saved: libc::termios }
+
+impl RawMode {
+    fn enter() -> Option<Self> {
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 { return None; }
+        unsafe {
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut saved) != 0 { return None; }
+            let mut raw = saved;
+            // Disable echo, line-buffering, and flow-control; keep ISIG so Ctrl+C fires.
+            raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN);
+            raw.c_iflag &= !libc::IXON;
+            // Non-blocking reads: return immediately if no bytes are available.
+            raw.c_cc[libc::VMIN]  = 0;
+            raw.c_cc[libc::VTIME] = 0;
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw);
+            print!("\x1b[?25l"); // hide cursor
+            let _ = io::stdout().flush();
+            Some(Self { saved })
+        }
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.saved); }
+        print!("\x1b[?25h\x1b[0m"); // show cursor + reset attributes
+        let _ = io::stdout().flush();
+    }
+}
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+
+enum InputEvent {
+    Up, Down,
+    Enter,       // open log / confirm (Enter, →, l)
+    Back,        // close log / quit (q, Q, Esc, ←)
+    PageUp, PageDown,
+    Follow,      // f — toggle live-follow in log view
+    Credentials, // e — show .env credentials overlay
+    Diagnose,    // d — run on-demand service diagnosis from log view
+}
+
+fn spawn_input_thread(tx: mpsc::SyncSender<InputEvent>, stopping: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 16];
+        loop {
+            if stopping.load(Ordering::Relaxed) { return; }
+            thread::sleep(Duration::from_millis(20));
+
+            let n = unsafe {
+                libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n <= 0 { continue; }
+
+            let event = match &buf[..n as usize] {
+                // Back: q / Q / Esc / Left-arrow
+                [b'q'] | [b'Q'] | [27] | [27, b'[', b'D'] => Some(InputEvent::Back),
+                // Up: ↑ / k
+                [27, b'[', b'A'] | [b'k'] => Some(InputEvent::Up),
+                // Down: ↓ / j
+                [27, b'[', b'B'] | [b'j'] => Some(InputEvent::Down),
+                // Enter: Return / Right-arrow / l
+                [b'\r'] | [b'\n'] | [b'l'] | [27, b'[', b'C'] => Some(InputEvent::Enter),
+                // Page-up / Page-down
+                [27, b'[', b'5', b'~'] => Some(InputEvent::PageUp),
+                [27, b'[', b'6', b'~'] => Some(InputEvent::PageDown),
+                // f — follow toggle
+                [b'f'] => Some(InputEvent::Follow),
+                // e — show credentials overlay
+                [b'e'] => Some(InputEvent::Credentials),
+                // d — run on-demand diagnosis
+                [b'd'] => Some(InputEvent::Diagnose),
+                _ => None,
+            };
+            if let Some(e) = event {
+                let _ = tx.try_send(e);
+            }
+        }
+    });
+}
+
+// ── Mode ─────────────────────────────────────────────────────────────────────
+
+enum Mode {
+    Overview    { cursor: usize },
+    LogView     { svc_idx: usize, scroll: usize, follow: bool },
+    Diagnose    { svc_idx: usize, findings: Vec<Finding>, cursor: usize },
+    Credentials,
+}
+
+// ── Per-process shutdown state ────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq)]
+enum TermStatus {
+    /// SIGTERM sent; waiting for the process to exit.
+    Terminating,
+    /// Process exited on its own (exit code).
+    Stopped(i32),
+    /// SIGKILL was sent after the grace timeout.
+    Killed,
+}
+
+// ── Log tail ──────────────────────────────────────────────────────────────────
+
+/// Return the last `max_lines` lines from a file (reads the whole file — fine for dev logs).
+fn tail_file(path: &Path, max_lines: usize) -> Vec<String> {
+    let Ok(f) = File::open(path) else { return vec![] };
+    let all: Vec<String> = io::BufReader::new(f).lines().filter_map(|l| l.ok()).collect();
+    let start = all.len().saturating_sub(max_lines);
+    all[start..].to_vec()
+}
+
+// ── ANSI-aware string helpers ─────────────────────────────────────────────────
+
+/// Count the number of visible (non-ANSI) characters in `s`.
+fn ansi_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut len = 0usize;
+    let mut i   = 0;
+    while i < b.len() {
+        if b[i] == b'\x1b' && b.get(i + 1) == Some(&b'[') {
+            i += 2;
+            while i < b.len() && b[i] != b'm' { i += 1; }
+            i += 1;
+        } else {
+            len += 1;
+            i   += 1;
+        }
+    }
+    len
+}
+
+/// Return `s` followed by enough spaces to reach `width` visible columns.
+fn pad_ansi(s: &str, width: usize) -> String {
+    let pad = width.saturating_sub(ansi_len(s));
+    format!("{s}{}", " ".repeat(pad))
+}
+
+// ── Render — overview ─────────────────────────────────────────────────────────
+
+fn render_overview(svcs: &[Svc], slug: &str, logs_dir: &Path, cursor: usize, has_tui: bool) {
+    print!("\x1b[H\x1b[2J");
+    println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}{slug}{R}\n");
+
+    // Column widths: name 26 | status 32 | pid 7 | url + elapsed
+    println!("  {BOLD}  {:<26}{:<32}{:<7}{R}", "Service", "Status", "PID");
+    println!("  {DIM}  {}{R}", "─".repeat(67));
+
+    let visible: Vec<usize> = svcs.iter().enumerate()
+        .filter(|(_, s)| s.health != Health::Pending)
+        .map(|(i, _)| i)
+        .collect();
+
+    for (row, &i) in visible.iter().enumerate() {
+        let s = &svcs[i];
+        let pid     = s.pid.map(|p| p.to_string()).unwrap_or_default();
+        let url_str = s.url.as_deref().unwrap_or("");
+        let elapsed = s.started_at.map(|_| s.secs());
+
+        // Marker column (2 chars wide: space or ▶)
+        let (marker, name_str) = if has_tui && row == cursor {
+            (format!("{CYN}{BOLD}▶{R} "), format!("{BOLD}{}{R}", s.name))
+        } else {
+            ("  ".to_string(), s.name.to_string())
+        };
+
+        // Use plain label for cursor row (no embedded ANSI to confuse padding);
+        // use colored label for all other rows.
+        let status_col = if has_tui && row == cursor {
+            pad_ansi(&s.health.label_plain(), 32)
+        } else {
+            pad_ansi(&s.health.label(), 32)
+        };
+
+        print!("  {marker}{:<26}{status_col}{:<7}", name_str, pid);
+        if !url_str.is_empty() { print!("  {DIM}{url_str}{R}"); }
+        if let Some(s) = elapsed  { print!("  {DIM}{s}s{R}"); }
+        println!();
+        // Diagnosis hint — shown below the row when available (crash context).
+        if let Some(diag) = &s.diagnosis {
+            println!("        {YLW}▸ {diag}{R}");
+        }
+    }
+
+    println!();
+
+    let active: Vec<_> = svcs.iter().filter(|s| s.health != Health::Pending).collect();
+    let all_up = !active.is_empty()
+        && active.iter().all(|s| matches!(s.health, Health::Up | Health::Running));
+    let any_bad = active.iter().any(|s| {
+        matches!(s.health, Health::Crashed(_) | Health::Degraded(_))
+    });
+
+    if any_bad {
+        println!("  {RED}{BOLD}One or more services failed.{R}");
+    } else if all_up {
+        println!("  {GRN}{BOLD}All services up.{R}");
+    } else {
+        println!("  Waiting for services…");
+    }
+
+    if has_tui {
+        println!("  {DIM}↑↓ navigate   Enter/→ logs   e credentials   q quit{R}");
+    } else {
+        println!("  {DIM}Ctrl+C to stop   tail -f {}/*.log{R}", logs_dir.display());
+    }
+    println!();
+    let _ = io::stdout().flush();
+}
+
+// ── Diagnosis ─────────────────────────────────────────────────────────────────
+
+// ── Finding data types ────────────────────────────────────────────────────────
+
+/// One command step in a multi-step fix sequence.
+#[derive(Clone)]
+struct FixStep { args: Vec<String>, cwd: PathBuf }
+
+impl FixStep {
+    fn new(args: &[&str], cwd: &Path) -> Self {
+        Self { args: args.iter().map(|s| s.to_string()).collect(), cwd: cwd.to_path_buf() }
+    }
+}
+
+/// An automated action that can be executed directly from the diagnosis screen.
+#[derive(Clone)]
+enum FixAction {
+    /// Run a sequence of shell commands (printed + executed in order).
+    Steps { label: String, steps: Vec<FixStep> },
+    /// Launch the interactive env-var wizard for a product.
+    EnvWizard { env_path: PathBuf, vars: &'static [EnvVar], product: &'static str },
+}
+
+impl FixAction {
+    fn label(&self) -> &str {
+        match self {
+            FixAction::Steps     { label, .. } => label.as_str(),
+            FixAction::EnvWizard { product, .. } => product,
+        }
+    }
+}
+
+/// A single diagnosed issue, optionally with a runnable fix.
+#[derive(Clone)]
+struct Finding {
+    title:    String,
+    body:     Vec<String>,
+    fix:      Option<FixAction>,
+    resolved: bool,
+}
+
+impl Finding {
+    fn info(title: impl Into<String>, body: Vec<String>) -> Self {
+        Self { title: title.into(), body, fix: None, resolved: false }
+    }
+    fn fixable(title: impl Into<String>, body: Vec<String>, fix: FixAction) -> Self {
+        Self { title: title.into(), body, fix: Some(fix), resolved: false }
+    }
+}
+
+/// Execute a fix action synchronously with visible output.
+/// Must be called with raw mode already dropped.
+fn run_fix_action(action: &FixAction) {
+    let sep = "─".repeat(56);
+    match action {
+        FixAction::Steps { label, steps } => {
+            println!("\n  {BOLD}{CYN}Applying fix:{R}  {label}\n  {DIM}{sep}{R}\n");
+            for step in steps {
+                println!("  {DIM}$ {}{R}", step.args.join(" "));
+                let prog  = step.args[0].as_str();
+                let argv: Vec<&str> = step.args[1..].iter().map(|s| s.as_str()).collect();
+                let code  = run_blocking(prog, &argv, &step.cwd);
+                if code != 0 {
+                    println!("\n  {RED}✗{R}  Command exited {code}. Remaining steps skipped.");
+                    return;
+                }
+            }
+            println!("\n  {GRN}✓{R}  Fix applied.");
+        }
+        FixAction::EnvWizard { env_path, vars, product } => {
+            run_env_wizard(env_path, vars, product);
+        }
+    }
+}
+
+/// Build the fix steps needed to create a Python venv and install dependencies
+/// in `backend_dir`.  Tries `requirements.txt` then `pyproject.toml`.
+fn venv_fix_steps(backend_dir: &Path) -> Vec<FixStep> {
+    let mut steps = vec![
+        FixStep::new(&["python3", "-m", "venv", ".venv"], backend_dir),
+    ];
+    if backend_dir.join("requirements.txt").exists() {
+        steps.push(FixStep::new(
+            &[".venv/bin/pip", "install", "-q", "-r", "requirements.txt"],
+            backend_dir,
+        ));
+    } else if backend_dir.join("pyproject.toml").exists() {
+        steps.push(FixStep::new(
+            &[".venv/bin/pip", "install", "-q", "-e", "."],
+            backend_dir,
+        ));
+    }
+    steps
+}
+
+/// Analyse a service and return a list of `Finding` structs, each of which may
+/// carry a `FixAction` that the user can execute directly from the diagnosis screen.
+fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
+    // ── Map service name → repo directory ────────────────────────────────────
+    let repo_dir: &Path = if svc.name.starts_with("copilot") {
+        &paths.copilot
+    } else if svc.name.starts_with("opencti") {
+        &paths.opencti
+    } else if svc.name.starts_with("connector") {
+        &paths.connector
+    } else if svc.name.starts_with("openaev") {
+        &paths.openaev
+    } else {
+        &paths.copilot
+    };
+
+    let mut findings: Vec<Finding> = Vec::new();
+
+    // ── 1. Degraded: surface reason with automated fix ────────────────────────
+    if let Health::Degraded(msg) = &svc.health {
+        let body = vec![msg.clone()];
+
+        let fix: Option<FixAction> = if msg.contains("venv") || msg.contains(".venv") {
+            // Python venv missing — determine backend dir and build fix steps
+            let backend_dir = if repo_dir.join("backend").is_dir() {
+                repo_dir.join("backend")
+            } else {
+                repo_dir.to_path_buf()
+            };
+            Some(FixAction::Steps {
+                label: "Create Python virtual environment and install dependencies".into(),
+                steps: venv_fix_steps(&backend_dir),
+            })
+        } else if msg.contains("node_modules") {
+            let fe_dir = if repo_dir.join("frontend").is_dir() {
+                repo_dir.join("frontend")
+            } else {
+                repo_dir.to_path_buf()
+            };
+            Some(FixAction::Steps {
+                label: "Install JavaScript dependencies (yarn install)".into(),
+                steps: vec![FixStep::new(&["yarn", "install"], &fe_dir)],
+            })
+        } else if msg.contains("APP__ADMIN__PASSWORD") || msg.contains("credentials") {
+            let env_path = paths.opencti.join("opencti-platform/opencti-graphql/.env.dev");
+            Some(FixAction::EnvWizard { env_path, vars: OPENCTI_ENV_VARS, product: "OpenCTI" })
+        } else if msg.contains("OPENCTI_TOKEN") {
+            let env_path = paths.connector.join(".env.dev");
+            Some(FixAction::EnvWizard { env_path, vars: CONNECTOR_ENV_VARS, product: "ImportDocumentAI connector" })
+        } else {
+            None
+        };
+
+        findings.push(if let Some(f) = fix {
+            Finding::fixable("Service did not start", body, f)
+        } else {
+            Finding::info("Service did not start", body)
+        });
+    }
+
+    // ── 2. Log pattern analysis ───────────────────────────────────────────────
+    if matches!(svc.health, Health::Crashed(_) | Health::Degraded(_)) {
+        let log_lines = tail_file(&svc.log_path, 150);
+        let mut matched: Vec<String> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for line in &log_lines {
+            let lower = line.to_lowercase();
+            for (needle, reason) in DIAG_PATTERNS {
+                if lower.contains(needle) && !seen.contains(reason) {
+                    seen.push(reason);
+                    matched.push(format!("  — {reason}"));
+                }
+            }
+        }
+        if !matched.is_empty() {
+            findings.push(Finding::info("Log patterns detected", matched));
+        }
+    }
+
+    // ── 3. Env file placeholder values ────────────────────────────────────────
+    struct EnvCheck { label: &'static str, path: PathBuf, vars: &'static [EnvVar], product: &'static str }
+    let env_checks = [
+        EnvCheck {
+            label:   "OpenCTI .env.dev",
+            path:    paths.opencti.join("opencti-platform/opencti-graphql/.env.dev"),
+            vars:    OPENCTI_ENV_VARS,
+            product: "OpenCTI",
+        },
+        EnvCheck {
+            label:   "Connector .env.dev",
+            path:    paths.connector.join(".env.dev"),
+            vars:    CONNECTOR_ENV_VARS,
+            product: "ImportDocumentAI connector",
+        },
+    ];
+    for ec in &env_checks {
+        if !ec.path.exists() { continue; }
+        let bad_keys: Vec<String> = parse_env_file(&ec.path).into_iter()
+            .filter(|(_, v)| v == "ChangeMe")
+            .map(|(k, _)| format!("  — {k} is still 'ChangeMe'"))
+            .collect();
+        if !bad_keys.is_empty() {
+            findings.push(Finding::fixable(
+                format!("Placeholder credentials in {}", ec.label),
+                bad_keys,
+                FixAction::EnvWizard { env_path: ec.path.clone(), vars: ec.vars, product: ec.product },
+            ));
+        }
+    }
+
+    // ── 4. Python venv missing ────────────────────────────────────────────────
+    if svc.name.contains("backend") || svc.name.contains("worker") || svc.name.contains("connector") {
+        let backend_dir = if repo_dir.join("backend").is_dir() {
+            repo_dir.join("backend")
+        } else {
+            repo_dir.to_path_buf()
+        };
+        let venv_python = backend_dir.join(".venv/bin/python");
+        if !venv_python.exists() {
+            findings.push(Finding::fixable(
+                "Python virtual environment missing",
+                vec![format!("  Expected: {}", venv_python.display())],
+                FixAction::Steps {
+                    label: "Create Python virtual environment and install dependencies".into(),
+                    steps: venv_fix_steps(&backend_dir),
+                },
+            ));
+        }
+    }
+
+    // ── 5. node_modules missing ───────────────────────────────────────────────
+    if svc.name.contains("frontend") {
+        let fe_candidates = [repo_dir.join("frontend"), repo_dir.to_path_buf()];
+        for fe_dir in &fe_candidates {
+            if fe_dir.is_dir() && !fe_dir.join("node_modules").is_dir() {
+                findings.push(Finding::fixable(
+                    "JavaScript dependencies not installed",
+                    vec![format!("  node_modules missing in {}", fe_dir.display())],
+                    FixAction::Steps {
+                        label: "Install JavaScript dependencies (yarn install)".into(),
+                        steps: vec![FixStep::new(&["yarn", "install"], fe_dir)],
+                    },
+                ));
+                break;
+            }
+        }
+    }
+
+    // ── 6. Bootstrap RunIfMissing steps from .dev-launcher.conf ──────────────
+    let conf_path = repo_dir.join(".dev-launcher.conf");
+    if let Some(manifest) = parse_dev_launcher_conf(&conf_path) {
+        for step in &manifest.bootstrap {
+            match step {
+                BootstrapDef::Check { path, missing_hint } => {
+                    if !repo_dir.join(path).exists() {
+                        findings.push(Finding::info(
+                            "Bootstrap check failed",
+                            vec![format!("  {missing_hint}")],
+                        ));
+                    }
+                }
+                BootstrapDef::RunIfMissing { check, command, cwd } => {
+                    if !repo_dir.join(check).exists() {
+                        if let Some((prog, args)) = command.split_first() {
+                            let work_dir = cwd.as_deref()
+                                .map(|c| repo_dir.join(c))
+                                .unwrap_or_else(|| repo_dir.to_path_buf());
+                            let mut all_args = vec![prog.as_str()];
+                            all_args.extend(args.iter().map(|s| s.as_str()));
+                            findings.push(Finding::fixable(
+                                format!("Bootstrap step needed: {}", prog),
+                                vec![format!("  Triggers when {} is missing", check)],
+                                FixAction::Steps {
+                                    label: format!("{}", command.join(" ")),
+                                    steps: vec![FixStep::new(&all_args, &work_dir)],
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 7. Recent log tail (always shown as context) ──────────────────────────
+    let tail = tail_file(&svc.log_path, 20);
+    if !tail.is_empty() {
+        let body = tail.iter().map(|l| format!("  {DIM}{l}{R}")).collect();
+        findings.push(Finding::info("Recent log output", body));
+    }
+
+    if findings.is_empty() {
+        findings.push(Finding::info(
+            "No issues detected",
+            vec![
+                "  Service appears healthy.".into(),
+                format!("  Log: {}", svc.log_path.display()),
+            ],
+        ));
+    }
+
+    findings
+}
+
+fn render_diagnose(svc: &Svc, findings: &[Finding], cursor: usize) {
+    let (cols, rows) = terminal_size();
+    let header  = 4usize;
+    let footer  = 2usize;
+    let content = rows.saturating_sub(header + footer);
+    let sep     = "─".repeat(cols.saturating_sub(4));
+
+    print!("\x1b[H\x1b[2J");
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    println!();
+    print!("  {BOLD}{CYN}{}{R}  {BOLD}diagnosis{R}", svc.name);
+    match &svc.health {
+        Health::Crashed(c)  => print!("  {RED}crashed ({c}){R}"),
+        Health::Degraded(m) => print!("  {RED}degraded{R}  {DIM}{m}{R}"),
+        Health::Up          => print!("  {GRN}up{R}"),
+        other               => print!("  {DIM}{}{R}", other.label_plain()),
+    }
+    println!();
+    println!("  {DIM}{}{R}", svc.log_path.display());
+    println!("  {DIM}{sep}{R}");
+
+    // ── Build display lines with per-finding blocks ───────────────────────────
+    // We render all findings into a flat line buffer, then paginate.
+    let mut lines: Vec<String> = Vec::new();
+    for (i, f) in findings.iter().enumerate() {
+        let is_cursor = i == cursor;
+        let marker = if is_cursor { format!("{CYN}{BOLD}▶{R} ") } else { "  ".to_string() };
+        let check  = if f.resolved { format!("{GRN}✓{R}") } else if f.fix.is_some() { format!("{YLW}●{R}") } else { format!("{DIM}·{R}") };
+
+        lines.push(format!("  {marker}{check}  {BOLD}{}{R}", f.title));
+        for b in &f.body {
+            lines.push(format!("       {b}"));
+        }
+        if let Some(fix) = &f.fix {
+            if f.resolved {
+                lines.push(format!("       {GRN}✓ Fixed{R}"));
+            } else {
+                lines.push(format!("       {CYN}→ Enter to run:{R}  {}", fix.label()));
+            }
+        }
+        lines.push(String::new());
+    }
+
+    // ── Paginate: keep cursor's finding block in view ─────────────────────────
+    // Find the first line that belongs to the cursor finding.
+    let cursor_line = {
+        let mut n = 0usize;
+        for (i, f) in findings.iter().enumerate() {
+            if i == cursor { break; }
+            n += 2 + f.body.len() + if f.fix.is_some() { 1 } else { 0 } + 1;
+        }
+        n
+    };
+    // Scroll so the cursor block starts near the top, but don't go past end.
+    let start = cursor_line.min(lines.len().saturating_sub(content));
+    let end   = (start + content).min(lines.len());
+    let page  = &lines[start..end];
+
+    for line in page {
+        let truncated: String = line.chars().take(cols.saturating_sub(2)).collect();
+        println!("{truncated}");
+    }
+    for _ in page.len()..content { println!(); }
+
+    // ── Footer ────────────────────────────────────────────────────────────────
+    println!("  {DIM}{sep}{R}");
+    let fixable_count = findings.iter().filter(|f| f.fix.is_some() && !f.resolved).count();
+    if fixable_count > 0 {
+        println!("  {DIM}↑↓ navigate   Enter run fix   q / ← back{R}   {YLW}{fixable_count} fix(es) available{R}");
+    } else {
+        println!("  {DIM}↑↓ navigate   q / ← back{R}");
+    }
+
+    let _ = io::stdout().flush();
+}
+
+// ── Render — log view ─────────────────────────────────────────────────────────
+
+fn render_log_view(svc: &Svc, scroll: usize, follow: bool) {
+    let (cols, rows) = terminal_size();
+    let header = 4usize;
+    let footer = 2usize;
+    let content = rows.saturating_sub(header + footer);
+    let sep = "─".repeat(cols.saturating_sub(4));
+
+    print!("\x1b[H\x1b[2J");
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    println!();
+    print!("  {BOLD}{CYN}{}{R}", svc.name);
+    match &svc.health {
+        Health::Up          => print!("  {GRN}up{R}"),
+        Health::Running     => print!("  {CYN}running{R}"),
+        Health::Crashed(c)  => print!("  {RED}crashed ({c}){R}"),
+        Health::Degraded(m) => print!("  {RED}degraded ({m}){R}"),
+        other               => print!("  {DIM}{}{R}", other.label_plain()),
+    }
+    if let Some(pid) = svc.pid { print!("  {DIM}pid {pid}{R}"); }
+    println!();
+    println!("  {DIM}{}{R}", svc.log_path.display());
+    println!("  {DIM}{sep}{R}");
+
+    // ── Content ───────────────────────────────────────────────────────────────
+    // Read more lines than we can show so scrolling has room.
+    let lines = tail_file(&svc.log_path, content + scroll + 300);
+    let total = lines.len();
+
+    // `scroll` counts lines back from the bottom; 0 = at the bottom.
+    let end   = total.saturating_sub(if follow { 0 } else { scroll });
+    let start = end.saturating_sub(content);
+    let page  = &lines[start..end];
+
+    for line in page {
+        let truncated: String = line.chars().take(cols.saturating_sub(2)).collect();
+        println!("  {truncated}");
+    }
+    // Pad so the footer stays at a fixed row.
+    for _ in page.len()..content { println!(); }
+
+    // ── Footer ────────────────────────────────────────────────────────────────
+    println!("  {DIM}{sep}{R}");
+    let follow_label = if follow {
+        format!("{GRN}following{R}")
+    } else {
+        format!("{YLW}paused{R}  {DIM}(f = follow){R}")
+    };
+    println!("  {DIM}q/← back   ↑↓ scroll   PgUp/PgDn fast   d diagnose{R}   {follow_label}");
+
+    let _ = io::stdout().flush();
+}
+
+// ── Render — shutdown ─────────────────────────────────────────────────────────
+
+/// `pairs[i]` = (service_name, Option<proc_index_into_term_status>).
+/// Services with `None` were already dead before shutdown was triggered.
+fn render_shutdown(
+    slug:        &str,
+    pairs:       &[(String, Option<usize>)],
+    term_status: &[TermStatus],
+    elapsed:     Duration,
+    timed_out:   bool,
+) {
+    print!("\x1b[H\x1b[2J");
+    println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}{slug}{R}  {YLW}{BOLD}shutting down…{R}\n");
+
+    for (name, proc_j) in pairs {
+        let status = match proc_j {
+            None => format!("{DIM}already stopped{R}"),
+            Some(j) => match &term_status[*j] {
+                TermStatus::Terminating => format!("{YLW}terminating…{R}"),
+                TermStatus::Stopped(0)  => format!("{GRN}stopped{R}"),
+                TermStatus::Stopped(c)  => format!("{GRN}stopped ({c}){R}"),
+                TermStatus::Killed      => format!("{RED}force killed{R}"),
+            },
+        };
+        println!("  {:<26}{status}", name);
+    }
+
+    println!();
+
+    let pending = term_status.iter().filter(|s| **s == TermStatus::Terminating).count();
+    if timed_out {
+        println!("  {RED}Grace period exceeded — processes were force-killed.{R}");
+    } else if pending == 0 {
+        println!("  {GRN}{BOLD}All processes stopped.{R}");
+    } else {
+        println!("  {DIM}Waiting for {pending} process{}…  {}s{R}",
+            if pending == 1 { "" } else { "es" }, elapsed.as_secs());
+    }
+    println!();
+    let _ = io::stdout().flush();
+}
+
+// ── Credentials overlay ───────────────────────────────────────────────────────
+
+struct CredEntry {
+    product: &'static str,
+    label:   &'static str,
+    value:   String,
+}
+
+/// Collect user-facing credentials from each product's .env file.
+fn gather_credentials(paths: &Paths, workspace: &Path) -> Vec<CredEntry> {
+    let mut out: Vec<CredEntry> = Vec::new();
+
+    // Copilot — .env lives only in the main worktree (not copied to feature worktrees).
+    // Try feature worktree first, fall back to main.
+    let copilot_env = [
+        paths.copilot.join(".env"),
+        workspace.join("filigran-copilot/.env"),
+    ]
+    .into_iter()
+    .find(|p| p.exists());
+    if let Some(env_path) = copilot_env {
+        let map = parse_env_file(&env_path);
+        for (key, label) in [
+            ("ADMIN_EMAIL",    "Admin e-mail"),
+            ("ADMIN_PASSWORD", "Admin password"),
+        ] {
+            if let Some(v) = map.get(key) {
+                out.push(CredEntry { product: "Copilot", label, value: v.clone() });
+            }
+        }
+    }
+
+    // OpenCTI — reads <opencti>/opencti-platform/opencti-graphql/.env.dev
+    let opencti_env = paths.opencti
+        .join("opencti-platform/opencti-graphql/.env.dev");
+    if opencti_env.exists() {
+        let map = parse_env_file(&opencti_env);
+        for (key, label) in [
+            ("APP__ADMIN__EMAIL",    "Admin e-mail"),
+            ("APP__ADMIN__PASSWORD", "Admin password"),
+            ("APP__ADMIN__TOKEN",    "API token"),
+        ] {
+            if let Some(v) = map.get(key) {
+                out.push(CredEntry { product: "OpenCTI", label, value: v.clone() });
+            }
+        }
+    }
+
+    // OpenAEV — reads <openaev>/openaev-dev/.env (created from .env.example at first launch).
+    let openaev_env = paths.openaev.join("openaev-dev/.env");
+    if openaev_env.exists() {
+        let map = parse_env_file(&openaev_env);
+        for (key, label) in [
+            ("PGADMIN_USER",     "pgAdmin e-mail"),
+            ("PGADMIN_PASSWORD", "pgAdmin password"),
+        ] {
+            if let Some(v) = map.get(key) {
+                out.push(CredEntry { product: "OpenAEV", label, value: v.clone() });
+            }
+        }
+    }
+
+    // Connector — reads <connector>/.env.dev
+    let connector_env = paths.connector.join(".env.dev");
+    if connector_env.exists() {
+        let map = parse_env_file(&connector_env);
+        if let Some(v) = map.get("OPENCTI_TOKEN") {
+            out.push(CredEntry { product: "Connector", label: "OpenCTI token", value: v.clone() });
+        }
+    }
+
+    out
+}
+
+fn render_credentials(creds: &[CredEntry], slug: &str) {
+    print!("\x1b[H\x1b[2J");
+    println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}{slug}{R}  {BOLD}— credentials{R}\n");
+
+    let mut current_product = "";
+    for entry in creds {
+        if entry.product != current_product {
+            current_product = entry.product;
+            println!("  {BOLD}{current_product}{R}");
+            println!("  {DIM}{}{R}", "─".repeat(50));
+        }
+        println!("  {:<24}{GRN}{}{R}", entry.label, entry.value);
+    }
+
+    if creds.is_empty() {
+        println!("  {DIM}No .env files found. Run the stack at least once to generate them.{R}");
+    }
+
+    println!();
+    println!("  {DIM}q/Esc back{R}");
+    println!();
+    let _ = io::stdout().flush();
+}
+
+// ── Low-level helpers ─────────────────────────────────────────────────────────
+
+fn parse_compose_project_name(compose_file: &Path) -> Option<String> {
+    let content = fs::read_to_string(compose_file).ok()?;
+    for line in content.lines() {
+        if !line.starts_with("name:") { continue; }
+        let val = line["name:".len()..].trim()
+            .trim_matches('"').trim_matches('\'').to_string();
+        if !val.is_empty() { return Some(val); }
+    }
+    None
+}
+
+fn split_health_url_parts(full: Option<&str>) -> (Option<String>, String) {
+    match full {
+        None => (None, String::new()),
+        Some(url) => {
+            if let Some(pos) = url.find("://") {
+                let after = &url[pos + 3..];
+                if let Some(slash) = after.find('/') {
+                    (Some(url[..pos + 3 + slash].to_string()), url[pos + 3 + slash..].to_string())
+                } else {
+                    (Some(url.to_string()), String::new())
+                }
+            } else {
+                (Some(url.to_string()), String::new())
+            }
+        }
+    }
+}
+
+fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut docker = ManifestDocker::default();
+    let mut services: Vec<SvcDef> = Vec::new();
+    let mut bootstrap: Vec<BootstrapDef> = Vec::new();
+
+    // Current section state
+    enum Section {
+        None,
+        Docker,
+        Service,
+        Bootstrap,
+    }
+
+    let mut section = Section::None;
+    // Per-service accumulator
+    let mut svc_name   = String::new();
+    let mut svc_args: Vec<String> = Vec::new();
+    let mut svc_cwd    = String::new();
+    let mut svc_health: Option<String> = None;
+    let mut svc_timeout: u64 = 30;
+    let mut svc_req_docker = false;
+    let mut svc_log: Option<String> = None;
+    // Per-bootstrap accumulator
+    let mut bs_check   = String::new();
+    let mut bs_missing = String::new();
+    let mut bs_run_if  = String::new();
+    let mut bs_command: Vec<String> = Vec::new();
+    let mut bs_cwd: Option<String> = None;
+
+    let flush_service = |name: &str, args: &Vec<String>, cwd: &str,
+                         health: &Option<String>, timeout: u64,
+                         req_docker: bool, log: &Option<String>,
+                         svcs: &mut Vec<SvcDef>| {
+        if !name.is_empty() {
+            svcs.push(SvcDef {
+                name:            name.to_string(),
+                args:            args.clone(),
+                cwd:             cwd.to_string(),
+                health:          health.clone(),
+                timeout_secs:    timeout,
+                requires_docker: req_docker,
+                log_name:        log.clone(),
+            });
+        }
+    };
+
+    let flush_bootstrap = |check: &str, missing: &str, run_if: &str,
+                           command: &Vec<String>, cwd: &Option<String>,
+                           bootstrap: &mut Vec<BootstrapDef>| {
+        if !check.is_empty() && !missing.is_empty() {
+            bootstrap.push(BootstrapDef::Check {
+                path:         check.to_string(),
+                missing_hint: missing.to_string(),
+            });
+        } else if !run_if.is_empty() && !command.is_empty() {
+            bootstrap.push(BootstrapDef::RunIfMissing {
+                check:   run_if.to_string(),
+                command: command.clone(),
+                cwd:     cwd.clone(),
+            });
+        }
+    };
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            // Flush previous section
+            match &section {
+                Section::Service => {
+                    flush_service(&svc_name, &svc_args, &svc_cwd, &svc_health,
+                                  svc_timeout, svc_req_docker, &svc_log, &mut services);
+                    svc_name = String::new(); svc_args = Vec::new();
+                    svc_cwd = String::new(); svc_health = None;
+                    svc_timeout = 30; svc_req_docker = false; svc_log = None;
+                }
+                Section::Bootstrap => {
+                    flush_bootstrap(&bs_check, &bs_missing, &bs_run_if,
+                                    &bs_command, &bs_cwd, &mut bootstrap);
+                    bs_check = String::new(); bs_missing = String::new();
+                    bs_run_if = String::new(); bs_command = Vec::new(); bs_cwd = None;
+                }
+                _ => {}
+            }
+
+            let inner = line[1..line.len()-1].trim();
+            if inner == "docker" {
+                section = Section::Docker;
+            } else if inner == "bootstrap" {
+                section = Section::Bootstrap;
+            } else if let Some(rest) = inner.strip_prefix("service ") {
+                svc_name = rest.trim().to_string();
+                section = Section::Service;
+            } else {
+                section = Section::None;
+            }
+            continue;
+        }
+
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim().to_string();
+            match &section {
+                Section::Docker => match k {
+                    "compose_dev" => docker.compose_dev = Some(v),
+                    "project"     => docker.project     = Some(v),
+                    _ => {}
+                },
+                Section::Service => match k {
+                    "command"         => svc_args = v.split_whitespace().map(|s| s.to_string()).collect(),
+                    "cwd"             => svc_cwd = v,
+                    "health"          => svc_health = if v.is_empty() { None } else { Some(v) },
+                    "timeout"         => svc_timeout = v.parse().unwrap_or(30),
+                    "requires_docker" => svc_req_docker = matches!(v.as_str(), "true" | "1" | "yes"),
+                    "log"             => svc_log = if v.is_empty() { None } else { Some(v) },
+                    _ => {}
+                },
+                Section::Bootstrap => match k {
+                    "check"          => bs_check   = v,
+                    "missing"        => bs_missing  = v,
+                    "run_if_missing" => bs_run_if   = v,
+                    "command"        => bs_command  = v.split_whitespace().map(|s| s.to_string()).collect(),
+                    "cwd"            => bs_cwd      = if v.is_empty() { None } else { Some(v) },
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    // Flush final section
+    match &section {
+        Section::Service => {
+            flush_service(&svc_name, &svc_args, &svc_cwd, &svc_health,
+                          svc_timeout, svc_req_docker, &svc_log, &mut services);
+        }
+        Section::Bootstrap => {
+            flush_bootstrap(&bs_check, &bs_missing, &bs_run_if,
+                            &bs_command, &bs_cwd, &mut bootstrap);
+        }
+        _ => {}
+    }
+
+    Some(RepoManifest { docker, services, bootstrap })
+}
+
+fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
+    let mut docker = ManifestDocker::default();
+    let mut services: Vec<SvcDef> = Vec::new();
+    let mut bootstrap: Vec<BootstrapDef> = Vec::new();
+
+    // Check for docker-compose.dev.yml
+    let compose_file = repo_dir.join("docker-compose.dev.yml");
+    if compose_file.exists() {
+        docker.compose_dev = Some("docker-compose.dev.yml".to_string());
+        docker.project = parse_compose_project_name(&compose_file)
+            .or_else(|| {
+                repo_dir.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| format!("{n}-dev"))
+            });
+    }
+
+    // Check for Python backend
+    let backend_dir = repo_dir.join("backend");
+    let python = backend_dir.join(".venv/bin/python");
+    if backend_dir.is_dir() && backend_dir.join("app/main.py").exists() {
+        services.push(SvcDef {
+            name:            "backend".to_string(),
+            args:            vec![
+                ".venv/bin/python".to_string(),
+                "-m".to_string(), "uvicorn".to_string(),
+                "app.main:application".to_string(),
+                "--reload".to_string(),
+                "--host".to_string(), "0.0.0.0".to_string(),
+                "--port".to_string(), "8100".to_string(),
+                "--timeout-graceful-shutdown".to_string(), "3".to_string(),
+            ],
+            cwd:             "backend".to_string(),
+            health:          Some("http://localhost:8100/api/health".to_string()),
+            timeout_secs:    120,
+            requires_docker: true,
+            log_name:        None,
+        });
+        services.push(SvcDef {
+            name:            "worker".to_string(),
+            args:            vec![
+                ".venv/bin/python".to_string(),
+                "-m".to_string(), "saq".to_string(),
+                "app.worker.settings".to_string(),
+            ],
+            cwd:             "backend".to_string(),
+            health:          None,
+            timeout_secs:    10,
+            requires_docker: true,
+            log_name:        Some("copilot-worker.log".to_string()),
+        });
+        bootstrap.push(BootstrapDef::Check {
+            path:         "backend/.venv/bin/python".to_string(),
+            missing_hint: "Run ./dev.sh once to create the Python venv".to_string(),
+        });
+        let _ = python; // silence unused warning
+    }
+
+    // Check for frontend
+    let frontend_dir = repo_dir.join("frontend");
+    if frontend_dir.join("package.json").exists() {
+        services.push(SvcDef {
+            name:            "frontend".to_string(),
+            args:            vec!["yarn".to_string(), "dev".to_string()],
+            cwd:             "frontend".to_string(),
+            health:          Some("http://localhost:3100".to_string()),
+            timeout_secs:    90,
+            requires_docker: false,
+            log_name:        None,
+        });
+        bootstrap.push(BootstrapDef::RunIfMissing {
+            check:   "frontend/node_modules".to_string(),
+            command: vec!["yarn".to_string(), "install".to_string()],
+            cwd:     Some("frontend".to_string()),
+        });
+    }
+
+    RepoManifest { docker, services, bootstrap }
+}
+
+fn save_dev_launcher_conf(conf_path: &Path, repo_name: &str, manifest: &RepoManifest) {
+    let mut out = format!("# {} — dev-feature launcher configuration\n", repo_name);
+    out.push_str("# Auto-generated. Edit to customize. Re-run dev-feature to apply changes.\n\n");
+
+    out.push_str("[docker]\n");
+    if let Some(ref cd) = manifest.docker.compose_dev {
+        out.push_str(&format!("compose_dev = {}\n", cd));
+    }
+    if let Some(ref p) = manifest.docker.project {
+        out.push_str(&format!("project     = {}\n", p));
+    }
+    out.push('\n');
+
+    for svc in &manifest.services {
+        out.push_str(&format!("[service {}]\n", svc.name));
+        if !svc.args.is_empty() {
+            out.push_str(&format!("command         = {}\n", svc.args.join(" ")));
+        }
+        if !svc.cwd.is_empty() {
+            out.push_str(&format!("cwd             = {}\n", svc.cwd));
+        }
+        if let Some(ref h) = svc.health {
+            out.push_str(&format!("health          = {}\n", h));
+        }
+        out.push_str(&format!("timeout         = {}\n", svc.timeout_secs));
+        if svc.requires_docker {
+            out.push_str("requires_docker = true\n");
+        }
+        if let Some(ref l) = svc.log_name {
+            out.push_str(&format!("log             = {}\n", l));
+        }
+        out.push('\n');
+    }
+
+    for step in &manifest.bootstrap {
+        out.push_str("[bootstrap]\n");
+        match step {
+            BootstrapDef::Check { path, missing_hint } => {
+                out.push_str(&format!("check   = {}\n", path));
+                out.push_str(&format!("missing = {}\n", missing_hint));
+            }
+            BootstrapDef::RunIfMissing { check, command, cwd } => {
+                out.push_str(&format!("run_if_missing = {}\n", check));
+                out.push_str(&format!("command        = {}\n", command.join(" ")));
+                if let Some(ref c) = cwd {
+                    out.push_str(&format!("cwd            = {}\n", c));
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    let _ = fs::write(conf_path, out);
+}
+
+fn load_repo_manifest(repo_dir: &Path, repo_name: &str) -> RepoManifest {
+    let conf_path = repo_dir.join(".dev-launcher.conf");
+    if conf_path.exists() {
+        if let Some(m) = parse_dev_launcher_conf(&conf_path) { return m; }
+    }
+    let manifest = infer_repo_manifest(repo_dir);
+    if !manifest.services.is_empty() {
+        println!("  {DIM}Auto-generating .dev-launcher.conf for {repo_name}…{R}");
+        save_dev_launcher_conf(&conf_path, repo_name, &manifest);
+    }
+    manifest
+}
+
+fn resolve_docker_project(repo_dir: &Path, manifest: &RepoManifest) -> String {
+    if let Some(p) = &manifest.docker.project { return p.clone(); }
+    let compose_file = manifest.docker.compose_dev.as_deref().unwrap_or("docker-compose.dev.yml");
+    if let Some(name) = parse_compose_project_name(&repo_dir.join(compose_file)) { return name; }
+    repo_dir.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}-dev")).unwrap_or_else(|| "dev".to_string())
+}
+
+/// Resolve the docker project name and compose file path for a product during
+/// workspace *removal* — read-only, never auto-generates `.dev-launcher.conf`.
+///
+/// Returns `None` when the product has no independent docker compose file
+/// (e.g. `connectors` shares OpenCTI docker) or the compose file doesn't exist.
+fn resolve_product_docker_for_down(repo: &str, repo_dir: &Path) -> Option<(String, PathBuf)> {
+    // Connector shares OpenCTI docker — caller skips it; return None explicitly.
+    if repo == "connectors" { return None; }
+
+    // OpenCTI: hardcoded compose location (not in a standard docker-compose.dev.yml).
+    if repo == "opencti" {
+        let compose = repo_dir.join("opencti-platform/opencti-dev/docker-compose.yml");
+        return Some(("opencti-dev".to_string(), compose));
+    }
+
+    // All other repos: try .dev-launcher.conf (parse-only, no auto-generate),
+    // then fall back to docker-compose.dev.yml for the project name.
+    let conf_path = repo_dir.join(".dev-launcher.conf");
+    let manifest  = parse_dev_launcher_conf(&conf_path).unwrap_or_default();
+
+    let compose_name = manifest.docker.compose_dev.as_deref()
+        .unwrap_or("docker-compose.dev.yml");
+    let compose_file = repo_dir.join(compose_name);
+
+    // Derive project name with the same priority chain as startup.
+    let project = if let Some(p) = manifest.docker.project {
+        p
+    } else if let Some(name) = parse_compose_project_name(&compose_file) {
+        name
+    } else {
+        repo_dir.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{n}-dev"))
+            .unwrap_or_else(|| "dev".to_string())
+    };
+
+    Some((project, compose_file))
+}
+
+fn run_manifest_bootstrap(repo_dir: &Path, manifest: &RepoManifest) -> bool {
+    let mut ok = true;
+    for step in &manifest.bootstrap {
+        match step {
+            BootstrapDef::Check { path, missing_hint } => {
+                if !repo_dir.join(path).exists() {
+                    println!("  {YLW}⚠{R}  {missing_hint}");
+                    ok = false;
+                }
+            }
+            BootstrapDef::RunIfMissing { check, command, cwd } => {
+                if !repo_dir.join(check).exists() {
+                    let work_dir = cwd.as_deref().map(|c| repo_dir.join(c)).unwrap_or_else(|| repo_dir.to_owned());
+                    if let Some((prog, args)) = command.split_first() {
+                        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                        run_blocking(prog, &args_ref, &work_dir);
+                    }
+                }
+            }
+        }
+    }
+    ok
+}
+
+fn parse_env_file(path: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(f) = File::open(path) else { return out };
+    for line in io::BufReader::new(f).lines().flatten() {
+        let line = line.trim().to_string();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some((k, v)) = line.split_once('=') {
+            // Unescape \n sequences written by write_env_file (e.g. multi-line PEM).
+            let v = v.trim_matches('"').trim_matches('\'').replace("\\n", "\n");
+            out.insert(k.into(), v);
+        }
+    }
+    out
+}
+
+fn open_log(path: &Path) -> File {
+    OpenOptions::new().create(true).append(true).open(path)
+        .unwrap_or_else(|_| panic!("cannot open log {}", path.display()))
+}
+
+fn run_blocking(program: &str, args: &[&str], dir: &Path) -> i32 {
+    Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .status()
+        .ok()
+        .and_then(|s| s.code())
+        .unwrap_or(-1)
+}
+
+/// Returns true when the Docker daemon is reachable.
+fn docker_available() -> bool {
+    Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// How many services in a compose project are currently running.
+fn docker_compose_running_count(project: &str) -> usize {
+    let out = Command::new("docker")
+        .args(["compose", "-p", project, "ps", "--services", "--filter", "status=running"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    out.ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// Run `docker compose -p <project> -f <file> up -d [extra…]`.
+/// Prints a one-line status and returns whether the command succeeded.
+fn docker_compose_up(label: &str, project: &str, compose_file: &Path, work_dir: &Path, extra: &[&str]) -> bool {
+    let running_before = docker_compose_running_count(project);
+    let file_str = compose_file.to_str().unwrap();
+    let mut argv: Vec<&str> = vec!["compose", "-p", project, "-f", file_str];
+    argv.extend_from_slice(extra);
+    argv.extend_from_slice(&["up", "-d", "--remove-orphans"]);
+    let code = run_blocking("docker", &argv, work_dir);
+    if code == 0 {
+        let running_after = docker_compose_running_count(project);
+        let started = running_after.saturating_sub(running_before);
+        if started == 0 {
+            println!("  {GRN}✓{R}  {label} docker deps already up ({running_after} containers)");
+        } else {
+            println!("  {GRN}✓{R}  {label} docker deps started ({started} new, {running_after} total)");
+        }
+        true
+    } else {
+        // Compose can fail when containers with explicit `container_name` already
+        // exist from a previous session started under a different project name
+        // (e.g. via `./dev.sh` before `name:` was added to the compose file).
+        // Check whether the containers are actually up via a broad name-prefix
+        // filter before treating this as a hard failure.
+        let prefix = project.split('-').next().unwrap_or(project);
+        let already_up = Command::new("docker")
+            .args(["ps", "-q", "--filter", &format!("name={}", prefix)])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        if already_up > 0 {
+            println!("  {YLW}⚠{R}  {label} docker deps: {already_up} container(s) already running from a previous session — proceeding");
+            println!("  {DIM}  Tip: run `docker compose down` in the repo directory to clean up old containers{R}");
+            return true;
+        }
+        println!("  {RED}✗{R}  {label} docker deps failed (exit {code}) — services depending on them will degrade");
+        false
+    }
+}
+
+fn spawn_svc(
+    program: &str,
+    args: &[&str],
+    dir: &Path,
+    extra_env: &HashMap<String, String>,
+    log: &Path,
+) -> io::Result<(Child, i32)> {
+    let log_out = open_log(log);
+    let log_err = log_out.try_clone()?;
+    let mut cmd = Command::new(program);
+    cmd .args(args)
+        .current_dir(dir)
+        .envs(extra_env)
+        .stdin(Stdio::null())
+        .stdout(log_out)
+        .stderr(log_err);
+    cmd.process_group(0);
+    let child = cmd.spawn()?;
+    let pgid  = child.id() as i32;
+    Ok((child, pgid))
+}
+
+fn probe(url: &str) -> bool {
+    match ureq::get(url).timeout(Duration::from_secs(2)).call() {
+        Ok(r)                              => r.status() < 500,
+        Err(ureq::Error::Status(code, _)) => code < 500, // 4xx = server is up, auth/not-found
+        Err(_)                            => false,       // connection refused / timeout
+    }
+}
+
+
+// ── LLM helpers ───────────────────────────────────────────────────────────────
+
+/// Escape a string for JSON — wraps in quotes and escapes special chars.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {},
+            c    => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Extract the first JSON string value after `"key":` in a flat response body.
+fn extract_json_string(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\":", key);
+    let start  = body.find(&needle)? + needle.len();
+    let rest   = body[start..].trim_start();
+    if !rest.starts_with('"') { return None; }
+    let inner  = &rest[1..];
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    loop {
+        match chars.next()? {
+            '"'  => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                c   => out.push(c),
+            },
+            c    => out.push(c),
+        }
+    }
+}
+
+/// Call the Anthropic Messages API (`{base_url}/messages`) and return the first text block.
+fn call_anthropic(cfg: &LlmConfig, prompt: &str) -> Option<String> {
+    let url  = format!("{}/messages", cfg.base_url);
+    let body = format!(
+        "{{\"model\":{},\"max_tokens\":256,\"messages\":[{{\"role\":\"user\",\"content\":{}}}]}}",
+        json_string(&cfg.model),
+        json_string(prompt),
+    );
+    let resp = ureq::post(&url)
+        .set("x-api-key", &cfg.api_key)
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .timeout(Duration::from_secs(15))
+        .send_string(&body)
+        .ok()?;
+    let text = resp.into_string().ok()?;
+    // Parse: {"content":[{"type":"text","text":"..."}], ...}
+    extract_json_string(&text, "text")
+}
+
+/// Call an OpenAI-compatible Chat Completions endpoint (`{base_url}/chat/completions`).
+/// Works with OpenAI, Ollama, LiteLLM, Azure OpenAI, Mistral, and any compatible provider.
+fn call_openai_compatible(cfg: &LlmConfig, prompt: &str) -> Option<String> {
+    let url  = format!("{}/chat/completions", cfg.base_url);
+    let body = format!(
+        "{{\"model\":{},\"max_tokens\":256,\"messages\":[{{\"role\":\"user\",\"content\":{}}}]}}",
+        json_string(&cfg.model),
+        json_string(prompt),
+    );
+    let mut req = ureq::post(&url)
+        .set("content-type", "application/json")
+        .timeout(Duration::from_secs(15));
+    if !cfg.api_key.is_empty() {
+        req = req.set("authorization", &format!("Bearer {}", cfg.api_key));
+    }
+    let resp = req.send_string(&body).ok()?;
+    let text = resp.into_string().ok()?;
+    // Parse: {"choices":[{"message":{"content":"..."}}], ...}
+    let choices_pos = text.find("\"choices\"")?;
+    extract_json_string(&text[choices_pos..], "content")
+}
+
+/// Ask the configured LLM to diagnose a crash based on the tail of the log.
+fn llm_diagnose(cfg: &LlmConfig, log_tail: &str) -> Option<String> {
+    let prompt = format!(
+        "You are a dev-tools assistant. A local development service crashed. \
+         The last lines of its log are below. In one short sentence (max 120 chars), \
+         state the most likely cause and the single best fix. \
+         Be direct — no preamble.\n\nLog tail:\n{log_tail}"
+    );
+    match cfg.provider {
+        LlmProvider::Anthropic       => call_anthropic(cfg, &prompt),
+        LlmProvider::OpenAICompatible => call_openai_compatible(cfg, &prompt),
+    }
+}
+
+// ── Diagnosis helpers ─────────────────────────────────────────────────────────
+
+/// Scan the last 200 lines of a log for a known pattern.
+/// Returns the human-readable reason for the first match, or `None`.
+fn check_diag_patterns(log_path: &Path) -> Option<String> {
+    let lines = tail_file(log_path, 200);
+    for line in &lines {
+        let lower = line.to_lowercase();
+        for (needle, reason) in DIAG_PATTERNS {
+            if lower.contains(needle) {
+                return Some(reason.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Diagnose a crash: pattern match first; fall back to LLM if no pattern found.
+fn diagnose_crash(log_path: &Path, llm: Option<&LlmConfig>) -> Option<String> {
+    // 1. Known-pattern fast path.
+    if let Some(reason) = check_diag_patterns(log_path) {
+        return Some(reason);
+    }
+    // 2. LLM fallback — only if configured.
+    let cfg = llm?;
+    let tail = tail_file(log_path, 60).join("\n");
+    if tail.trim().is_empty() { return None; }
+    llm_diagnose(cfg, &tail)
+}
+
+// ── LLM config resolution ─────────────────────────────────────────────────────
+
+/// Resolve the LLM config.
+///
+/// Priority for each field:
+///   api_key  : config file → `FILIGRAN_LLM_KEY` env var (empty = LLM disabled)
+///   url      : config file → inferred from provider/key
+///   provider : config file → inferred from url → inferred from key prefix
+///   model    : config file → provider default
+///
+/// Provider inference rules (when not explicitly set):
+///   - URL contains "anthropic"       → Anthropic
+///   - URL set (other)                → OpenAICompatible
+///   - No URL, key starts "sk-ant-"   → Anthropic (default URL)
+///   - No URL, other key              → OpenAICompatible (default URL)
+fn resolve_llm_config(dev_cfg: Option<&DevConfig>) -> Option<LlmConfig> {
+    // API key — empty string is treated as "not set".
+    let api_key = dev_cfg
+        .and_then(|c| c.llm_api_key.as_deref())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("FILIGRAN_LLM_KEY").ok())
+        .unwrap_or_default();
+
+    // URL is required when no key is set (allows keyless local providers like Ollama).
+    let custom_url = dev_cfg.and_then(|c| c.llm_url.as_deref());
+    if api_key.trim().is_empty() && custom_url.is_none() { return None; }
+
+    // Explicit provider hint from config.
+    let provider_hint = dev_cfg.and_then(|c| c.llm_provider.as_deref());
+
+    // Determine provider: explicit > URL > key prefix > default OpenAICompatible.
+    let is_anthropic = match provider_hint {
+        Some(p) => p.eq_ignore_ascii_case("anthropic"),
+        None    => custom_url.map(|u| u.contains("anthropic")).unwrap_or(false)
+                   || (custom_url.is_none() && api_key.starts_with("sk-ant-")),
+    };
+
+    let (provider, default_url, default_model) = if is_anthropic {
+        (LlmProvider::Anthropic,        "https://api.anthropic.com/v1", "claude-haiku-4-5-20251001")
+    } else {
+        (LlmProvider::OpenAICompatible, "https://api.openai.com/v1",    "gpt-4o-mini")
+    };
+
+    let base_url = custom_url.unwrap_or(default_url).trim_end_matches('/').to_string();
+
+    let model = dev_cfg
+        .and_then(|c| c.llm_model.as_deref())
+        .unwrap_or(default_model)
+        .to_string();
+
+    Some(LlmConfig { provider, api_key, model, base_url })
+}
+
+// ── Persistent configuration ──────────────────────────────────────────────────
+
+struct DevConfig {
+    workspace_root: PathBuf,
+    /// API key sent to the provider. Can also be set via FILIGRAN_LLM_KEY env var.
+    /// May be empty for local providers like Ollama that require no authentication.
+    llm_api_key:    Option<String>,
+    /// Base URL of the LLM provider, e.g.:
+    ///   https://api.anthropic.com/v1          (Anthropic — default when key starts sk-ant-)
+    ///   https://api.openai.com/v1             (OpenAI — default for other keys)
+    ///   http://localhost:4000/v1              (LiteLLM proxy)
+    ///   http://localhost:11434/v1             (Ollama)
+    ///   https://<endpoint>.openai.azure.com/openai/deployments/<name>
+    llm_url:        Option<String>,
+    /// Force provider format: "anthropic" or "openai" (auto-inferred from URL when omitted).
+    llm_provider:   Option<String>,
+    /// Model name override — defaults to claude-haiku-4-5-20251001 (Anthropic) or gpt-4o-mini.
+    llm_model:      Option<String>,
+}
+
+/// `~/.dev-launcher/config`
+fn config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".dev-launcher/config")
+}
+
+/// Expand a leading `~/` to the real home directory.
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(rest)
+    } else {
+        PathBuf::from(s)
+    }
+}
+
+fn load_config() -> Option<DevConfig> {
+    let path = config_path();
+    if !path.exists() { return None; }
+    let map = parse_env_file(&path);
+    let root_str = map.get("workspace_root")?;
+    let root = expand_tilde(root_str);
+    if root.is_dir() {
+        Some(DevConfig {
+            workspace_root: root,
+            llm_api_key:  map.get("llm_api_key").cloned(),
+            llm_url:      map.get("llm_url").cloned(),
+            llm_provider: map.get("llm_provider").cloned(),
+            llm_model:    map.get("llm_model").cloned(),
+        })
+    } else {
+        // Saved path is stale — fall through to wizard.
+        println!("  {YLW}⚠{R}  Config workspace_root no longer exists: {}", root.display());
+        println!("  {DIM}(saved in {}){R}", config_path().display());
+        println!();
+        None
+    }
+}
+
+fn save_config(config: &DevConfig) {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut content = format!("workspace_root={}\n", config.workspace_root.display());
+    if let Some(k) = &config.llm_api_key  { content.push_str(&format!("llm_api_key={k}\n")); }
+    if let Some(u) = &config.llm_url      { content.push_str(&format!("llm_url={u}\n")); }
+    if let Some(p) = &config.llm_provider { content.push_str(&format!("llm_provider={p}\n")); }
+    if let Some(m) = &config.llm_model    { content.push_str(&format!("llm_model={m}\n")); }
+    let _ = fs::write(&path, content);
+}
+
+// ── Repository registry ───────────────────────────────────────────────────────
+
+/// Default registry embedded at compile time from `repos.conf` next to Cargo.toml.
+/// Users can override by placing their own copy at `~/.dev-launcher/repos.conf`.
+const DEFAULT_REPOS_CONF: &str = include_str!("../repos.conf");
+
+#[derive(Clone)]
+struct RepoEntry {
+    /// Local directory name (used as clone destination and worktree base).
+    dir:   String,
+    label: String,
+    url:   String,
+    group: String,
+}
+
+fn repos_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".dev-launcher/repos.conf")
+}
+
+/// Parse an INI-style repos.conf into a list of `RepoEntry` values.
+/// Sections: `[dir-name]`; fields: `label`, `url`, `group`.
+fn parse_repos_conf(content: &str) -> Vec<RepoEntry> {
+    let mut entries: Vec<RepoEntry> = Vec::new();
+    let mut dir   = String::new();
+    let mut label = String::new();
+    let mut url   = String::new();
+    let mut group = String::new();
+
+    let flush = |dir: &str, label: &str, url: &str, group: &str, out: &mut Vec<RepoEntry>| {
+        if !dir.is_empty() && !url.is_empty() {
+            out.push(RepoEntry {
+                dir:   dir.to_string(),
+                label: if label.is_empty() { dir.to_string() } else { label.to_string() },
+                url:   url.to_string(),
+                group: group.to_string(),
+            });
+        }
+    };
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.starts_with('[') && line.ends_with(']') {
+            flush(&dir, &label, &url, &group, &mut entries);
+            dir   = line[1..line.len()-1].trim().to_string();
+            label = String::new();
+            url   = String::new();
+            group = String::new();
+        } else if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "label" => label = v.trim().to_string(),
+                "url"   => url   = v.trim().to_string(),
+                "group" => group = v.trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+    flush(&dir, &label, &url, &group, &mut entries);
+    entries
+}
+
+/// Load repo registry: user override (`~/.dev-launcher/repos.conf`) or embedded default.
+fn load_repos() -> Vec<RepoEntry> {
+    let user_path = repos_config_path();
+    if user_path.exists() {
+        if let Ok(content) = fs::read_to_string(&user_path) {
+            let entries = parse_repos_conf(&content);
+            if !entries.is_empty() { return entries; }
+        }
+    }
+    parse_repos_conf(DEFAULT_REPOS_CONF)
+}
+
+// ── Clone selector TUI ────────────────────────────────────────────────────────
+
+struct CloneChoice {
+    entry:   RepoEntry,
+    /// Selected for cloning.
+    enabled: bool,
+    /// Already present on disk — shown as cloned, not toggleable.
+    present: bool,
+}
+
+fn render_clone_selector(dest: &Path, choices: &[CloneChoice], cursor: usize) {
+    let sep = "─".repeat(70);
+    print!("\x1b[H\x1b[2J");
+    println!("\n  {BOLD}{CYN}dev-feature  —  clone repositories{R}\n");
+    println!("  {DIM}Destination: {}{R}", dest.display());
+    println!("\n  {DIM}{sep}{R}");
+    println!("  {BOLD}Select repositories to clone{R}");
+    println!("  {DIM}{sep}{R}\n");
+
+    let mut last_group = "";
+    for (i, c) in choices.iter().enumerate() {
+        // Group header
+        if c.entry.group != last_group && !c.entry.group.is_empty() {
+            if i > 0 { println!(); }
+            println!("  {DIM}{}{R}", c.entry.group);
+            last_group = &c.entry.group;
+        }
+
+        let marker = if i == cursor { format!("{CYN}{BOLD}▶{R} ") } else { "  ".to_string() };
+
+        let checkbox = if c.present {
+            format!("{DIM}[✓ cloned]{R}  ")
+        } else if c.enabled {
+            format!("{GRN}[{BOLD}✓{R}{GRN}]{R}        ")
+        } else {
+            format!("{DIM}[ ]{R}        ")
+        };
+
+        let name = if c.present {
+            format!("{DIM}{:<28}{R}", c.entry.label)
+        } else if i == cursor {
+            format!("{BOLD}{:<28}{R}", c.entry.label)
+        } else {
+            format!("{:<28}", c.entry.label)
+        };
+
+        println!("  {marker}{checkbox}  {name}  {DIM}{}{R}", c.entry.url);
+    }
+
+    println!();
+    println!("  {DIM}{sep}{R}");
+    println!("  {DIM}↑↓ / j k  navigate   Space toggle   a all   n none   Enter clone   q skip{R}");
+    println!();
+    let _ = io::stdout().flush();
+}
+
+/// Interactive clone selector. Returns `true` if the user confirmed, `false` if skipped.
+fn run_clone_selector(dest: &Path, choices: &mut Vec<CloneChoice>) -> bool {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 { return false; }
+    let mut raw = RawMode::enter();
+    let mut cursor = 0usize;
+    if let Some(first) = choices.iter().position(|c| !c.present) { cursor = first; }
+    let mut buf = [0u8; 16];
+    loop {
+        render_clone_selector(dest, choices, cursor);
+        thread::sleep(Duration::from_millis(20));
+        let n = unsafe {
+            libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        if n <= 0 { continue; }
+        match &buf[..n as usize] {
+            [27, b'[', b'A'] | [b'k'] => { cursor = cursor.saturating_sub(1); }
+            [27, b'[', b'B'] | [b'j'] => { if cursor + 1 < choices.len() { cursor += 1; } }
+            [b' '] => {
+                if !choices[cursor].present {
+                    choices[cursor].enabled = !choices[cursor].enabled;
+                }
+            }
+            // Select all missing
+            [b'a'] | [b'A'] => {
+                for c in choices.iter_mut() { if !c.present { c.enabled = true; } }
+            }
+            // Deselect all
+            [b'n'] | [b'N'] => {
+                for c in choices.iter_mut() { if !c.present { c.enabled = false; } }
+            }
+            [b'\r'] | [b'\n'] => { drop(raw.take()); return true; }
+            [b'q'] | [b'Q'] | [27] => { drop(raw.take()); return false; }
+            _ => {}
+        }
+    }
+}
+
+/// Clone selected repos. Git output streams directly to the terminal.
+fn clone_repos(dest: &Path, choices: &[CloneChoice]) {
+    let sep = "─".repeat(60);
+    println!("\n  {BOLD}Cloning into {}{R}", dest.display());
+    println!("  {DIM}{sep}{R}\n");
+    for c in choices.iter().filter(|c| c.enabled && !c.present) {
+        println!("  {CYN}▶{R}  {} — {DIM}{}{R}", c.entry.label, c.entry.url);
+        let target = dest.join(&c.entry.dir).to_string_lossy().into_owned();
+        let status = Command::new("git")
+            .args(["clone", &c.entry.url, &target])
+            .current_dir(dest)
+            .stdin(Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() =>
+                println!("  {GRN}✓{R}  {} cloned\n", c.entry.label),
+            Ok(s) =>
+                println!("  {RED}✗{R}  {} failed (exit {})\n", c.entry.label, s.code().unwrap_or(-1)),
+            Err(e) =>
+                println!("  {RED}✗{R}  {} error: {e}\n", c.entry.label),
+        }
+    }
+    println!("  {DIM}{sep}{R}\n");
+}
+
+/// First-run interactive wizard: ask for workspace root, optionally clone repos, persist.
+fn run_config_wizard() -> PathBuf {
+    let sep = "─".repeat(60);
+    println!("\n  {BOLD}{CYN}dev-feature  —  first-run setup{R}\n");
+    println!("  {DIM}{sep}{R}");
+    println!("  Workspace root not configured.\n");
+    println!("  Enter the directory that will contain:");
+    println!("  {DIM}  filigran-copilot/   opencti/   connectors/   openaev/{R}\n");
+    println!("  The directory can be new — repositories can be cloned for you.");
+    println!();
+    println!("  You can override this setting later with:");
+    println!("  {DIM}  --workspace-root <path>{R}");
+    println!("  {DIM}  FILIGRAN_WORKSPACE_ROOT=<path>{R}");
+    println!("  {DIM}  edit {}{R}", config_path().display());
+    println!("\n  {DIM}{sep}{R}\n");
+
+    loop {
+        print!("  Workspace root path: ");
+        let _ = io::stdout().flush();
+        let input = match read_line_or_interrupt() {
+            None => { println!("\n  {YLW}Aborted.{R}"); std::process::exit(0); }
+            Some(s) => s,
+        };
+        let trimmed = input.trim();
+        if trimmed.is_empty() { continue; }
+
+        let candidate = expand_tilde(trimmed);
+
+        // Create directory if it doesn't exist.
+        if !candidate.exists() {
+            print!("  Directory does not exist. Create it? {DIM}[Y/n]{R} ");
+            let _ = io::stdout().flush();
+            match read_line_or_interrupt() {
+                None => { println!("\n  {YLW}Aborted.{R}"); std::process::exit(0); }
+                Some(s) if matches!(s.trim().to_ascii_lowercase().as_str(), "n" | "no") => {
+                    println!("  Skipped.");
+                    continue;
+                }
+                _ => {
+                    if let Err(e) = fs::create_dir_all(&candidate) {
+                        println!("  {RED}✗{R}  Could not create directory: {e}");
+                        continue;
+                    }
+                    println!("  {GRN}✓{R}  Created {}", candidate.display());
+                }
+            }
+        }
+
+        if !candidate.is_dir() {
+            println!("  {RED}✗{R}  Not a directory: {}", candidate.display());
+            continue;
+        }
+
+        // Offer to clone any repositories not yet present.
+        let repos = load_repos();
+        let mut clone_choices: Vec<CloneChoice> = repos.into_iter().map(|entry| {
+            let present = candidate.join(&entry.dir).is_dir();
+            CloneChoice { entry, enabled: !present, present }
+        }).collect();
+
+        let any_missing = clone_choices.iter().any(|c| !c.present);
+        if any_missing {
+            println!();
+            println!("  {DIM}Some repositories are not yet present in this directory.{R}");
+            if run_clone_selector(&candidate, &mut clone_choices) {
+                let any_selected = clone_choices.iter().any(|c| c.enabled && !c.present);
+                if any_selected {
+                    clone_repos(&candidate, &clone_choices);
+                }
+            } else {
+                println!("  {DIM}Cloning skipped — you can run git clone manually later.{R}\n");
+            }
+        }
+
+        let cfg = DevConfig {
+            workspace_root: candidate.clone(),
+            llm_api_key: None, llm_url: None, llm_provider: None, llm_model: None,
+        };
+        save_config(&cfg);
+        println!("  {GRN}✓{R}  Saved → {}", config_path().display());
+        println!();
+        return candidate;
+    }
+}
+
+/// Resolve the workspace root. Priority:
+///   1. `--workspace-root <path>` CLI flag
+///   2. `FILIGRAN_WORKSPACE_ROOT` env var
+///   3. `workspace_root` key in `~/.config/dev-feature/config`
+///   4. Interactive first-run wizard (saves result to config file)
+fn resolve_workspace_root(args: &Args) -> PathBuf {
+    // 1. CLI flag
+    if let Some(root) = &args.workspace_root {
+        let root = if root.starts_with("~/") {
+            expand_tilde(root.to_str().unwrap_or(""))
+        } else {
+            root.clone()
+        };
+        if root.is_dir() { return root; }
+        eprintln!("--workspace-root '{}' is not a directory.", root.display());
+        std::process::exit(1);
+    }
+
+    // 2. Env var
+    if let Ok(raw) = std::env::var("FILIGRAN_WORKSPACE_ROOT") {
+        let root = expand_tilde(raw.trim());
+        if root.is_dir() { return root; }
+        eprintln!("FILIGRAN_WORKSPACE_ROOT='{}' is not a directory.", root.display());
+        std::process::exit(1);
+    }
+
+    // 3. Config file
+    if let Some(cfg) = load_config() {
+        return cfg.workspace_root;
+    }
+
+    // 4. First-run wizard
+    run_config_wizard()
+}
+
+// ── Connector bootstrapping ───────────────────────────────────────────────────
+
+fn ensure_connector_env(dir: &Path) -> PathBuf {
+    let path = dir.join(".env.dev");
+    if !path.exists() {
+        let _ = fs::write(&path, "\
+# Connector dev environment — fill in before running\n\
+OPENCTI_URL=http://localhost:4000\n\
+OPENCTI_TOKEN=ChangeMe\n\
+CONNECTOR_ID=54263257-26dc-4cca-8c45-deea44cdecf1\n\
+CONNECTOR_NAME=ImportDocumentAI\n\
+CONNECTOR_SCOPE=application/pdf,text/plain,text/html,text/markdown\n\
+CONNECTOR_AUTO=false\n\
+CONNECTOR_LOG_LEVEL=debug\n\
+CONNECTOR_WEB_SERVICE_URL=https://importdoc.ariane.testing.filigran.io\n\
+IMPORT_DOCUMENT_CREATE_INDICATOR=false\n\
+IMPORT_DOCUMENT_INCLUDE_RELATIONSHIPS=true\n\
+CONNECTOR_LICENCE_KEY_PEM=\n\
+");
+        println!("  {YLW}Created connector env template — edit before starting:{R}");
+        println!("  {DIM}{}{R}\n", path.display());
+    }
+    path
+}
+
+fn ensure_connector_venv(dir: &Path) -> PathBuf {
+    let venv = dir.join(".venv");
+    if !venv.join("bin/python").exists() {
+        println!("  Creating connector Python venv…");
+        run_blocking("python3", &["-m", "venv", ".venv"], dir);
+        let pip  = venv.join("bin/pip").to_string_lossy().into_owned();
+        let reqs = dir.join("src/requirements.txt").to_string_lossy().into_owned();
+        run_blocking(&pip, &["install", "-q", "-r", &reqs], dir);
+    }
+    venv
+}
+
+/// Ensure Corepack is enabled so that projects with `"packageManager": "yarn@4.x"`
+/// use the correct Yarn version instead of the system's legacy Yarn 1.x.
+///
+/// `corepack enable` replaces the global `yarn` shim with one that reads
+/// `packageManager` from each project's package.json and downloads/activates the
+/// matching version on first use.  It is idempotent and fast when already enabled.
+fn ensure_corepack() {
+    let status = Command::new("corepack")
+        .arg("enable")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("  Corepack enabled — yarn@4 shim active.");
+        }
+        _ => {
+            println!("  {YLW}Could not enable Corepack — yarn@4 projects will fail to start.{R}");
+            println!("  {DIM}Fix: npm install -g corepack   then re-run dev-feature{R}");
+            println!("  {DIM}     (or: sudo corepack enable if node is installed system-wide){R}");
+            println!();
+        }
+    }
+}
+
+/// Returns `Some(reason)` when the connector env file contains unfilled placeholder
+/// values that would cause the connector to crash immediately on startup.
+fn validate_connector_env(env: &HashMap<String, String>) -> Option<String> {
+    let token = env.get("OPENCTI_TOKEN").map(|s| s.as_str()).unwrap_or("");
+    if token.is_empty() || token == "ChangeMe" {
+        return Some("OPENCTI_TOKEN not set — edit .env.dev before running".into());
+    }
+    None
+}
+
+/// Read POSTGRES_PASSWORD from a docker-compose YAML file by scanning for the key.
+/// Returns None if the file can't be read or the key isn't found.
+fn read_compose_postgres_password(compose_file: &Path) -> Option<String> {
+    let content = fs::read_to_string(compose_file).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("POSTGRES_PASSWORD:") {
+            let val = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !val.is_empty() { return Some(val); }
+        }
+    }
+    None
+}
+
+/// Build the DATABASE_URL env var for the Copilot backend by reading the actual
+/// POSTGRES_PASSWORD from docker-compose.dev.yml, so the backend can connect
+/// regardless of what the config.py default says.
+fn copilot_backend_env(copilot_dir: &Path) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    let compose = copilot_dir.join("docker-compose.dev.yml");
+    if let Some(password) = read_compose_postgres_password(&compose) {
+        env.insert(
+            "DATABASE_URL".into(),
+            format!("postgresql+asyncpg://copilot:{password}@localhost:5432/copilot"),
+        );
+    }
+    env
+}
+
+/// Ensure OpenCTI graphql's Python deps (eql, yara-python, pycti…) are installed.
+///
+/// On systems where pip3 cannot install globally (Homebrew-managed Python, PEP 668),
+/// we create a project-local venv at `<graphql_dir>/.python-venv` and install there.
+/// Returns a `PYTHONPATH` value that points at that venv's site-packages so the
+/// Node.js → Python bridge can find the packages at runtime.
+fn ensure_opencti_graphql_python_deps(dir: &Path) -> Option<String> {
+    let venv = dir.join(".python-venv");
+    let venv_python = venv.join("bin/python3");
+    let reqs = dir.join("src/python/requirements.txt");
+    if !reqs.exists() { return None; }
+
+    // Create venv if it doesn't exist yet.
+    if !venv_python.exists() {
+        println!("  Creating OpenCTI graphql Python venv…");
+        let ok = run_blocking("python3", &["-m", "venv", venv.to_str().unwrap()], dir);
+        if ok != 0 {
+            println!("  {YLW}Could not create Python venv — opencti-graphql may fail.{R}");
+            return None;
+        }
+    }
+
+    // Check if eql is already installed in the venv.
+    let already = Command::new(venv_python.to_str().unwrap())
+        .args(["-c", "import eql"])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false);
+
+    if !already {
+        println!("  Installing OpenCTI graphql Python deps (eql, yara, pycti…)");
+        let pip = venv.join("bin/pip3").to_string_lossy().into_owned();
+        run_blocking(&pip, &["install", "-q", "-r", reqs.to_str().unwrap()], dir);
+    }
+
+    // Return the site-packages path so the caller can set PYTHONPATH.
+    let site_packages = Command::new(venv_python.to_str().unwrap())
+        .args(["-c", "import site; print(site.getsitepackages()[0])"])
+        .stdin(Stdio::null()).stderr(Stdio::null())
+        .output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    site_packages
+}
+
+fn ensure_copilot_fe_deps(dir: &Path) {
+    if !dir.join("node_modules").is_dir() {
+        println!("  Installing Copilot frontend deps…");
+        run_blocking("yarn", &["install"], dir);
+    }
+}
+
+fn ensure_opencti_fe_deps(dir: &Path) {
+    if !dir.join("node_modules").is_dir() {
+        println!("  Installing OpenCTI frontend deps…");
+        run_blocking("yarn", &["install"], dir);
+    }
+}
+
+fn ensure_openaev_fe_deps(dir: &Path) {
+    if !dir.join("node_modules").is_dir() {
+        println!("  Installing OpenAEV frontend deps…");
+        run_blocking("yarn", &["install"], dir);
+    }
+}
+
+/// Ensure `openaev-dev/.env` exists, created from `.env.example` if needed.
+fn ensure_openaev_dev_env(dev_dir: &Path) {
+    let env_path = dev_dir.join(".env");
+    if !env_path.exists() {
+        let example = dev_dir.join(".env.example");
+        if example.exists() {
+            let _ = fs::copy(&example, &env_path);
+            println!("  {YLW}Created openaev-dev/.env from .env.example — defaults are fine for local dev.{R}");
+        }
+    }
+}
+
+/// Resolve the Maven executable: prefer `mvnw` wrapper in the repo root, fall back to `mvn`.
+fn maven_cmd(openaev_root: &Path) -> String {
+    let wrapper = openaev_root.join("mvnw");
+    if wrapper.exists() {
+        wrapper.to_string_lossy().into_owned()
+    } else {
+        "mvn".to_string()
+    }
+}
+
+// ── Environment wizard ────────────────────────────────────────────────────────
+
+/// A required variable that the wizard will prompt for when missing or placeholder.
+struct EnvVar {
+    key:         &'static str,
+    /// Short label shown in the audit table.
+    label:       &'static str,
+    /// One-line hint shown below the variable name during prompting.
+    hint:        &'static str,
+    /// True → mask the current value in the audit table (tokens, certs, keys).
+    secret:      bool,
+    /// True → accept multiple lines until the user types END on its own line.
+    multiline:   bool,
+    /// True → generate a random UUID v4 when the user leaves the prompt blank.
+    auto_uuid:   bool,
+    /// True → generate 32 random bytes as base64 when the user leaves the prompt blank.
+    auto_b64:    bool,
+}
+
+/// Variables required to boot OpenCTI for the first time.
+/// `APP__ADMIN__TOKEN` doubles as the value you'll later paste into the connector as
+/// `OPENCTI_TOKEN`, so knowing it up-front saves a second wizard run.
+const OPENCTI_ENV_VARS: &[EnvVar] = &[
+    EnvVar {
+        key:       "APP__ADMIN__EMAIL",
+        label:     "Admin e-mail",
+        hint:      "Login e-mail for the built-in admin account (any valid address works)",
+        secret:    false,
+        multiline: false,
+        auto_uuid: false,
+        auto_b64:  false,
+    },
+    EnvVar {
+        key:       "APP__ADMIN__PASSWORD",
+        label:     "Admin password",
+        hint:      "Password for the built-in admin account (anything except 'ChangeMe')",
+        secret:    true,
+        multiline: false,
+        auto_uuid: false,
+        auto_b64:  false,
+    },
+    EnvVar {
+        key:       "APP__ADMIN__TOKEN",
+        label:     "Admin API token (UUID)",
+        hint:      "Leave blank to auto-generate — copy this value into OPENCTI_TOKEN for the connector",
+        secret:    true,
+        multiline: false,
+        auto_uuid: true,
+        auto_b64:  false,
+    },
+    EnvVar {
+        key:       "APP__ENCRYPTION_KEY",
+        label:     "Encryption key (base64)",
+        hint:      "Leave blank to auto-generate — equivalent to: openssl rand -base64 32",
+        secret:    true,
+        multiline: false,
+        auto_uuid: false,
+        auto_b64:  true,
+    },
+];
+
+/// Create `<graphql_dir>/.env.dev` from defaults if it doesn't exist yet.
+fn ensure_opencti_env(gql_dir: &Path) {
+    let path = gql_dir.join(".env.dev");
+    if !path.exists() {
+        let _ = fs::write(&path, "\
+# OpenCTI graphql dev environment — generated by dev-feature\n\
+# Leave TOKEN and ENCRYPTION_KEY as ChangeMe; the wizard will auto-generate them.\n\
+APP__ADMIN__EMAIL=admin@opencti.io\n\
+APP__ADMIN__PASSWORD=ChangeMe\n\
+APP__ADMIN__TOKEN=ChangeMe\n\
+APP__ENCRYPTION_KEY=ChangeMe\n\
+");
+    }
+}
+
+/// Variables that require real user-supplied values before the connector can start.
+/// Variables with sensible defaults (OPENCTI_URL, CONNECTOR_ID, …) are omitted.
+const CONNECTOR_ENV_VARS: &[EnvVar] = &[
+    EnvVar {
+        key:       "OPENCTI_TOKEN",
+        label:     "OpenCTI API token",
+        hint:      "Same value as APP__ADMIN__TOKEN set during OpenCTI setup",
+        secret:    true,
+        multiline: false,
+        auto_uuid: false,
+        auto_b64:  false,
+    },
+    EnvVar {
+        key:       "CONNECTOR_LICENCE_KEY_PEM",
+        label:     "Filigran licence certificate (PEM)",
+        hint:      "Paste the full -----BEGIN CERTIFICATE----- … -----END CERTIFICATE----- block",
+        secret:    true,
+        multiline: true,
+        auto_uuid: false,
+        auto_b64:  false,
+    },
+];
+
+/// Read `n` random bytes from /dev/urandom.
+fn rand_bytes(n: usize) -> Vec<u8> {
+    use io::Read as _;
+    let mut buf = vec![0u8; n];
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    buf
+}
+
+/// Generate a random UUID v4.
+fn gen_uuid() -> String {
+    let mut b = rand_bytes(16);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant RFC 4122
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7], b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15],
+    )
+}
+
+/// Generate 32 random bytes encoded as base64 — suitable for APP__ENCRYPTION_KEY.
+fn gen_base64_key() -> String {
+    use std::fmt::Write as _;
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = rand_bytes(33); // 33 bytes → 44 base64 chars, no padding issues
+    let mut out = String::with_capacity(44);
+    for chunk in bytes[..33].chunks(3) {
+        let n = match chunk.len() {
+            3 => (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8 | chunk[2] as u32,
+            2 => (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8,
+            _ => (chunk[0] as u32) << 16,
+        };
+        let _ = write!(out, "{}{}{}{}", TABLE[(n >> 18 & 63) as usize] as char,
+            TABLE[(n >> 12 & 63) as usize] as char,
+            if chunk.len() > 1 { TABLE[(n >> 6 & 63) as usize] as char } else { '=' },
+            if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Placeholder values that count as "not set".
+fn is_placeholder(v: &str) -> bool {
+    matches!(v.trim(), "" | "ChangeMe" | "changeme" | "TODO" | "CHANGEME")
+}
+
+/// Rewrite `path` preserving comments and key ordering.
+/// Actual newlines in values are escaped to `\n` so the file stays single-line per key.
+fn write_env_file(path: &Path, env: &HashMap<String, String>) {
+    let original = fs::read_to_string(path).unwrap_or_default();
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut lines: Vec<String> = Vec::new();
+
+    for line in original.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            lines.push(line.to_string());
+            continue;
+        }
+        if let Some((k, _)) = trimmed.split_once('=') {
+            let k = k.trim();
+            if let Some(val) = env.get(k) {
+                lines.push(format!("{}={}", k, val.replace('\n', "\\n")));
+                written.insert(k.to_string());
+                continue;
+            }
+        }
+        lines.push(line.to_string());
+    }
+
+    // Append keys that were not present in the original file.
+    for (k, v) in env {
+        if !written.contains(k.as_str()) {
+            lines.push(format!("{}={}", k, v.replace('\n', "\\n")));
+        }
+    }
+
+    let mut content = lines.join("\n");
+    if !content.ends_with('\n') { content.push('\n'); }
+    let _ = fs::write(path, content);
+}
+
+/// Read one line from stdin.
+///
+/// Returns `None` on:
+/// - Ctrl+C  (SIGINT interrupts the blocking read → `Err(Interrupted)`)
+/// - Ctrl+D  (EOF → `Ok(0)` bytes read)
+/// - Any other I/O error
+///
+/// Returns `Some(line)` otherwise, with the trailing newline stripped.
+fn read_line_or_interrupt() -> Option<String> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = unsafe {
+            libc::read(libc::STDIN_FILENO, byte.as_mut_ptr() as *mut libc::c_void, 1)
+        };
+        if n <= 0 {
+            return None;
+        }
+        match byte[0] {
+            b'\n' => break,
+            b'\r' => continue, // skip CR from CRLF terminals (ICRNL may produce double newline)
+            b => buf.push(b),
+        }
+    }
+    String::from_utf8(buf).ok().map(|s| s.trim_end().to_string())
+}
+
+/// Interactive env setup wizard for a single `.env` file.
+///
+/// Shows an audit table of `vars`, then prompts the user to fill in any that are
+/// missing or still hold placeholder values.  Writes the result back to `env_path`.
+/// No-ops silently when stdin is not a TTY (CI / piped input).
+///
+/// Escapable at every prompt:
+///   - Ctrl+C / Ctrl+D  →  aborts the wizard immediately
+///   - `q` at the confirmation prompt  →  skips the wizard
+///   - `q` at a single-line value prompt  →  aborts the wizard
+fn run_env_wizard(env_path: &Path, vars: &[EnvVar], service_label: &str) {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 { return; }
+
+    let mut env = parse_env_file(env_path);
+
+    // ── Audit ─────────────────────────────────────────────────────────────────
+    let missing: Vec<&EnvVar> = vars.iter()
+        .filter(|v| is_placeholder(env.get(v.key).map(|s| s.as_str()).unwrap_or("")))
+        .collect();
+
+    println!("  {BOLD}{service_label}{R}");
+    for v in vars {
+        let cur = env.get(v.key).map(|s| s.as_str()).unwrap_or("");
+        let (icon, display) = if is_placeholder(cur) {
+            (format!("{RED}✗{R}"), format!("{RED}not set{R}"))
+        } else if v.secret {
+            (format!("{GRN}✓{R}"), format!("{GRN}[set]{R}"))
+        } else {
+            let preview: String = cur.chars().take(48).collect();
+            (format!("{GRN}✓{R}"), format!("{GRN}{preview}{R}"))
+        };
+        println!("  {icon}  {:<38} {display}", v.key);
+    }
+    println!();
+
+    if missing.is_empty() {
+        println!("  {GRN}All required variables are set.{R}");
+        println!();
+        return;
+    }
+
+    // ── Confirmation prompt ───────────────────────────────────────────────────
+    println!("  {YLW}{} variable{} not set.{R}",
+        missing.len(), if missing.len() == 1 { " is" } else { "s are" });
+    print!("  Configure {} now? {DIM}[Y/n/q]{R} ",
+        if missing.len() == 1 { "it" } else { "them" });
+    let _ = io::stdout().flush();
+
+    let answer = match read_line_or_interrupt() {
+        None => {
+            println!("\n  {YLW}Interrupted — skipping {service_label}.{R}\n");
+            return;
+        }
+        Some(a) => a,
+    };
+
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "n" => {
+            println!("  {YLW}Skipped — {service_label} will fail until these are set.{R}\n");
+            return;
+        }
+        "q" => {
+            println!("  {YLW}Wizard aborted.{R}\n");
+            return;
+        }
+        _ => {}
+    }
+    println!();
+
+    // ── Per-variable prompts ──────────────────────────────────────────────────
+    let mut changed = false;
+    for v in &missing {
+        println!("  {BOLD}{CYN}{}{R}  {DIM}({}){R}", v.key, v.label);
+        println!("  {DIM}{}{R}", v.hint);
+        println!();
+
+        let value: String = if v.multiline {
+            println!("  {DIM}Paste the value. Type {BOLD}END{R}{DIM} on its own line when done, or {BOLD}Ctrl+C{R}{DIM} to abort:{R}");
+            let mut lines: Vec<String> = Vec::new();
+            loop {
+                match read_line_or_interrupt() {
+                    None => {
+                        println!("\n  {YLW}Interrupted — wizard aborted.{R}\n");
+                        // Persist whatever was already changed before bailing.
+                        if changed { write_env_file(env_path, &env); }
+                        return;
+                    }
+                    Some(s) if s == "END" => break,
+                    Some(s) => lines.push(s),
+                }
+            }
+            lines.join("\n")
+        } else {
+            print!("  {DIM}Value (q to skip):{R} ");
+            let _ = io::stdout().flush();
+            match read_line_or_interrupt() {
+                None => {
+                    println!("\n  {YLW}Interrupted — wizard aborted.{R}\n");
+                    if changed { write_env_file(env_path, &env); }
+                    return;
+                }
+                Some(s) if matches!(s.trim(), "q" | "Q") => {
+                    println!("  {YLW}Wizard aborted.{R}\n");
+                    if changed { write_env_file(env_path, &env); }
+                    return;
+                }
+                Some(s) => s.trim().to_string(),
+            }
+        };
+
+        let final_value = if value.trim().is_empty() && v.auto_uuid {
+            let uuid = gen_uuid();
+            println!("  {GRN}Auto-generated:{R}  {DIM}{uuid}{R}\n");
+            uuid
+        } else if value.trim().is_empty() && v.auto_b64 {
+            let key = gen_base64_key();
+            println!("  {GRN}Auto-generated:{R}  {DIM}{key}{R}\n");
+            key
+        } else {
+            value
+        };
+
+        if final_value.trim().is_empty() {
+            println!("  {YLW}No input — {}{R} left unset.\n", v.key);
+        } else {
+            env.insert(v.key.to_string(), final_value);
+            changed = true;
+            println!("  {GRN}✓{R}  {}\n", v.key);
+        }
+    }
+
+    // ── Persist ───────────────────────────────────────────────────────────────
+    if changed {
+        write_env_file(env_path, &env);
+        println!("  {GRN}Saved → {}{R}", env_path.display());
+    } else {
+        println!("  {YLW}Nothing changed.{R}");
+    }
+    println!();
+}
+
+// ── Product selector ─────────────────────────────────────────────────────────
+
+struct ProductChoice {
+    label:     &'static str,
+    desc:      &'static str,
+    repo:      &'static str,  // bare repo dir name: "filigran-copilot", "opencti", …
+    /// Currently checked by the user.
+    enabled:   bool,
+    /// The directory for this product exists on disk (or will be created).
+    available: bool,
+    /// Branch to launch this product on. May differ per product.
+    branch:    String,
+}
+
+fn render_product_selector(slug: &str, choices: &[ProductChoice], cursor: usize) {
+    let sep = "─".repeat(72);
+    print!("\x1b[H\x1b[2J");
+    println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}{slug}{R}\n");
+    println!("  {DIM}{sep}{R}");
+    println!("  {BOLD}Launch configuration{R}  {DIM}— pick what to start{R}");
+    println!("  {DIM}{sep}{R}\n");
+
+    for (i, c) in choices.iter().enumerate() {
+        let marker = if i == cursor {
+            format!("{CYN}{BOLD}▶{R} ")
+        } else {
+            "  ".to_string()
+        };
+
+        let checkbox = if !c.available && c.branch.is_empty() {
+            format!("{DIM}[–]{R}")
+        } else if c.enabled {
+            format!("{GRN}[{BOLD}✓{R}{GRN}]{R}")
+        } else {
+            format!("{DIM}[ ]{R}")
+        };
+
+        let name = if !c.available && c.branch.is_empty() {
+            format!("{DIM}{}{R}", c.label)
+        } else if i == cursor {
+            format!("{BOLD}{}{R}", c.label)
+        } else {
+            c.label.to_string()
+        };
+
+        let desc = if !c.available && c.branch.is_empty() {
+            format!("{DIM}not found{R}")
+        } else {
+            format!("{DIM}{}{R}", c.desc)
+        };
+
+        // Branch column — dim unless it was manually set (differs from default)
+        let branch_col = if c.branch.is_empty() {
+            String::new()
+        } else {
+            format!("  {DIM}{}{R}", c.branch)
+        };
+
+        println!("  {marker}{checkbox}  {:<22}{:<26}{branch_col}", name, desc);
+    }
+
+    println!();
+    println!("  {DIM}{sep}{R}");
+    println!("  {DIM}↑↓ / j k  navigate   Space toggle   b branch   Enter start   q quit{R}");
+    println!();
+    let _ = io::stdout().flush();
+}
+
+/// Interactive product-selection screen.
+///
+/// Returns `true` when the user presses Enter (proceed), `false` when they press q/Esc (quit).
+/// Runs in raw mode internally; terminal is restored before returning.
+/// Press `b` to set a custom branch for the highlighted product (worktree created on launch).
+fn run_product_selector(slug: &str, choices: &mut Vec<ProductChoice>) -> bool {
+    // No-op in non-interactive environments — caller uses the defaults.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+        return true;
+    }
+
+    let mut raw = RawMode::enter();
+    let mut cursor = 0usize;
+    // Start cursor on the first available product.
+    if let Some(first) = choices.iter().position(|c| c.available || !c.branch.is_empty()) {
+        cursor = first;
+    }
+
+    let mut buf = [0u8; 16];
+    loop {
+        render_product_selector(slug, choices, cursor);
+
+        thread::sleep(Duration::from_millis(20));
+        let n = unsafe {
+            libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        if n <= 0 { continue; }
+
+        match &buf[..n as usize] {
+            // Navigate up
+            [27, b'[', b'A'] | [b'k'] => {
+                cursor = cursor.saturating_sub(1);
+            }
+            // Navigate down
+            [27, b'[', b'B'] | [b'j'] => {
+                if cursor + 1 < choices.len() { cursor += 1; }
+            }
+            // Toggle
+            [b' '] => {
+                if choices[cursor].available || !choices[cursor].branch.is_empty() {
+                    choices[cursor].enabled = !choices[cursor].enabled;
+                }
+            }
+            // Edit branch for highlighted product
+            [b'b'] | [b'B'] => {
+                // Exit raw mode so we can read a normal line.
+                drop(raw.take());
+                let current = &choices[cursor].branch;
+                print!("\x1b[?25h"); // show cursor
+                if current.is_empty() {
+                    print!("\n  Branch for {} : ", choices[cursor].label);
+                } else {
+                    print!("\n  Branch for {} (Enter to keep {current}): ", choices[cursor].label);
+                }
+                let _ = io::stdout().flush();
+                if let Some(input) = read_line_or_interrupt() {
+                    let trimmed = input.trim().to_string();
+                    if !trimmed.is_empty() {
+                        choices[cursor].branch  = trimmed;
+                        choices[cursor].enabled  = true;
+                        choices[cursor].available = true; // worktree will be created
+                    }
+                }
+                // Re-enter raw mode.
+                raw = RawMode::enter();
+            }
+            // Confirm
+            [b'\r'] | [b'\n'] => {
+                return true;
+            }
+            // Quit
+            [b'q'] | [b'Q'] | [27] => {
+                // Clear screen before exiting so the terminal is clean.
+                print!("\x1b[H\x1b[2J");
+                let _ = io::stdout().flush();
+                return false;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Feature flag selector ─────────────────────────────────────────────────────
+
+struct FlagChoice {
+    name:    String,
+    enabled: bool,
+}
+
+/// Walk `dir` recursively, collect every unique flag name passed to
+/// `isFeatureEnabled()` (graphql) or `isFeatureEnable()` (frontend).
+/// Skips `node_modules` and non-.ts/.js/.tsx files.
+#[allow(dead_code)]
+fn discover_feature_flags(dir: &Path) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = Default::default();
+    discover_flags_in_dir(dir, &mut set);
+    set.into_iter().collect()
+}
+
+fn discover_flags_in_dir(dir: &Path, out: &mut std::collections::BTreeSet<String>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().map_or(false, |n| n == "node_modules" || n == ".git") {
+                continue;
+            }
+            discover_flags_in_dir(&path, out);
+        } else {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "ts" | "js" | "tsx" | "jsx") {
+                discover_flags_in_file(&path, out);
+            }
+        }
+    }
+}
+
+fn discover_flags_in_file(path: &Path, out: &mut std::collections::BTreeSet<String>) {
+    let Ok(content) = fs::read_to_string(path) else { return };
+    // Match both `isFeatureEnabled(` (graphql/backend) and `isFeatureEnable(` (frontend)
+    for needle in &["isFeatureEnabled(", "isFeatureEnable("] {
+        extract_flag_calls(&content, needle, out);
+    }
+}
+
+fn extract_flag_calls(content: &str, needle: &str, out: &mut std::collections::BTreeSet<String>) {
+    let mut search = content;
+    while let Some(idx) = search.find(needle) {
+        search = &search[idx + needle.len()..];
+        // Deduplicate: skip `isFeatureEnabled(` when we're iterating `isFeatureEnable(`
+        // by ignoring a match where the very next char is 'd' (already covered by the longer needle).
+        if needle == "isFeatureEnable(" {
+            if search.starts_with('d') { continue; }
+        }
+        // Find the opening quote right after the '('
+        let rest = search.trim_start_matches(' ');
+        let quote = match rest.chars().next() {
+            Some('\'') => '\'',
+            Some('"')  => '"',
+            _           => continue,
+        };
+        let inner = &rest[1..];
+        if let Some(end) = inner.find(quote) {
+            let flag = &inner[..end];
+            // Flag names are alphanumeric + underscores
+            if !flag.is_empty() && flag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                out.insert(flag.to_string());
+            }
+        }
+    }
+}
+
+/// Parse the `APP__ENABLED_DEV_FEATURES` JSON array from an env file.
+fn read_active_flags(env_file: &Path) -> Vec<String> {
+    let map = parse_env_file(env_file);
+    let raw = map.get("APP__ENABLED_DEV_FEATURES").cloned().unwrap_or_default();
+    let trimmed = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.is_empty() { return vec![]; }
+    trimmed.split(',')
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Write `flags` back into `APP__ENABLED_DEV_FEATURES` in the env file.
+fn write_active_flags(env_file: &Path, flags: &[String]) {
+    let mut map = parse_env_file(env_file);
+    let val = if flags.is_empty() {
+        "[]".to_string()
+    } else {
+        let inner = flags.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(",");
+        format!("[{inner}]")
+    };
+    map.insert("APP__ENABLED_DEV_FEATURES".to_string(), val);
+    write_env_file(env_file, &map);
+}
+
+fn render_flag_selector(slug: &str, product: &str, choices: &[FlagChoice], cursor: usize) {
+    let sep = "─".repeat(56);
+    print!("\x1b[H\x1b[2J");
+    println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}{slug}{R}\n");
+    println!("  {DIM}{sep}{R}");
+    println!("  {BOLD}Feature flags{R}  {DIM}— {product}{R}");
+    println!("  {DIM}{sep}{R}\n");
+
+    for (i, c) in choices.iter().enumerate() {
+        let marker = if i == cursor {
+            format!("{CYN}{BOLD}▶{R} ")
+        } else {
+            "  ".to_string()
+        };
+        let checkbox = if c.enabled {
+            format!("{GRN}[{BOLD}✓{R}{GRN}]{R}")
+        } else {
+            format!("{DIM}[ ]{R}")
+        };
+        let name = if i == cursor {
+            format!("{BOLD}{}{R}", c.name)
+        } else {
+            c.name.clone()
+        };
+        println!("  {marker}{checkbox}  {name}");
+    }
+
+    println!();
+    println!("  {DIM}{sep}{R}");
+    println!("  {DIM}↑↓ / j k  navigate   Space  toggle   Enter  confirm   q  skip{R}");
+    println!();
+    let _ = io::stdout().flush();
+}
+
+/// Interactive feature-flag selector for one product.
+///
+/// Modifies `choices` in-place. Returns when the user presses Enter (confirm)
+/// or q/Esc (skip — keeping whatever state was set). Always returns `true` so
+/// the caller can decide whether to proceed.
+fn run_flag_selector(slug: &str, product: &str, choices: &mut Vec<FlagChoice>) {
+    if choices.is_empty() || unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+        return;
+    }
+    let _raw = RawMode::enter();
+    let mut cursor = 0usize;
+    let mut buf = [0u8; 16];
+    loop {
+        render_flag_selector(slug, product, choices, cursor);
+        thread::sleep(Duration::from_millis(20));
+        let n = unsafe {
+            libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        if n <= 0 { continue; }
+        match &buf[..n as usize] {
+            [27, b'[', b'A'] | [b'k'] => { cursor = cursor.saturating_sub(1); }
+            [27, b'[', b'B'] | [b'j'] => { if cursor + 1 < choices.len() { cursor += 1; } }
+            [b' '] => { choices[cursor].enabled = !choices[cursor].enabled; }
+            [b'\r'] | [b'\n'] => { return; }
+            [b'q'] | [b'Q'] | [27] => { return; }
+            _ => {}
+        }
+    }
+}
+
+// ── Workspace helpers ─────────────────────────────────────────────────────────
+
+/// Build initial product choices with no specific branches (uses main repo dirs).
+fn default_product_choices(workspace_root: &Path) -> Vec<ProductChoice> {
+    PRODUCTS.iter().map(|(repo, label, _, desc)| {
+        let main_dir = workspace_root.join(repo);
+        let available = main_dir.is_dir();
+        let branch = if available { current_branch(&main_dir) } else { String::new() };
+        ProductChoice { label, desc, repo, enabled: available, available, branch }
+    }).collect()
+}
+
+/// Build workspace entries from explicit branch CLI args.
+fn build_entries_from_branches(args: &Args) -> Vec<WorkspaceEntry> {
+    PRODUCTS.iter().map(|(repo, _, key, _)| {
+        let branch = match *key {
+            "copilot"   => args.copilot_branch.clone(),
+            "opencti"   => args.opencti_branch.clone(),
+            "openaev"   => args.openaev_branch.clone(),
+            "connector" => args.connector_branch.clone(),
+            _           => None,
+        };
+        WorkspaceEntry { repo: repo.to_string(), enabled: branch.is_some(), branch: branch.unwrap_or_default() }
+    }).collect()
+}
+
+/// Show the product selector for a new workspace, save the config, return it + choices.
+fn build_new_workspace_interactive(
+    workspace_root: &Path,
+    ws_dir: &Path,
+) -> (WorkspaceConfig, Vec<ProductChoice>) {
+    let mut choices = default_product_choices(workspace_root);
+    if !run_product_selector("new", &mut choices) {
+        std::process::exit(0);
+    }
+    let cfg = choices_to_workspace(&choices);
+    save_workspace(ws_dir, &cfg);
+    (cfg, choices)
+}
+
+/// Resolve which workspace to use.
+///
+/// Priority:
+/// 1. `--workspace <hash>` — load by hash, skip product selector
+/// 2. `--*-branch` flags — build from branches, compute hash, skip selector
+/// 3. Interactive — workspace list → pick/create → product selector → save
+fn resolve_workspace(
+    args: &Args,
+    workspace_root: &Path,
+    ws_dir: &Path,
+) -> (WorkspaceConfig, Vec<ProductChoice>) {
+    if let Some(hash) = &args.workspace {
+        match load_workspace(ws_dir, hash) {
+            Some(cfg) => {
+                let choices = workspace_to_choices(&cfg, workspace_root);
+                (cfg, choices)
+            }
+            None => {
+                eprintln!("Workspace '{}' not found in {}.", hash, ws_dir.display());
+                std::process::exit(1);
+            }
+        }
+    } else if args.copilot_branch.is_some() || args.opencti_branch.is_some()
+           || args.openaev_branch.is_some() || args.connector_branch.is_some()
+    {
+        // Build from branch flags — find or create workspace.
+        let entries = build_entries_from_branches(args);
+        let hash = compute_workspace_hash(&entries);
+        let cfg = load_workspace(ws_dir, &hash).unwrap_or_else(|| {
+            let c = WorkspaceConfig { hash: hash.clone(), created: today(), entries };
+            save_workspace(ws_dir, &c);
+            c
+        });
+        let choices = workspace_to_choices(&cfg, workspace_root);
+        (cfg, choices)
+    } else {
+        // Interactive: workspace list → product selector.
+        // Loops back to the selector after a Delete so the user can continue
+        // managing workspaces without restarting the tool.
+        let mut choices = 'selector: loop {
+            let workspaces = list_workspaces(ws_dir);
+            if workspaces.is_empty() {
+                return build_new_workspace_interactive(workspace_root, ws_dir);
+            }
+            match run_workspace_selector(&workspaces) {
+                WorkspaceAction::Delete(cfg) => {
+                    run_workspace_delete(&cfg, workspace_root, ws_dir);
+                    // list_workspaces will exclude tombstoned entries on next iteration
+                    continue 'selector;
+                }
+                WorkspaceAction::Open(cfg) => {
+                    break workspace_to_choices(&cfg, workspace_root);
+                }
+                WorkspaceAction::CreateNew => {
+                    break default_product_choices(workspace_root);
+                }
+                WorkspaceAction::Quit => {
+                    print!("\x1b[H\x1b[2J");
+                    let _ = io::stdout().flush();
+                    std::process::exit(0);
+                }
+            }
+        };
+        // Product selector pre-filled with selected workspace (or fresh defaults).
+        if !run_product_selector("", &mut choices) {
+            std::process::exit(0);
+        }
+        let cfg = choices_to_workspace(&choices);
+        save_workspace(ws_dir, &cfg);
+        (cfg, choices)
+    }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let args = Args::parse();
+
+    let workspace_root = resolve_workspace_root(&args);
+    let ws_dir = workspaces_dir(&workspace_root);
+
+    // ── Workspace + product selection ─────────────────────────────────────────
+    let (workspace_cfg, choices) = resolve_workspace(&args, &workspace_root, &ws_dir);
+    let slug = workspace_cfg.hash.clone();
+
+    let logs_dir = args.logs_dir.clone()
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/dev-feature-logs/{}", slug)));
+    fs::create_dir_all(&logs_dir).expect("cannot create logs_dir");
+
+    // ── Create missing worktrees ───────────────────────────────────────────────
+    {
+        let sep = "─".repeat(56);
+        let need_worktrees = choices.iter().any(|c| {
+            c.enabled && !c.branch.is_empty() && {
+                let target = workspace_root.join(format!("{}-{}", c.repo, branch_to_slug(&c.branch)));
+                let main   = workspace_root.join(c.repo);
+                !target.is_dir()
+                    && main.is_dir()
+                    && current_branch(&main) != c.branch.as_str()
+            }
+        });
+        if need_worktrees {
+            println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}{slug}{R}");
+            println!("\n  {DIM}{sep}{R}");
+            println!("  {BOLD}Setting up worktrees{R}");
+            println!("  {DIM}{sep}{R}\n");
+        }
+        for c in choices.iter().filter(|c| c.enabled && !c.branch.is_empty()) {
+            ensure_worktree(&workspace_root, c.repo, &c.branch);
+        }
+        if need_worktrees { println!(); }
+    }
+
+    // Rebuild paths so feature flags, env wizard, and services use the right dirs.
+    let paths = {
+        let resolve_branch = |repo: &str, branch: &str| -> PathBuf {
+            if branch.is_empty() { return workspace_root.join(repo); }
+            let slug = branch_to_slug(branch);
+            let wt   = workspace_root.join(format!("{}-{}", repo, slug));
+            if wt.is_dir() { return wt; }
+            // If the main checkout is already on this branch (no worktree was
+            // created), use it directly.
+            let main = workspace_root.join(repo);
+            if current_branch(&main) == branch { return main; }
+            main
+        };
+        Paths {
+            copilot:   resolve_branch(choices[0].repo, &choices[0].branch),
+            opencti:   resolve_branch(choices[1].repo, &choices[1].branch),
+            openaev:   resolve_branch(choices[2].repo, &choices[2].branch),
+            connector: resolve_branch(choices[3].repo, &choices[3].branch)
+                           .join("internal-import-file/import-document-ai"),
+        }
+    };
+
+    // Derive activity flags from workspace choices.
+    let no_copilot       = !(choices[0].enabled && paths.copilot.is_dir());
+    let no_opencti       = !(choices[1].enabled && paths.opencti.is_dir());
+    let no_openaev       = !(choices[2].enabled && paths.openaev.is_dir());
+    let no_connector     = !(choices[3].enabled && paths.connector.is_dir());
+    let no_opencti_front = no_opencti || args.no_opencti_front;
+    let no_openaev_front = no_openaev || args.no_openaev_front;
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Feature flags  —  per-product interactive selector
+    // ════════════════════════════════════════════════════════════════════════
+
+    // OpenCTI: scan src/ for isFeatureEnabled() calls, let user toggle them.
+    if !no_opencti && paths.opencti.is_dir() {
+        let gql_dir  = paths.opencti.join("opencti-platform/opencti-graphql");
+        let env_file = gql_dir.join(".env.dev");
+        if gql_dir.is_dir() {
+            // Scan both the graphql backend and the frontend for flag usages.
+            let front_dir = paths.opencti.join("opencti-platform/opencti-front/src");
+            let mut flag_set: std::collections::BTreeSet<String> = Default::default();
+            discover_flags_in_dir(&gql_dir.join("src"), &mut flag_set);
+            if front_dir.is_dir() {
+                discover_flags_in_dir(&front_dir, &mut flag_set);
+            }
+            let discovered: Vec<String> = flag_set.into_iter().collect();
+            if !discovered.is_empty() {
+                // Ensure .env.dev exists before we read/write it.
+                ensure_opencti_env(&gql_dir);
+                let active = read_active_flags(&env_file);
+                let mut flag_choices: Vec<FlagChoice> = discovered.iter()
+                    .map(|f| FlagChoice { name: f.clone(), enabled: active.contains(f) })
+                    .collect();
+                run_flag_selector(&slug, "OpenCTI", &mut flag_choices);
+                let selected: Vec<String> = flag_choices.into_iter()
+                    .filter(|f| f.enabled)
+                    .map(|f| f.name)
+                    .collect();
+                write_active_flags(&env_file, &selected);
+            }
+        }
+    }
+
+    // Load optional LLM config for crash diagnosis.
+    let llm_cfg: Option<LlmConfig> = {
+        let dev_cfg = load_config();
+        resolve_llm_config(dev_cfg.as_ref())
+    };
+    if llm_cfg.is_some() {
+        println!("  {DIM}LLM diagnosis enabled.{R}");
+    }
+
+    let state:    State              = Arc::new(Mutex::new(Vec::new()));
+    let mut procs: Vec<Proc>         = Vec::new();
+    let stopping: Arc<AtomicBool>    = Arc::new(AtomicBool::new(false));
+
+    // Diagnosis channel: background threads → main loop.
+    let (diag_tx, diag_rx) = mpsc::sync_channel::<DiagEvent>(32);
+    // Track which service indices have already had diagnosis dispatched.
+    let mut diagnosed: HashSet<usize> = HashSet::new();
+
+    // ── Ctrl+C ───────────────────────────────────────────────────────────────
+    {
+        let stopping = Arc::clone(&stopping);
+        ctrlc::set_handler(move || {
+            stopping.store(true, Ordering::Relaxed);
+        }).expect("failed to set Ctrl+C handler");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Step 1 / 2  —  Environment
+    // ════════════════════════════════════════════════════════════════════════
+    let sep = "─".repeat(56);
+    println!("\n  {BOLD}{CYN}dev-feature{R}  {DIM}{slug}{R}");
+    println!("\n  {DIM}{sep}{R}");
+    println!("  {BOLD}Step 1 / 2  —  Environment{R}");
+    println!("  {DIM}{sep}{R}\n");
+
+    if !no_opencti && paths.opencti.is_dir() {
+        let gql_dir = paths.opencti.join("opencti-platform/opencti-graphql");
+        if gql_dir.is_dir() {
+            ensure_opencti_env(&gql_dir);
+            run_env_wizard(&gql_dir.join(".env.dev"), OPENCTI_ENV_VARS, "OpenCTI");
+        }
+    } else if no_opencti {
+        println!("  {DIM}OpenCTI skipped.{R}\n");
+    }
+
+    if !no_connector && paths.connector.is_dir() {
+        // Create .env.dev from template BEFORE auto-propagation so that the
+        // template exists when we merge the token into it.  If we propagate
+        // first and the file is absent, parse_env_file returns an empty map and
+        // write_env_file produces a file with only OPENCTI_TOKEN — all other
+        // required vars (OPENCTI_URL etc.) are lost.
+        ensure_connector_env(&paths.connector);
+    }
+
+    // Auto-propagate APP__ADMIN__TOKEN → OPENCTI_TOKEN so the connector wizard
+    // is pre-filled and the user does not have to copy the token manually.
+    if !no_opencti && !no_connector && paths.connector.is_dir() {
+        let gql_env = paths.opencti
+            .join("opencti-platform/opencti-graphql/.env.dev");
+        let connector_env = paths.connector.join(".env.dev");
+        if gql_env.exists() {
+            if let Some(token) = parse_env_file(&gql_env).get("APP__ADMIN__TOKEN").cloned() {
+                // Only propagate a real token (not placeholder).
+                if !token.is_empty() && token != "ChangeMe" {
+                    let mut cenv = parse_env_file(&connector_env);
+                    cenv.insert("OPENCTI_TOKEN".to_string(), token);
+                    write_env_file(&connector_env, &cenv);
+                    println!("  {GRN}✓{R}  OPENCTI_TOKEN synced from OpenCTI admin token");
+                }
+            }
+        }
+    }
+
+    if !no_connector && paths.connector.is_dir() {
+        // .env.dev already exists (created above); wizard will prompt for any
+        // remaining unfilled values.
+        run_env_wizard(
+            &paths.connector.join(".env.dev"),
+            CONNECTOR_ENV_VARS,
+            "ImportDocumentAI connector",
+        );
+    } else if no_connector {
+        println!("  {DIM}Connector skipped.{R}\n");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Step 2 / 2  —  Starting services
+    // ════════════════════════════════════════════════════════════════════════
+    println!("  {DIM}{sep}{R}");
+    println!("  {BOLD}Step 2 / 2  —  Starting services{R}");
+    println!("  {DIM}{sep}{R}\n");
+
+    // ── Bootstrap: Corepack ──────────────────────────────────────────────────
+    // All JS projects in this workspace use yarn@4 via the `packageManager` field.
+    // Corepack must be enabled so the system `yarn` shim dispatches to the right version.
+    print!("  Checking Corepack… ");
+    let _ = io::stdout().flush();
+    ensure_corepack();
+
+    // ── Docker deps (blocking) ────────────────────────────────────────────────
+    // Pass an explicit `-p` project name so every run — main branch or any feature
+    // worktree — maps to the same Docker project.  Without this, docker compose
+    // derives the project name from the working directory, so stopped containers
+    // from a different worktree run produce "container name already in use" errors.
+    //
+    // docker_compose_up() is idempotent: already-running containers are left alone,
+    // stopped containers are restarted, missing ones are created.
+    print!("  Checking Docker… ");
+    let _ = io::stdout().flush();
+    let docker_ok = docker_available();
+    if docker_ok {
+        println!("{GRN}running{R}");
+    } else {
+        println!("{RED}not reachable{R}");
+        println!("  {YLW}Start Docker Desktop (or the Docker daemon) before launching the stack.{R}");
+        println!("  {DIM}Services that need infrastructure containers will start in Degraded state.{R}\n");
+    }
+
+    // Load repo manifests (docker-compose discovery + .dev-launcher.conf)
+    let copilot_manifest  = if !no_copilot   && paths.copilot.is_dir()    { Some(load_repo_manifest(&paths.copilot,   "Copilot"))   } else { None };
+    let opencti_manifest  = if !no_opencti   && paths.opencti.is_dir()    { Some(load_repo_manifest(&paths.opencti,   "OpenCTI"))   } else { None };
+    let openaev_manifest  = if !no_openaev   && paths.openaev.is_dir()    { Some(load_repo_manifest(&paths.openaev,   "OpenAEV"))   } else { None };
+    let _connector_manifest = if !no_connector && paths.connector.is_dir() { Some(load_repo_manifest(&paths.connector, "Connector")) } else { None };
+
+    let mut copilot_docker_ok = true;
+    let mut opencti_docker_ok = true;
+    let mut openaev_docker_ok = true;
+
+    if docker_ok {
+        if !no_copilot && paths.copilot.is_dir() {
+            let (project, dc) = if let Some(ref m) = copilot_manifest {
+                (resolve_docker_project(&paths.copilot, m),
+                 paths.copilot.join(m.docker.compose_dev.as_deref().unwrap_or("docker-compose.dev.yml")))
+            } else {
+                ("copilot-dev".to_string(), paths.copilot.join("docker-compose.dev.yml"))
+            };
+            if dc.exists() {
+                copilot_docker_ok = docker_compose_up("Copilot", &project, &dc, &paths.copilot, &[]);
+            }
+        }
+        if !no_opencti && paths.opencti.is_dir() {
+            let dc = paths.opencti.join("opencti-platform/opencti-dev/docker-compose.yml");
+            if dc.exists() {
+                let project = opencti_manifest.as_ref()
+                    .and_then(|m| m.docker.project.clone())
+                    .unwrap_or_else(|| "opencti-dev".to_string());
+                opencti_docker_ok = docker_compose_up("OpenCTI", &project, &dc, &paths.opencti, &[]);
+            }
+        }
+        if !no_openaev && paths.openaev.is_dir() {
+            let dev_dir = paths.openaev.join("openaev-dev");
+            let dc = dev_dir.join("docker-compose.yml");
+            if dc.exists() {
+                ensure_openaev_dev_env(&dev_dir);
+                let env_file = dev_dir.join(".env").to_string_lossy().into_owned();
+                let project = openaev_manifest.as_ref()
+                    .and_then(|m| m.docker.project.clone())
+                    .unwrap_or_else(|| "openaev-dev".to_string());
+                openaev_docker_ok = docker_compose_up("OpenAEV", &project, &dc, &dev_dir,
+                    &["--env-file", &env_file]);
+            }
+        }
+    } else {
+        copilot_docker_ok = false;
+        opencti_docker_ok = false;
+        openaev_docker_ok = false;
+    }
+    println!();
+
+    // ── Spawn services ────────────────────────────────────────────────────────
+    {
+        let mut svcs = state.lock().unwrap();
+
+        macro_rules! try_spawn {
+            ($svc:expr, $prog:expr, $argv:expr, $dir:expr, $env:expr) => {{
+                let idx = svcs.len();
+                match spawn_svc($prog, $argv, $dir, $env, &$svc.log_path) {
+                    Ok((child, pgid)) => {
+                        $svc.pid        = Some(child.id());
+                        $svc.started_at = Some(Instant::now());
+                        $svc.health     = if $svc.url.is_some() { Health::Launching } else { Health::Running };
+                        svcs.push($svc);
+                        procs.push(Proc { idx, pgid, child });
+                    }
+                    Err(e) => {
+                        $svc.health = Health::Degraded(e.to_string());
+                        svcs.push($svc);
+                    }
+                }
+            }};
+        }
+
+        // Copilot
+        if !no_copilot && paths.copilot.is_dir() {
+            let uses_manifest = copilot_manifest.as_ref().map_or(false, |m| !m.services.is_empty());
+            if uses_manifest {
+                let m = copilot_manifest.as_ref().unwrap();
+                let _bootstrap_ok = run_manifest_bootstrap(&paths.copilot, m);
+                let backend_env = copilot_backend_env(&paths.copilot);
+                for def in &m.services {
+                    let log_path = logs_dir.join(
+                        def.log_name.clone().unwrap_or_else(|| format!("copilot-{}.log", def.name))
+                    );
+                    let (url, health_path) = split_health_url_parts(def.health.as_deref());
+                    let mut svc = Svc::new(
+                        format!("copilot-{}", def.name),
+                        url, health_path, def.timeout_secs, log_path,
+                    );
+                    if def.requires_docker && !copilot_docker_ok {
+                        svc.health = Health::Degraded("Docker deps not running — start Docker first".into());
+                        svcs.push(svc);
+                        continue;
+                    }
+                    let work_dir = if def.cwd.is_empty() {
+                        paths.copilot.clone()
+                    } else {
+                        paths.copilot.join(&def.cwd)
+                    };
+                    if def.args.is_empty() || !work_dir.is_dir() { svcs.push(svc); continue; }
+                    let prog = if def.args[0].starts_with('.') {
+                        work_dir.join(&def.args[0]).to_string_lossy().into_owned()
+                    } else {
+                        def.args[0].clone()
+                    };
+                    if (prog.starts_with('/') || prog.starts_with("./") || prog.contains("/."))
+                       && !PathBuf::from(&prog).exists()
+                    {
+                        svc.health = Health::Degraded(format!("{} not found — run ./dev.sh once", &def.args[0]));
+                        svcs.push(svc);
+                        continue;
+                    }
+                    let rest: Vec<&str> = def.args[1..].iter().map(|s| s.as_str()).collect();
+                    let empty_env: HashMap<String, String> = HashMap::new();
+                    let env = if def.cwd == "backend" { &backend_env } else { &empty_env };
+                    try_spawn!(svc, &prog, &rest, &work_dir, env);
+                }
+            } else {
+                // Fallback: hardcoded Copilot spawn
+                let backend_dir = paths.copilot.join("backend");
+                let python = backend_dir.join(".venv/bin/python");
+                let backend_env = copilot_backend_env(&paths.copilot);
+                let mut svc = Svc::new("copilot-backend", Some("http://localhost:8100"), "/api/health", 120, logs_dir.join("copilot-backend.log"));
+                if !copilot_docker_ok {
+                    svc.health = Health::Degraded("Docker deps not running — start Docker first".into());
+                    svcs.push(svc);
+                } else if python.exists() {
+                    try_spawn!(svc, python.to_str().unwrap(),
+                        &["-m", "uvicorn", "app.main:application",
+                          "--reload", "--host", "0.0.0.0", "--port", "8100",
+                          "--timeout-graceful-shutdown", "3"],
+                        &backend_dir, &backend_env);
+                } else {
+                    svc.health = Health::Degraded("venv missing — run ./dev.sh once to set up".into());
+                    svcs.push(svc);
+                }
+                let mut svc = Svc::new("copilot-worker", None::<String>, "", 10, logs_dir.join("copilot-worker.log"));
+                if !copilot_docker_ok {
+                    svc.health = Health::Degraded("Docker deps not running".into());
+                    svcs.push(svc);
+                } else if python.exists() {
+                    try_spawn!(svc, python.to_str().unwrap(), &["-m", "saq", "app.worker.settings"], &backend_dir, &backend_env);
+                } else {
+                    svc.health = Health::Degraded("venv missing".into());
+                    svcs.push(svc);
+                }
+                let fe_dir = paths.copilot.join("frontend");
+                ensure_copilot_fe_deps(&fe_dir);
+                let mut svc = Svc::new("copilot-frontend", Some("http://localhost:3100"), "", 90, logs_dir.join("copilot-frontend.log"));
+                if fe_dir.is_dir() {
+                    try_spawn!(svc, "yarn", &["dev"], &fe_dir, &HashMap::new());
+                }
+            }
+        }
+
+        // OpenCTI
+        if !no_opencti && paths.opencti.is_dir() {
+            let gql_dir = paths.opencti.join("opencti-platform/opencti-graphql");
+            let mut gql_env: HashMap<String, String> = HashMap::new();
+            if gql_dir.is_dir() {
+                if !gql_dir.join("node_modules").is_dir() {
+                    println!("  Installing OpenCTI graphql node deps…");
+                    run_blocking("yarn", &["install"], &gql_dir);
+                }
+                if let Some(pypath) = ensure_opencti_graphql_python_deps(&gql_dir) {
+                    gql_env.insert("PYTHONPATH".into(), pypath);
+                }
+                // Inject admin credentials from .env.dev so OpenCTI can initialise
+                // the admin user on first boot (password/token must not be "ChangeMe").
+                let env_file = gql_dir.join(".env.dev");
+                if env_file.exists() {
+                    for (k, v) in parse_env_file(&env_file) {
+                        gql_env.insert(k, v);
+                    }
+                }
+            }
+            // Validate that the admin password has been changed from the default.
+            // OpenCTI refuses to start with APP__ADMIN__PASSWORD=ChangeMe and the
+            // crash message is buried in logs — catch it here with a clear hint.
+            let opencti_password_ok = gql_env
+                .get("APP__ADMIN__PASSWORD")
+                .map(|p| !p.is_empty() && p != "ChangeMe")
+                .unwrap_or(false);
+            let mut svc = Svc::new("opencti-graphql", Some("http://localhost:4000"), "/health", 300, logs_dir.join("opencti-graphql.log"));
+            if !opencti_docker_ok {
+                svc.health = Health::Degraded("Docker deps not running — start Docker first".into());
+                svcs.push(svc);
+            } else if !opencti_password_ok {
+                svc.health = Health::Degraded("APP__ADMIN__PASSWORD not set — run dev-feature again to fill in credentials".into());
+                svcs.push(svc);
+            } else if gql_dir.is_dir() {
+                try_spawn!(svc, "yarn", &["start"], &gql_dir, &gql_env);
+            }
+
+            if !no_opencti_front {
+                let front_dir = paths.opencti.join("opencti-platform/opencti-front");
+                ensure_opencti_fe_deps(&front_dir);
+                let mut svc = Svc::new("opencti-frontend", Some("http://localhost:3000"), "", 120, logs_dir.join("opencti-frontend.log"));
+                if front_dir.is_dir() {
+                    try_spawn!(svc, "yarn", &["dev"], &front_dir, &HashMap::new());
+                }
+            }
+        }
+
+        // OpenAEV
+        if !no_openaev && paths.openaev.is_dir() {
+            let mvn = maven_cmd(&paths.openaev);
+            let api_dir = paths.openaev.join("openaev-api");
+
+            // The health endpoint requires the configured key (default "ChangeMe").
+            let mut svc = Svc::new(
+                "openaev-backend",
+                Some("http://localhost:8080"),
+                "/api/health?health_access_key=ChangeMe",
+                180,
+                logs_dir.join("openaev-backend.log"),
+            );
+            if !openaev_docker_ok {
+                svc.health = Health::Degraded("Docker deps not running — start Docker first".into());
+                svcs.push(svc);
+            } else if api_dir.is_dir() {
+                try_spawn!(svc, &mvn,
+                    &["spring-boot:run", "-Pdev", "-pl", "openaev-api",
+                      "-Dspring-boot.run.profiles=dev"],
+                    &paths.openaev, &HashMap::new());
+            } else {
+                svc.health = Health::Degraded("openaev-api/ not found".into());
+                svcs.push(svc);
+            }
+
+            if !no_openaev_front {
+                let fe_dir = paths.openaev.join("openaev-front");
+                ensure_openaev_fe_deps(&fe_dir);
+                let mut svc = Svc::new(
+                    "openaev-frontend",
+                    Some("http://localhost:3001"),
+                    "",
+                    90,
+                    logs_dir.join("openaev-frontend.log"),
+                );
+                if fe_dir.is_dir() {
+                    try_spawn!(svc, "yarn", &["start"], &fe_dir, &HashMap::new());
+                }
+            }
+        }
+
+        // Connector
+        if !no_connector && paths.connector.is_dir() {
+            let env_path = ensure_connector_env(&paths.connector);
+            let venv     = ensure_connector_venv(&paths.connector);
+            let python   = venv.join("bin/python");
+            let src_dir  = paths.connector.join("src");
+            let env      = parse_env_file(&env_path);
+
+            let mut svc = Svc::new("connector", None::<String>, "", 30, logs_dir.join("connector.log"));
+            if let Some(reason) = validate_connector_env(&env) {
+                // Fail fast with a clear message instead of letting the connector crash
+                // immediately after spawn with a confusing Python traceback.
+                svc.health = Health::Degraded(reason);
+                svcs.push(svc);
+            } else if src_dir.is_dir() && python.exists() {
+                try_spawn!(svc, python.to_str().unwrap(), &["main.py"], &src_dir, &env);
+            } else {
+                svc.health = Health::Degraded("src/ or venv not found".into());
+                svcs.push(svc);
+            }
+        }
+    }
+
+    // ── Health-probe thread ───────────────────────────────────────────────────
+    {
+        let state    = Arc::clone(&state);
+        let stopping = Arc::clone(&stopping);
+        thread::spawn(move || {
+            loop {
+                if stopping.load(Ordering::Relaxed) { return; }
+                thread::sleep(Duration::from_secs(1));
+
+                // Snapshot what needs probing — release the lock before any blocking I/O.
+                // Without this, each 2-second probe timeout holds the lock and stalls the
+                // main thread (render + input) for N × 2 s.
+                let to_probe: Vec<(usize, String, bool, u64)> = {
+                    let svcs = state.lock().unwrap();
+                    svcs.iter().enumerate()
+                        .filter(|(_, s)| !s.health.is_done())
+                        .filter_map(|(i, s)| {
+                            s.health_url().map(|url| {
+                                let timed_out = s.started_at
+                                    .map(|t| t.elapsed() > s.startup_timeout)
+                                    .unwrap_or(false);
+                                (i, url, timed_out, s.startup_timeout.as_secs())
+                            })
+                        })
+                        .collect()
+                }; // ← lock released here, before any probe() call
+
+                // Probe each URL without holding the state lock.
+                for (i, url, timed_out, timeout_secs) in to_probe {
+                    let ok = !timed_out && probe(&url);
+
+                    let mut svcs = state.lock().unwrap();
+                    if svcs[i].health.is_done() { continue; } // may have crashed while we probed
+                    svcs[i].health = if ok {
+                        Health::Up
+                    } else if timed_out {
+                        Health::Degraded(format!("no response after {timeout_secs}s"))
+                    } else {
+                        match &svcs[i].health {
+                            Health::Probing(n) => Health::Probing(n + 1),
+                            _                  => Health::Probing(1),
+                        }
+                    };
+                    // ← lock released between probes
+                }
+            }
+        });
+    }
+
+    // ── TUI setup ─────────────────────────────────────────────────────────────
+    let mut raw_mode: Option<RawMode> = RawMode::enter();
+    let has_tui = raw_mode.is_some();
+    let mut mode = Mode::Overview { cursor: 0 };
+    let mut creds: Vec<CredEntry> = Vec::new(); // populated on first Credentials entry
+
+    let (tx, rx) = mpsc::sync_channel::<InputEvent>(32);
+    if has_tui {
+        spawn_input_thread(tx, Arc::clone(&stopping));
+    }
+
+    // ── Main loop ─────────────────────────────────────────────────────────────
+    // The loop ticks every 20 ms so input feels instant (~20–40 ms latency).
+    // A full re-render is triggered immediately on any input event, and on a
+    // 500 ms timer for health-status updates. This avoids spamming the terminal
+    // with unnecessary clears while staying responsive to keypresses.
+    print!("\x1b[2J");
+    let render_interval  = Duration::from_millis(500);
+    let mut last_render  = Instant::now();
+    let mut force_render = true; // draw immediately on first iteration
+
+    loop {
+        // ── Shutdown ─────────────────────────────────────────────────────────
+        if stopping.load(Ordering::Relaxed) {
+            drop(raw_mode.take()); // restore terminal first
+
+            // Build (name, proc_index_opt) pairs for every visible service.
+            // Services that never had an active proc (Degraded/Crashed at spawn)
+            // get None — they are shown as "already stopped".
+            let pairs: Vec<(String, Option<usize>)> = {
+                let svcs = state.lock().unwrap();
+                svcs.iter().enumerate()
+                    .filter(|(_, s)| s.health != Health::Pending)
+                    .map(|(svc_i, s)| {
+                        let proc_j = procs.iter().position(|p| p.idx == svc_i);
+                        (s.name.clone(), proc_j)
+                    })
+                    .collect()
+            };
+
+            // Send SIGTERM to every active process group.
+            for p in &mut procs { p.kill(); }
+
+            let mut term_status: Vec<TermStatus> = procs.iter()
+                .map(|_| TermStatus::Terminating)
+                .collect();
+
+            let started  = Instant::now();
+            let grace    = Duration::from_secs(5);
+            let mut timed_out = false;
+
+            loop {
+                // Poll for exited processes.
+                for (j, p) in procs.iter_mut().enumerate() {
+                    if term_status[j] == TermStatus::Terminating {
+                        if let Some(code) = p.try_reap() {
+                            term_status[j] = TermStatus::Stopped(code);
+                        }
+                    }
+                }
+
+                // Force-kill stragglers that survived the grace period.
+                if !timed_out && started.elapsed() >= grace {
+                    timed_out = true;
+                    for (j, p) in procs.iter_mut().enumerate() {
+                        if term_status[j] == TermStatus::Terminating {
+                            unsafe { libc::kill(-p.pgid, libc::SIGKILL); }
+                            term_status[j] = TermStatus::Killed;
+                        }
+                    }
+                }
+
+                render_shutdown(&slug, &pairs, &term_status, started.elapsed(), timed_out);
+
+                let all_done = term_status.iter().all(|s| *s != TermStatus::Terminating);
+                if all_done {
+                    // One final render so the user sees "All processes stopped."
+                    render_shutdown(&slug, &pairs, &term_status, started.elapsed(), timed_out);
+                    thread::sleep(Duration::from_millis(600));
+                    break;
+                }
+
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            break;
+        }
+
+        // ── Crash detection ───────────────────────────────────────────────────
+        {
+            let mut svcs = state.lock().unwrap();
+            for p in &mut procs {
+                if let Some(code) = p.try_reap() {
+                    let already_crashed = matches!(svcs[p.idx].health, Health::Crashed(_));
+                    svcs[p.idx].health = Health::Crashed(code);
+                    force_render = true;
+
+                    // Spawn diagnosis for the first crash only.
+                    if !already_crashed && !diagnosed.contains(&p.idx) {
+                        diagnosed.insert(p.idx);
+                        let log_path = svcs[p.idx].log_path.clone();
+                        let svc_idx  = p.idx;
+                        let tx       = diag_tx.clone();
+                        let llm      = llm_cfg.clone();
+                        thread::spawn(move || {
+                            // Small delay so the log has time to flush.
+                            thread::sleep(Duration::from_millis(300));
+                            if let Some(msg) = diagnose_crash(&log_path, llm.as_ref()) {
+                                let _ = tx.send(DiagEvent::Result { svc_idx, msg });
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── Receive diagnosis results ─────────────────────────────────────────
+        while let Ok(DiagEvent::Result { svc_idx, msg }) = diag_rx.try_recv() {
+            let mut svcs = state.lock().unwrap();
+            if let Some(svc) = svcs.get_mut(svc_idx) {
+                svc.diagnosis = Some(msg);
+            }
+            force_render = true;
+        }
+
+        // ── Input handling ────────────────────────────────────────────────────
+        let mut got_input = false;
+        if has_tui {
+            let visible_count = state.lock().unwrap()
+                .iter().filter(|s| s.health != Health::Pending).count();
+
+            while let Ok(event) = rx.try_recv() {
+                got_input = true;
+                match &mut mode {
+                    Mode::Overview { cursor } => match event {
+                        InputEvent::Up   => { *cursor = cursor.saturating_sub(1); }
+                        InputEvent::Down => {
+                            if visible_count > 0 {
+                                *cursor = (*cursor + 1).min(visible_count - 1);
+                            }
+                        }
+                        InputEvent::Enter => {
+                            let svcs = state.lock().unwrap();
+                            let visible: Vec<usize> = svcs.iter().enumerate()
+                                .filter(|(_, s)| s.health != Health::Pending)
+                                .map(|(i, _)| i)
+                                .collect();
+                            if let Some(&svc_idx) = visible.get(*cursor) {
+                                drop(svcs);
+                                mode = Mode::LogView { svc_idx, scroll: 0, follow: true };
+                            }
+                        }
+                        InputEvent::Back        => { stopping.store(true, Ordering::Relaxed); }
+                        InputEvent::Credentials => {
+                            creds = gather_credentials(&paths, &workspace_root);
+                            mode  = Mode::Credentials;
+                        }
+                        _ => {}
+                    },
+                    Mode::LogView { svc_idx, scroll, follow } => match event {
+                        InputEvent::Back     => { mode = Mode::Overview { cursor: 0 }; }
+                        InputEvent::Up       => { *scroll += 5;  *follow = false; }
+                        InputEvent::Down     => {
+                            *scroll = scroll.saturating_sub(5);
+                            if *scroll == 0 { *follow = true; }
+                        }
+                        InputEvent::PageUp   => { *scroll += 20; *follow = false; }
+                        InputEvent::PageDown => {
+                            *scroll = scroll.saturating_sub(20);
+                            if *scroll == 0 { *follow = true; }
+                        }
+                        InputEvent::Follow   => { *scroll = 0; *follow = true; }
+                        InputEvent::Diagnose => {
+                            let idx = *svc_idx;
+                            let findings = {
+                                let svcs = state.lock().unwrap();
+                                svcs.get(idx).map(|svc| diagnose_service(svc, &paths))
+                                    .unwrap_or_default()
+                            };
+                            mode = Mode::Diagnose { svc_idx: idx, findings, cursor: 0 };
+                        }
+                        _ => {}
+                    },
+                    Mode::Diagnose { cursor, findings, svc_idx } => match event {
+                        InputEvent::Back => {
+                            let idx = *svc_idx;
+                            mode = Mode::LogView { svc_idx: idx, scroll: 0, follow: true };
+                        }
+                        InputEvent::Up => {
+                            *cursor = cursor.saturating_sub(1);
+                        }
+                        InputEvent::Down => {
+                            if *cursor + 1 < findings.len() { *cursor += 1; }
+                        }
+                        InputEvent::Enter => {
+                            // Run the fix for the current finding, if any.
+                            let idx        = *svc_idx;
+                            let cur        = *cursor;
+                            let fix_action = findings.get(cur).and_then(|f| f.fix.clone());
+                            if let Some(action) = fix_action {
+                                // Restore terminal, run the fix with visible output.
+                                drop(raw_mode.take());
+                                print!("\x1b[H\x1b[2J");
+                                let _ = io::stdout().flush();
+                                run_fix_action(&action);
+                                println!();
+                                print!("  Press any key to return to diagnosis…");
+                                let _ = io::stdout().flush();
+                                let mut _b = [0u8; 1];
+                                unsafe { libc::read(libc::STDIN_FILENO, _b.as_mut_ptr() as *mut libc::c_void, 1) };
+                                raw_mode = RawMode::enter();
+                                // Mark finding as resolved if the fix appears to have worked,
+                                // then re-run diagnosis to pick up any remaining issues.
+                                let new_findings = {
+                                    let svcs = state.lock().unwrap();
+                                    svcs.get(idx).map(|svc| diagnose_service(svc, &paths))
+                                        .unwrap_or_default()
+                                };
+                                mode = Mode::Diagnose {
+                                    svc_idx:  idx,
+                                    findings: new_findings,
+                                    cursor:   cur.min(findings.len().saturating_sub(1)),
+                                };
+                                force_render = true;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Mode::Credentials => match event {
+                        InputEvent::Back => { mode = Mode::Overview { cursor: 0 }; }
+                        _ => {}
+                    },
+                }
+            }
+
+            // Clamp cursor after service list may have changed.
+            if let Mode::Overview { cursor } = &mut mode {
+                if visible_count > 0 { *cursor = (*cursor).min(visible_count - 1); }
+            }
+        }
+
+        // ── Render ────────────────────────────────────────────────────────────
+        // Re-render immediately on any input event; otherwise on the periodic timer.
+        if got_input || force_render || last_render.elapsed() >= render_interval {
+            let svcs = state.lock().unwrap();
+            match &mode {
+                Mode::Overview { cursor } => {
+                    render_overview(&svcs, &slug, &logs_dir, *cursor, has_tui);
+                }
+                Mode::LogView { svc_idx, scroll, follow } => {
+                    if let Some(svc) = svcs.get(*svc_idx) {
+                        render_log_view(svc, *scroll, *follow);
+                    }
+                }
+                Mode::Diagnose { svc_idx, findings, cursor } => {
+                    if let Some(svc) = svcs.get(*svc_idx) {
+                        render_diagnose(svc, findings, *cursor);
+                    }
+                }
+                Mode::Credentials => {
+                    render_credentials(&creds, &slug);
+                }
+            }
+            drop(svcs);
+            last_render  = Instant::now();
+            force_render = false;
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    }
+}
