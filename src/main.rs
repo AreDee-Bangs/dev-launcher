@@ -2419,6 +2419,35 @@ fn run_blocking(program: &str, args: &[&str], dir: &Path) -> i32 {
 }
 
 /// Returns true when the Docker daemon is reachable.
+/// Parse the port number out of a URL like "http://localhost:4000/health".
+fn extract_url_port(url: &str) -> Option<u16> {
+    // Strip scheme, then take everything after the last ':'
+    let after_scheme = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let host_port = after_scheme.split('/').next()?;  // drop path
+    let port_str  = host_port.rsplit(':').next()?;
+    port_str.parse().ok()
+}
+
+/// Returns None when the port is free, or Some(human-readable message + PIDs) when occupied.
+/// Uses `lsof` to identify the conflicting process — macOS only but that's our target.
+fn port_in_use(port: u16) -> Option<String> {
+    let out = Command::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output().ok()?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let pids: Vec<&str> = raw.split_whitespace().collect();
+    if pids.is_empty() { return None; }
+    // Resolve PID → process name for a friendlier message.
+    let procs: Vec<String> = pids.iter().filter_map(|pid| {
+        Command::new("ps").args(["-p", pid, "-o", "comm="])
+            .output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| format!("{} (PID {})", s.trim(), pid))
+    }).collect();
+    let desc = if procs.is_empty() { pids.join(", ") } else { procs.join(", ") };
+    Some(format!("Port {port} already in use by {desc} — stop it then press R to retry"))
+}
+
 fn docker_available() -> bool {
     Command::new("docker")
         .args(["info", "--format", "{{.ServerVersion}}"])
@@ -4363,6 +4392,14 @@ fn main() {
                     env:             $env.clone(),
                     requires_docker: false,
                 });
+                // Pre-launch port gate: refuse to spawn if the target port is occupied.
+                let port_conflict: Option<String> = $svc.url.as_deref()
+                    .and_then(extract_url_port)
+                    .and_then(port_in_use);
+                if let Some(conflict) = port_conflict {
+                    $svc.health = Health::Degraded(conflict);
+                    svcs.push($svc);
+                } else {
                 let idx = svcs.len();
                 match spawn_svc($prog, $argv, $dir, $env, &$svc.log_path) {
                     Ok((child, pgid)) => {
@@ -4377,6 +4414,7 @@ fn main() {
                         svcs.push($svc);
                     }
                 }
+                } // end port-conflict else
             }};
         }
 
