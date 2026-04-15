@@ -579,22 +579,28 @@ fn tombstone_workspace(dir: &Path, hash: &str) {
 
 
 /// Convert a `WorkspaceConfig` back to `ProductChoice` list (for the UI and path resolution).
+///
+/// Always iterates `PRODUCTS` as the canonical list so that every product is
+/// present in the result regardless of what was (or wasn't) stored in the config.
+/// Saved state (enabled / branch) is looked up by repo name, not position, making
+/// this robust against entries being missing, reordered, or added to PRODUCTS later.
 fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> Vec<ProductChoice> {
-    config.entries.iter().zip(PRODUCTS.iter()).map(|(e, (repo, label, _, desc))| {
-        let path = if e.branch.is_empty() {
+    PRODUCTS.iter().map(|(repo, label, _, desc)| {
+        let saved  = config.entries.iter().find(|e| e.repo.as_str() == *repo);
+        let branch = saved.map(|e| e.branch.clone()).unwrap_or_default();
+        let enabled = saved.map(|e| e.enabled).unwrap_or(false);
+        let path = if branch.is_empty() {
             workspace_root.join(repo)
         } else {
-            let slug = branch_to_slug(&e.branch);
-            let wt = workspace_root.join(format!("{}-{}", repo, slug));
+            let slug = branch_to_slug(&branch);
+            let wt   = workspace_root.join(format!("{}-{}", repo, slug));
             if wt.is_dir() { wt } else { workspace_root.join(repo) }
         };
         ProductChoice {
-            label,
-            desc,
-            repo,
-            enabled:   e.enabled,
+            label, desc, repo,
+            enabled,
             available: path.is_dir() || workspace_root.join(repo).is_dir(),
-            branch:    e.branch.clone(),
+            branch,
         }
     }).collect()
 }
@@ -3661,10 +3667,28 @@ fn run_product_selector(slug: &str, choices: &mut Vec<ProductChoice>) -> bool {
             [27, b'[', b'B'] | [b'j'] => {
                 if cursor + 1 < choices.len() { cursor += 1; }
             }
-            // Toggle
+            // Toggle — if the product is available, toggle enabled.
+            // If unavailable and no branch set, fall through to the branch prompt
+            // (same as pressing 'b') so the user can enable it via a worktree.
             [b' '] => {
                 if choices[cursor].available || !choices[cursor].branch.is_empty() {
                     choices[cursor].enabled = !choices[cursor].enabled;
+                } else {
+                    // Product dir doesn't exist yet — ask for a branch name so a worktree
+                    // can be created, which makes the product available.
+                    drop(raw.take());
+                    print!("\x1b[?25h");
+                    print!("\n  Branch for {} : ", choices[cursor].label);
+                    let _ = io::stdout().flush();
+                    if let Some(input) = read_line_or_interrupt() {
+                        let trimmed = input.trim().to_string();
+                        if !trimmed.is_empty() {
+                            choices[cursor].branch   = trimmed;
+                            choices[cursor].enabled  = true;
+                            choices[cursor].available = true;
+                        }
+                    }
+                    raw = RawMode::enter();
                 }
             }
             // Edit branch for highlighted product
@@ -3949,6 +3973,10 @@ fn resolve_workspace(
             if workspaces.is_empty() {
                 return build_new_workspace_interactive(workspace_root, ws_dir);
             }
+            // Flush any buffered stdin bytes (e.g. the Enter from a delete confirmation
+            // or the confirmation prompt in run_workspace_delete) so they don't
+            // accidentally fire in run_workspace_selector.
+            unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
             match run_workspace_selector(&workspaces) {
                 WorkspaceAction::Delete(cfg) => {
                     run_workspace_delete(&cfg, workspace_root, ws_dir);
