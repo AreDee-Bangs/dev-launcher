@@ -952,7 +952,10 @@ impl RawMode {
             raw.c_cc[libc::VMIN]  = 0;
             raw.c_cc[libc::VTIME] = 0;
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw);
-            print!("\x1b[?25l"); // hide cursor
+            // Enter alternate screen buffer + hide cursor.
+            // The alternate screen is a separate display surface with no scrollback;
+            // the original terminal content is restored exactly when we leave.
+            print!("\x1b[?1049h\x1b[?25l");
             let _ = io::stdout().flush();
             Some(Self { saved })
         }
@@ -962,7 +965,8 @@ impl RawMode {
 impl Drop for RawMode {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.saved); }
-        print!("\x1b[?25h\x1b[0m"); // show cursor + reset attributes
+        // Leave alternate screen buffer, show cursor, reset attributes.
+        print!("\x1b[?1049l\x1b[?25h\x1b[0m");
         let _ = io::stdout().flush();
     }
 }
