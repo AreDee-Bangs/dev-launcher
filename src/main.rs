@@ -24,6 +24,51 @@ use std::thread;
 
 use clap::Parser;
 
+// ── Signal / orphan-recovery globals ─────────────────────────────────────────
+// SIGHUP is sent when the terminal window is closed. The ctrlc crate only
+// handles SIGINT/SIGTERM. We install a raw libc handler for SIGHUP that sets
+// this static so the main loop runs the same clean shutdown path.
+static SIGHUP_STOP: AtomicBool = AtomicBool::new(false);
+extern "C" fn sighup_handler(_: libc::c_int) {
+    SIGHUP_STOP.store(true, Ordering::Relaxed);
+}
+
+/// Path of the PID file for a given slug. Written at spawn time so that a
+/// subsequent launch can kill any orphans left behind by a SIGKILL'd session.
+fn pid_file_path(slug: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/dev-feature-{slug}.pids"))
+}
+
+/// Kill any PIDs recorded in a leftover PID file from a crashed previous session.
+fn kill_orphaned_pids(slug: &str) {
+    let path = pid_file_path(slug);
+    let Ok(content) = fs::read_to_string(&path) else { return };
+    let pids: Vec<i32> = content.lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    if pids.is_empty() { return }
+    eprintln!("  [dev-feature] Found orphaned PIDs from a previous session: {pids:?}");
+    eprintln!("  [dev-feature] Sending SIGTERM…");
+    for &pid in &pids {
+        unsafe { libc::kill(pid, libc::SIGTERM); }
+    }
+    // Brief pause then SIGKILL any survivors.
+    thread::sleep(Duration::from_millis(500));
+    for &pid in &pids {
+        unsafe { libc::kill(pid, libc::SIGKILL); }
+    }
+    let _ = fs::remove_file(&path);
+    eprintln!("  [dev-feature] Orphan cleanup done.");
+}
+
+/// Append a PID to the session PID file (called once per spawned process).
+fn record_pid(slug: &str, pid: u32) {
+    let path = pid_file_path(slug);
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{pid}");
+    }
+}
+
 // ── ANSI ──────────────────────────────────────────────────────────────────────
 
 const R:    &str = "\x1b[0m";
@@ -4214,13 +4259,22 @@ fn main() {
     // Track which service indices have already had diagnosis dispatched.
     let mut diagnosed: HashSet<usize> = HashSet::new();
 
-    // ── Ctrl+C ───────────────────────────────────────────────────────────────
+    // ── Signal handlers ──────────────────────────────────────────────────────
+    // ctrlc handles SIGINT + SIGTERM (with the "termination" feature).
+    // We add SIGHUP separately so that closing the terminal window triggers
+    // the same clean shutdown path instead of orphaning all child processes.
     {
         let stopping = Arc::clone(&stopping);
         ctrlc::set_handler(move || {
             stopping.store(true, Ordering::Relaxed);
         }).expect("failed to set Ctrl+C handler");
     }
+    unsafe { libc::signal(libc::SIGHUP, sighup_handler as *const () as libc::sighandler_t); }
+
+    // ── Orphan recovery ──────────────────────────────────────────────────────
+    // If the previous session was SIGKILL'd (or crashed), it left a PID file.
+    // Kill any surviving processes before we try to bind their ports.
+    kill_orphaned_pids(&slug);
 
     // ════════════════════════════════════════════════════════════════════════
     //  Step 1 / 2  —  Environment
@@ -4403,6 +4457,7 @@ fn main() {
                 let idx = svcs.len();
                 match spawn_svc($prog, $argv, $dir, $env, &$svc.log_path) {
                     Ok((child, pgid)) => {
+                        record_pid(&slug, child.id()); // track for orphan recovery
                         $svc.pid        = Some(child.id());
                         $svc.started_at = Some(Instant::now());
                         $svc.health     = if $svc.url.is_some() { Health::Launching } else { Health::Running };
@@ -4720,7 +4775,7 @@ fn main() {
 
     loop {
         // ── Shutdown ─────────────────────────────────────────────────────────
-        if stopping.load(Ordering::Relaxed) {
+        if stopping.load(Ordering::Relaxed) || SIGHUP_STOP.load(Ordering::Relaxed) {
             drop(raw_mode.take()); // restore terminal first
 
             // Build (name, proc_index_opt) pairs for every visible service.
@@ -4738,7 +4793,11 @@ fn main() {
             };
 
             // Send SIGTERM to every active process group.
-            for p in &mut procs { p.kill(); }
+            eprintln!("[dev-feature] Stopping {} process(es)…", procs.len());
+            for p in &mut procs {
+                eprintln!("[dev-feature]   SIGTERM → pgid -{} (svc #{})", p.pgid, p.idx);
+                p.kill();
+            }
 
             let mut term_status: Vec<TermStatus> = procs.iter()
                 .map(|_| TermStatus::Terminating)
@@ -4763,6 +4822,7 @@ fn main() {
                     timed_out = true;
                     for (j, p) in procs.iter_mut().enumerate() {
                         if term_status[j] == TermStatus::Terminating {
+                            eprintln!("[dev-feature]   SIGKILL → pgid -{} (did not exit in 5s)", p.pgid);
                             unsafe { libc::kill(-p.pgid, libc::SIGKILL); }
                             term_status[j] = TermStatus::Killed;
                         }
@@ -4776,6 +4836,10 @@ fn main() {
                     // One final render so the user sees "All processes stopped."
                     render_shutdown(&slug, &pairs, &term_status, started.elapsed(), timed_out);
                     thread::sleep(Duration::from_millis(600));
+                    // Clean shutdown — remove the PID file so the next launch
+                    // doesn't try to kill processes that are already gone.
+                    let _ = fs::remove_file(pid_file_path(&slug));
+                    eprintln!("[dev-feature] All processes stopped. PID file removed.");
                     break;
                 }
 
@@ -4848,6 +4912,7 @@ fn main() {
             let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
             match spawn_svc(&cmd.prog, &args, &cmd.dir, &cmd.env, &log_path) {
                 Ok((child, pgid)) => {
+                    record_pid(&slug, child.id());
                     let mut svcs = state.lock().unwrap();
                     let has_url = svcs[idx].url.is_some();
                     svcs[idx].health     = if has_url { Health::Launching } else { Health::Running };
@@ -4934,6 +4999,7 @@ fn main() {
                                             Ok((child, pgid)) => {
                                                 let mut svcs = state.lock().unwrap();
                                                 let has_url = svcs[idx].url.is_some();
+                                                record_pid(&slug, child.id());
                                                 svcs[idx].health     = if has_url { Health::Launching } else { Health::Running };
                                                 svcs[idx].pid        = Some(child.id());
                                                 svcs[idx].started_at = Some(Instant::now());
