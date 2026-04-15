@@ -223,6 +223,16 @@ enum DiagEvent {
 // ── Service display state (shared with health thread) ─────────────────────────
 
 #[derive(Debug)]
+/// Stored command needed to restart a service after a crash or manual retry.
+#[derive(Clone)]
+struct SpawnCmd {
+    prog:            String,
+    args:            Vec<String>,
+    dir:             PathBuf,
+    env:             HashMap<String, String>,
+    requires_docker: bool,
+}
+
 struct Svc {
     name:            String,
     url:             Option<String>,
@@ -234,6 +244,10 @@ struct Svc {
     log_path:        PathBuf,
     /// Diagnosis message set by the log daemon after a crash.
     diagnosis:       Option<String>,
+    /// Stored command — populated at spawn time; enables R-key restart.
+    spawn_cmd:       Option<SpawnCmd>,
+    /// Service names that must be Up/Running before this one is spawned.
+    requires:        Vec<String>,
 }
 
 impl Svc {
@@ -254,6 +268,8 @@ impl Svc {
             startup_timeout: Duration::from_secs(timeout_secs),
             log_path,
             diagnosis: None,
+            spawn_cmd: None,
+            requires: Vec::new(),
         }
     }
 
@@ -263,6 +279,15 @@ impl Svc {
 
     fn secs(&self) -> u64 {
         self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    }
+
+    fn is_healthy(&self) -> bool {
+        matches!(self.health, Health::Up | Health::Running)
+    }
+
+    fn is_waiting_for_requires(&self) -> bool {
+        matches!(&self.health, Health::Degraded(m) if m.starts_with("Waiting for "))
+            && self.spawn_cmd.is_some()
     }
 }
 
@@ -284,6 +309,8 @@ struct SvcDef {
     timeout_secs:    u64,
     requires_docker: bool,
     log_name:        Option<String>,
+    /// Service names (within this stack) that must be Up before this one starts.
+    requires:        Vec<String>,
 }
 
 enum BootstrapDef {
@@ -982,6 +1009,7 @@ enum InputEvent {
     Credentials, // e — show .env credentials overlay
     Diagnose,    // d — run on-demand service diagnosis from log view
     Report,      // r — report missing recipe (Diagnose mode only)
+    Restart,     // R — kill and re-spawn the highlighted service
 }
 
 fn spawn_input_thread(tx: mpsc::SyncSender<InputEvent>, stopping: Arc<AtomicBool>) {
@@ -1016,6 +1044,8 @@ fn spawn_input_thread(tx: mpsc::SyncSender<InputEvent>, stopping: Arc<AtomicBool
                 [b'd'] => Some(InputEvent::Diagnose),
                 // r — report missing recipe (Diagnose mode)
                 [b'r'] => Some(InputEvent::Report),
+                // R — restart highlighted service
+                [b'R'] => Some(InputEvent::Restart),
                 _ => None,
             };
             if let Some(e) = event {
@@ -1146,7 +1176,7 @@ fn render_overview(svcs: &[Svc], slug: &str, logs_dir: &Path, cursor: usize, has
     }
 
     if has_tui {
-        println!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   e credentials   q quit{R}");
+        println!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   R restart   e credentials   q quit{R}");
     } else {
         println!("  {DIM}Ctrl+C to stop   tail -f {}/*.log{R}", logs_dir.display());
     }
@@ -1983,6 +2013,7 @@ fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
     let mut svc_timeout: u64 = 30;
     let mut svc_req_docker = false;
     let mut svc_log: Option<String> = None;
+    let mut svc_requires: Vec<String> = Vec::new();
     // Per-bootstrap accumulator
     let mut bs_check   = String::new();
     let mut bs_missing = String::new();
@@ -1993,6 +2024,7 @@ fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
     let flush_service = |name: &str, args: &Vec<String>, cwd: &str,
                          health: &Option<String>, timeout: u64,
                          req_docker: bool, log: &Option<String>,
+                         requires: &Vec<String>,
                          svcs: &mut Vec<SvcDef>| {
         if !name.is_empty() {
             svcs.push(SvcDef {
@@ -2003,6 +2035,7 @@ fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                 timeout_secs:    timeout,
                 requires_docker: req_docker,
                 log_name:        log.clone(),
+                requires:        requires.clone(),
             });
         }
     };
@@ -2033,10 +2066,11 @@ fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
             match &section {
                 Section::Service => {
                     flush_service(&svc_name, &svc_args, &svc_cwd, &svc_health,
-                                  svc_timeout, svc_req_docker, &svc_log, &mut services);
+                                  svc_timeout, svc_req_docker, &svc_log, &svc_requires, &mut services);
                     svc_name = String::new(); svc_args = Vec::new();
                     svc_cwd = String::new(); svc_health = None;
                     svc_timeout = 30; svc_req_docker = false; svc_log = None;
+                    svc_requires = Vec::new();
                 }
                 Section::Bootstrap => {
                     flush_bootstrap(&bs_check, &bs_missing, &bs_run_if,
@@ -2077,6 +2111,7 @@ fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                     "timeout"         => svc_timeout = v.parse().unwrap_or(30),
                     "requires_docker" => svc_req_docker = matches!(v.as_str(), "true" | "1" | "yes"),
                     "log"             => svc_log = if v.is_empty() { None } else { Some(v) },
+                    "requires"        => svc_requires = v.split_whitespace().map(|s| s.to_string()).collect(),
                     _ => {}
                 },
                 Section::Bootstrap => match k {
@@ -2096,7 +2131,7 @@ fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
     match &section {
         Section::Service => {
             flush_service(&svc_name, &svc_args, &svc_cwd, &svc_health,
-                          svc_timeout, svc_req_docker, &svc_log, &mut services);
+                          svc_timeout, svc_req_docker, &svc_log, &svc_requires, &mut services);
         }
         Section::Bootstrap => {
             flush_bootstrap(&bs_check, &bs_missing, &bs_run_if,
@@ -2145,6 +2180,7 @@ fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
             timeout_secs:    120,
             requires_docker: true,
             log_name:        None,
+            requires:        Vec::new(),
         });
         services.push(SvcDef {
             name:            "worker".to_string(),
@@ -2158,6 +2194,7 @@ fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
             timeout_secs:    10,
             requires_docker: true,
             log_name:        Some("copilot-worker.log".to_string()),
+            requires:        Vec::new(),
         });
         bootstrap.push(BootstrapDef::Check {
             path:         "backend/.venv/bin/python".to_string(),
@@ -2177,6 +2214,7 @@ fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
             timeout_secs:    90,
             requires_docker: false,
             log_name:        None,
+            requires:        Vec::new(),
         });
         bootstrap.push(BootstrapDef::RunIfMissing {
             check:   "frontend/node_modules".to_string(),
@@ -4317,6 +4355,14 @@ fn main() {
 
         macro_rules! try_spawn {
             ($svc:expr, $prog:expr, $argv:expr, $dir:expr, $env:expr) => {{
+                // Store spawn command so the service can be restarted via R key.
+                $svc.spawn_cmd = Some(SpawnCmd {
+                    prog:            $prog.to_string(),
+                    args:            $argv.iter().map(|s| s.to_string()).collect(),
+                    dir:             $dir.to_path_buf(),
+                    env:             $env.clone(),
+                    requires_docker: false,
+                });
                 let idx = svcs.len();
                 match spawn_svc($prog, $argv, $dir, $env, &$svc.log_path) {
                     Ok((child, pgid)) => {
@@ -4350,6 +4396,8 @@ fn main() {
                         format!("copilot-{}", def.name),
                         url, health_path, def.timeout_secs, log_path,
                     );
+                    // Propagate requires from manifest (prefix with product for cross-product deps).
+                    svc.requires = def.requires.clone();
                     if def.requires_docker && !copilot_docker_ok {
                         svc.health = Health::Degraded("Docker deps not running — start Docker first".into());
                         svcs.push(svc);
@@ -4376,6 +4424,21 @@ fn main() {
                     let rest: Vec<&str> = def.args[1..].iter().map(|s| s.as_str()).collect();
                     let empty_env: HashMap<String, String> = HashMap::new();
                     let env = if def.cwd == "backend" { &backend_env } else { &empty_env };
+                    // Check requires before spawning — defer if deps aren't healthy yet.
+                    if !def.requires.is_empty() {
+                        let unmet: Vec<&str> = def.requires.iter()
+                            .filter(|r| !svcs.iter().any(|s| &s.name == *r && s.is_healthy()))
+                            .map(|s| s.as_str()).collect();
+                        if !unmet.is_empty() {
+                            svc.spawn_cmd = Some(SpawnCmd {
+                                prog: prog.clone(), args: rest.iter().map(|s| s.to_string()).collect(),
+                                dir: work_dir.clone(), env: env.clone(), requires_docker: def.requires_docker,
+                            });
+                            svc.health = Health::Degraded(format!("Waiting for {}…", unmet.join(", ")));
+                            svcs.push(svc);
+                            continue;
+                        }
+                    }
                     try_spawn!(svc, &prog, &rest, &work_dir, env);
                 }
             } else {
@@ -4516,13 +4579,30 @@ fn main() {
             let env      = parse_env_file(&env_path);
 
             let mut svc = Svc::new("connector", None::<String>, "", 30, logs_dir.join("connector.log"));
+            // Connector needs OpenCTI graphql healthy before it can connect.
+            svc.requires = vec!["opencti-graphql".to_string()];
             if let Some(reason) = validate_connector_env(&env) {
                 // Fail fast with a clear message instead of letting the connector crash
                 // immediately after spawn with a confusing Python traceback.
                 svc.health = Health::Degraded(reason);
                 svcs.push(svc);
             } else if src_dir.is_dir() && python.exists() {
-                try_spawn!(svc, python.to_str().unwrap(), &["main.py"], &src_dir, &env);
+                // Check if opencti-graphql is already healthy; if not, defer.
+                let opencti_ready = svcs.iter().any(|s| s.name == "opencti-graphql" && s.is_healthy());
+                if !opencti_ready {
+                    let python_str = python.to_str().unwrap().to_string();
+                    svc.spawn_cmd = Some(SpawnCmd {
+                        prog: python_str.clone(),
+                        args: vec!["main.py".to_string()],
+                        dir:  src_dir.clone(),
+                        env:  env.clone(),
+                        requires_docker: false,
+                    });
+                    svc.health = Health::Degraded("Waiting for opencti-graphql…".into());
+                    svcs.push(svc);
+                } else {
+                    try_spawn!(svc, python.to_str().unwrap(), &["main.py"], &src_dir, &env);
+                }
             } else {
                 svc.health = Health::Degraded("src/ or venv not found".into());
                 svcs.push(svc);
@@ -4712,6 +4792,39 @@ fn main() {
             force_render = true;
         }
 
+        // ── Auto-spawn services waiting on requires ───────────────────────────
+        // Collect candidates (brief lock), then spawn outside the lock.
+        let spawn_candidates: Vec<(usize, SpawnCmd, PathBuf)> = {
+            let svcs = state.lock().unwrap();
+            svcs.iter().enumerate()
+                .filter(|(_, s)| s.is_waiting_for_requires())
+                .filter(|(_, s)| {
+                    s.requires.iter().all(|req| svcs.iter().any(|o| &o.name == req && o.is_healthy()))
+                })
+                .filter_map(|(i, s)| {
+                    s.spawn_cmd.clone().map(|cmd| (i, cmd, s.log_path.clone()))
+                })
+                .collect()
+        };
+        for (idx, cmd, log_path) in spawn_candidates {
+            let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
+            match spawn_svc(&cmd.prog, &args, &cmd.dir, &cmd.env, &log_path) {
+                Ok((child, pgid)) => {
+                    let mut svcs = state.lock().unwrap();
+                    let has_url = svcs[idx].url.is_some();
+                    svcs[idx].health     = if has_url { Health::Launching } else { Health::Running };
+                    svcs[idx].pid        = Some(child.id());
+                    svcs[idx].started_at = Some(Instant::now());
+                    procs.push(Proc { idx, pgid, child });
+                }
+                Err(e) => {
+                    let mut svcs = state.lock().unwrap();
+                    svcs[idx].health = Health::Degraded(e.to_string());
+                }
+            }
+            force_render = true;
+        }
+
         // ── Input handling ────────────────────────────────────────────────────
         let mut got_input = false;
         if has_tui {
@@ -4750,6 +4863,53 @@ fn main() {
                                 let findings = diagnose_service(&svcs[idx], &paths);
                                 drop(svcs);
                                 mode = Mode::Diagnose { svc_idx: idx, findings, cursor: 0 };
+                            }
+                        }
+                        // R — kill and re-spawn the highlighted service
+                        InputEvent::Restart => {
+                            let visible: Vec<usize> = {
+                                let svcs = state.lock().unwrap();
+                                svcs.iter().enumerate()
+                                    .filter(|(_, s)| s.health != Health::Pending)
+                                    .map(|(i, _)| i)
+                                    .collect()
+                            };
+                            if let Some(&idx) = visible.get(*cursor) {
+                                let (cmd, log_path) = {
+                                    let svcs = state.lock().unwrap();
+                                    (svcs[idx].spawn_cmd.clone(), svcs[idx].log_path.clone())
+                                };
+                                if let Some(cmd) = cmd {
+                                    // Kill existing process if still running.
+                                    if let Some(pos) = procs.iter().position(|p| p.idx == idx) {
+                                        unsafe { libc::kill(-(procs[pos].pgid as i32), libc::SIGKILL); }
+                                        procs.remove(pos);
+                                    }
+                                    // Re-check Docker if the service needs it.
+                                    let docker_ok = !cmd.requires_docker || docker_available();
+                                    if !docker_ok {
+                                        let mut svcs = state.lock().unwrap();
+                                        svcs[idx].health = Health::Degraded("Docker not running — start Docker first".into());
+                                    } else {
+                                        let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
+                                        match spawn_svc(&cmd.prog, &args, &cmd.dir, &cmd.env, &log_path) {
+                                            Ok((child, pgid)) => {
+                                                let mut svcs = state.lock().unwrap();
+                                                let has_url = svcs[idx].url.is_some();
+                                                svcs[idx].health     = if has_url { Health::Launching } else { Health::Running };
+                                                svcs[idx].pid        = Some(child.id());
+                                                svcs[idx].started_at = Some(Instant::now());
+                                                svcs[idx].diagnosis  = None;
+                                                procs.push(Proc { idx, pgid, child });
+                                            }
+                                            Err(e) => {
+                                                let mut svcs = state.lock().unwrap();
+                                                svcs[idx].health = Health::Degraded(e.to_string());
+                                            }
+                                        }
+                                    }
+                                    force_render = true;
+                                }
                             }
                         }
                         InputEvent::Back        => { stopping.store(true, Ordering::Relaxed); }
