@@ -52,6 +52,10 @@ const KIND_BOOTSTRAP_RUN:     &str = "bootstrap-command-needed";
 const KIND_DEGRADED_UNKNOWN:  &str = "service-degraded-unknown";
 const KIND_CRASH:             &str = "service-crashed";
 
+/// How long (in seconds) to wait for OpenCTI to finish initialising before
+/// the user restarts the connector after a startup crash.
+const CONNECTOR_CRASH_WAIT_SECS: u64 = 120;
+
 /// Kinds that have a known, implemented recipe in this binary.
 /// A finding whose kind is NOT in this list (and is not an info/ kind) will
 /// offer the user a shortcut to file a GitHub issue requesting the recipe.
@@ -60,6 +64,7 @@ const RECIPE_CATALOG: &[&str] = &[
     KIND_NODE_MODULES,
     KIND_ENV_PLACEHOLDER,
     KIND_BOOTSTRAP_RUN,
+    KIND_CRASH,
 ];
 
 /// Returns true when the finding represents an issue with no implemented recipe,
@@ -1430,15 +1435,35 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
 
     // ── 1b. Crashed: surface exit code as a reportable finding ───────────────
     if let Health::Crashed(code) = &svc.health {
-        findings.push(Finding::info(
-            KIND_CRASH,
-            format!("Service crashed (exit {})", code),
-            vec![
-                format!("  Exit code: {}", code),
-                format!("  Log: {}", svc.log_path.display()),
-                "  No automated fix is available — use r to file a GitHub issue.".into(),
-            ],
-        ));
+        let body_base = vec![
+            format!("  Exit code: {}", code),
+            format!("  Log: {}", svc.log_path.display()),
+        ];
+        if svc.name.starts_with("connector") {
+            // The connector frequently crashes on startup because OpenCTI is still
+            // initialising.  Recipe: wait CONNECTOR_CRASH_WAIT_SECS to let OpenCTI
+            // finish, then the user can press R to restart the connector.
+            let mut body = body_base;
+            body.push("  OpenCTI may not be fully initialised yet.".into());
+            body.push("  After waiting, press R on the overview screen to restart the connector.".into());
+            findings.push(Finding::fixable(
+                KIND_CRASH,
+                format!("Service crashed (exit {})", code),
+                body,
+                FixAction::Steps {
+                    label: format!("Wait {} s for OpenCTI to finish starting up", CONNECTOR_CRASH_WAIT_SECS),
+                    steps: vec![FixStep::new(&["sleep", &CONNECTOR_CRASH_WAIT_SECS.to_string()], repo_dir)],
+                },
+            ));
+        } else {
+            let mut body = body_base;
+            body.push("  Check the log above for details.".into());
+            findings.push(Finding::info(
+                KIND_CRASH,
+                format!("Service crashed (exit {})", code),
+                body,
+            ));
+        }
     }
 
     // ── 2. Log pattern analysis ───────────────────────────────────────────────
