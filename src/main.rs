@@ -1142,7 +1142,7 @@ fn render_overview(svcs: &[Svc], slug: &str, logs_dir: &Path, cursor: usize, has
     }
 
     if has_tui {
-        println!("  {DIM}↑↓ navigate   Enter/→ logs   e credentials   q quit{R}");
+        println!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   e credentials   q quit{R}");
     } else {
         println!("  {DIM}Ctrl+C to stop   tail -f {}/*.log{R}", logs_dir.display());
     }
@@ -4686,6 +4686,14 @@ fn main() {
                                 let _ = tx.send(DiagEvent::Result { svc_idx, msg });
                             }
                         });
+
+                        // Auto-jump to Diagnose view on first crash when in Overview.
+                        // This puts the user directly on the findings screen (with r / fixes)
+                        // instead of requiring them to navigate Log → d → Diagnose manually.
+                        if has_tui && matches!(mode, Mode::Overview { .. }) {
+                            let findings = diagnose_service(&svcs[p.idx], &paths);
+                            mode = Mode::Diagnose { svc_idx: p.idx, findings, cursor: 0 };
+                        }
                     }
                 }
             }
@@ -4725,6 +4733,19 @@ fn main() {
                             if let Some(&svc_idx) = visible.get(*cursor) {
                                 drop(svcs);
                                 mode = Mode::LogView { svc_idx, scroll: 0, follow: true };
+                            }
+                        }
+                        // d — open diagnosis directly from the overview (skip the log view)
+                        InputEvent::Diagnose => {
+                            let svcs = state.lock().unwrap();
+                            let visible: Vec<usize> = svcs.iter().enumerate()
+                                .filter(|(_, s)| s.health != Health::Pending)
+                                .map(|(i, _)| i)
+                                .collect();
+                            if let Some(&idx) = visible.get(*cursor) {
+                                let findings = diagnose_service(&svcs[idx], &paths);
+                                drop(svcs);
+                                mode = Mode::Diagnose { svc_idx: idx, findings, cursor: 0 };
                             }
                         }
                         InputEvent::Back        => { stopping.store(true, Ordering::Relaxed); }
