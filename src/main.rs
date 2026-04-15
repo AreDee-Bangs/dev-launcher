@@ -50,6 +50,7 @@ const KIND_NODE_MODULES:      &str = "node-modules-missing";
 const KIND_ENV_PLACEHOLDER:   &str = "env-placeholder-credentials";
 const KIND_BOOTSTRAP_RUN:     &str = "bootstrap-command-needed";
 const KIND_DEGRADED_UNKNOWN:  &str = "service-degraded-unknown";
+const KIND_CRASH:             &str = "service-crashed";
 
 /// Kinds that have a known, implemented recipe in this binary.
 /// A finding whose kind is NOT in this list (and is not an info/ kind) will
@@ -1393,6 +1394,19 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
         }
     }
 
+    // ── 1b. Crashed: surface exit code as a reportable finding ───────────────
+    if let Health::Crashed(code) = &svc.health {
+        findings.push(Finding::info(
+            KIND_CRASH,
+            format!("Service crashed (exit {})", code),
+            vec![
+                format!("  Exit code: {}", code),
+                format!("  Log: {}", svc.log_path.display()),
+                "  No automated fix is available — use r to file a GitHub issue.".into(),
+            ],
+        ));
+    }
+
     // ── 2. Log pattern analysis ───────────────────────────────────────────────
     if matches!(svc.health, Health::Crashed(_) | Health::Degraded(_)) {
         let log_lines = tail_file(&svc.log_path, 150);
@@ -1595,7 +1609,8 @@ fn render_diagnose(svc: &Svc, findings: &[Finding], cursor: usize) {
         let mut n = 0usize;
         for (i, f) in findings.iter().enumerate() {
             if i == cursor { break; }
-            n += 2 + f.body.len() + if f.fix.is_some() { 1 } else { 0 } + 1;
+            let extra = if f.fix.is_some() || needs_recipe(f) { 1 } else { 0 };
+            n += 2 + f.body.len() + extra + 1;
         }
         n
     };
