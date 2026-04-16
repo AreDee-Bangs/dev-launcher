@@ -105,6 +105,7 @@ const RECIPE_CATALOG: &[&str] = &[
     KIND_NODE_MODULES,
     KIND_ENV_PLACEHOLDER,
     KIND_BOOTSTRAP_RUN,
+    KIND_CRASH,
 ];
 
 /// Returns true when the finding represents an issue with no implemented recipe,
@@ -1475,15 +1476,36 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
 
     // ── 1b. Crashed: surface exit code as a reportable finding ───────────────
     if let Health::Crashed(code) = &svc.health {
-        findings.push(Finding::info(
-            KIND_CRASH,
-            format!("Service crashed (exit {})", code),
-            vec![
-                format!("  Exit code: {}", code),
-                format!("  Log: {}", svc.log_path.display()),
-                "  No automated fix is available — use r to file a GitHub issue.".into(),
-            ],
-        ));
+        let body_base = vec![
+            format!("  Exit code: {}", code),
+            format!("  Log: {}", svc.log_path.display()),
+        ];
+        if svc.name == "opencti-graphql" {
+            // opencti-graphql exits 1 when node_modules are stale or incomplete
+            // (e.g. after a branch switch or an interrupted install).
+            // Recipe: re-run yarn install in the graphql directory.
+            let gql_dir = repo_dir.join("opencti-platform/opencti-graphql");
+            let mut body = body_base;
+            body.push("  Node dependencies may be out of date or corrupted.".into());
+            body.push("  Re-installing them usually resolves the crash.".into());
+            findings.push(Finding::fixable(
+                KIND_CRASH,
+                format!("Service crashed (exit {})", code),
+                body,
+                FixAction::Steps {
+                    label: "Re-install JavaScript dependencies (yarn install)".into(),
+                    steps: vec![FixStep::new(&["yarn", "install"], &gql_dir)],
+                },
+            ));
+        } else {
+            let mut body = body_base;
+            body.push("  Check the log above for details.".into());
+            findings.push(Finding::info(
+                KIND_CRASH,
+                format!("Service crashed (exit {})", code),
+                body,
+            ));
+        }
     }
 
     // ── 2. Log pattern analysis ───────────────────────────────────────────────
