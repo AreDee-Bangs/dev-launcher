@@ -94,6 +94,7 @@ const KIND_PYTHON_VENV:       &str = "python-venv-missing";
 const KIND_NODE_MODULES:      &str = "node-modules-missing";
 const KIND_ENV_PLACEHOLDER:   &str = "env-placeholder-credentials";
 const KIND_BOOTSTRAP_RUN:     &str = "bootstrap-command-needed";
+const KIND_DOCKER_NOT_RUNNING: &str = "docker-not-running";
 const KIND_DEGRADED_UNKNOWN:  &str = "service-degraded-unknown";
 const KIND_CRASH:             &str = "service-crashed";
 
@@ -110,6 +111,7 @@ const RECIPE_CATALOG: &[&str] = &[
     KIND_ENV_PLACEHOLDER,
     KIND_BOOTSTRAP_RUN,
     KIND_CRASH,
+    KIND_DOCKER_NOT_RUNNING,
 ];
 
 /// Returns true when the finding represents an issue with no implemented recipe,
@@ -1454,6 +1456,33 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
                 FixAction::EnvWizard { env_path, vars: CONNECTOR_ENV_VARS, product: "ImportDocumentAI connector" },
                 KIND_ENV_PLACEHOLDER,
             )
+        } else if msg.contains("Docker deps not running") {
+            // Docker Desktop is not running.  If it has since been started
+            // (rare but possible), just flag the service for a restart.
+            // Otherwise offer a one-click recipe that starts Docker using the
+            // platform-appropriate command.
+            if docker_available() {
+                DegradedOutcome::NeedsRestart
+            } else {
+                let start_steps: Option<Vec<FixStep>> = if cfg!(target_os = "macos") {
+                    Some(vec![FixStep::new(&["open", "-a", "Docker"], repo_dir)])
+                } else if cfg!(target_os = "linux") {
+                    Some(vec![FixStep::new(&["sudo", "systemctl", "start", "docker"], repo_dir)])
+                } else {
+                    None
+                };
+                if let Some(steps) = start_steps {
+                    DegradedOutcome::Fixable(
+                        FixAction::Steps {
+                            label: "Start Docker daemon".into(),
+                            steps,
+                        },
+                        KIND_DOCKER_NOT_RUNNING,
+                    )
+                } else {
+                    DegradedOutcome::Unknown
+                }
+            }
         } else {
             DegradedOutcome::Unknown
         };
