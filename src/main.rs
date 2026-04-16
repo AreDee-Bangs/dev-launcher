@@ -1484,7 +1484,24 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
             format!("  Exit code: {}", code),
             format!("  Log: {}", svc.log_path.display()),
         ];
-        if svc.name.starts_with("connector") {
+        if svc.name == "opencti-graphql" {
+            // opencti-graphql exits 1 when node_modules are stale or incomplete
+            // (e.g. after a branch switch or an interrupted install).
+            // Recipe: re-run yarn install in the graphql directory.
+            let gql_dir = repo_dir.join("opencti-platform/opencti-graphql");
+            let mut body = body_base;
+            body.push("  Node dependencies may be out of date or corrupted.".into());
+            body.push("  Re-installing them usually resolves the crash.".into());
+            findings.push(Finding::fixable(
+                KIND_CRASH,
+                format!("Service crashed (exit {})", code),
+                body,
+                FixAction::Steps {
+                    label: "Re-install JavaScript dependencies (yarn install)".into(),
+                    steps: vec![FixStep::new(&["yarn", "install"], &gql_dir)],
+                },
+            ));
+        } else if svc.name.starts_with("connector") {
             // The connector frequently crashes on startup because OpenCTI is still
             // initialising.  Recipe: wait CONNECTOR_CRASH_WAIT_SECS to let OpenCTI
             // finish, then the user can press R to restart the connector.
