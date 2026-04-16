@@ -402,6 +402,7 @@ struct Paths {
     opencti:   PathBuf,
     connector: PathBuf,
     openaev:   PathBuf,
+    ws_hash:   String,
 }
 
 impl Paths {
@@ -1514,22 +1515,51 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
             format!("  Log: {}", svc.log_path.display()),
         ];
         if svc.name == "opencti-graphql" {
-            // opencti-graphql exits 1 when node_modules are stale or incomplete
-            // (e.g. after a branch switch or an interrupted install).
-            // Recipe: re-run yarn install in the graphql directory.
-            let gql_dir = repo_dir.join("opencti-platform/opencti-graphql");
-            let mut body = body_base;
-            body.push("  Node dependencies may be out of date or corrupted.".into());
-            body.push("  Re-installing them usually resolves the crash.".into());
-            findings.push(Finding::fixable(
-                KIND_CRASH,
-                format!("Service crashed (exit {})", code),
-                body,
-                FixAction::Steps {
-                    label: "Re-install JavaScript dependencies (yarn install)".into(),
-                    steps: vec![FixStep::new(&["yarn", "install"], &gql_dir)],
-                },
-            ));
+            // Check the log to distinguish between crash causes.
+            let log_lines = tail_file(&svc.log_path, 100);
+            let has_index_exists = log_lines.iter().any(|l| l.contains("index already exists"));
+
+            if has_index_exists {
+                // Recipe: the Elasticsearch/OpenSearch index was left in a
+                // half-initialised state (platform was killed mid-init).
+                // Fix: remove all compose volumes so the index is recreated
+                // cleanly on next startup.
+                let dc = paths.opencti.join("opencti-platform/opencti-dev/docker-compose.yml");
+                let project = ws_docker_project("opencti-dev", &paths.ws_hash);
+                let dc_str = dc.to_string_lossy().into_owned();
+                let mut body = body_base;
+                body.push("  Elasticsearch/OpenSearch index is in a partially-initialised state.".into());
+                body.push("  Removing the data volumes allows the platform to re-initialise cleanly.".into());
+                findings.push(Finding::fixable(
+                    KIND_CRASH,
+                    format!("Service crashed (exit {})", code),
+                    body,
+                    FixAction::Steps {
+                        label: "Reset Elasticsearch/OpenSearch data (docker compose down -v)".into(),
+                        steps: vec![FixStep::new(
+                            &["docker", "compose", "-p", project.as_str(), "-f", dc_str.as_str(), "down", "-v"],
+                            repo_dir,
+                        )],
+                    },
+                ));
+            } else {
+                // opencti-graphql exits 1 when node_modules are stale or incomplete
+                // (e.g. after a branch switch or an interrupted install).
+                // Recipe: re-run yarn install in the graphql directory.
+                let gql_dir = repo_dir.join("opencti-platform/opencti-graphql");
+                let mut body = body_base;
+                body.push("  Node dependencies may be out of date or corrupted.".into());
+                body.push("  Re-installing them usually resolves the crash.".into());
+                findings.push(Finding::fixable(
+                    KIND_CRASH,
+                    format!("Service crashed (exit {})", code),
+                    body,
+                    FixAction::Steps {
+                        label: "Re-install JavaScript dependencies (yarn install)".into(),
+                        steps: vec![FixStep::new(&["yarn", "install"], &gql_dir)],
+                    },
+                ));
+            }
         } else if svc.name.starts_with("connector") {
             // The connector frequently crashes on startup because OpenCTI is still
             // initialising.  Recipe: wait CONNECTOR_CRASH_WAIT_SECS to let OpenCTI
@@ -4267,6 +4297,7 @@ fn main() {
             openaev:   resolve_branch(choices[2].repo, &choices[2].branch),
             connector: resolve_branch(choices[3].repo, &choices[3].branch)
                            .join("internal-import-file/import-document-ai"),
+            ws_hash:   slug.clone(),
         }
     };
 
