@@ -97,6 +97,10 @@ const KIND_BOOTSTRAP_RUN:     &str = "bootstrap-command-needed";
 const KIND_DEGRADED_UNKNOWN:  &str = "service-degraded-unknown";
 const KIND_CRASH:             &str = "service-crashed";
 
+/// How long (in seconds) to wait for OpenCTI to finish initialising before
+/// the user restarts the connector after a startup crash.
+const CONNECTOR_CRASH_WAIT_SECS: u64 = 120;
+
 /// Kinds that have a known, implemented recipe in this binary.
 /// A finding whose kind is NOT in this list (and is not an info/ kind) will
 /// offer the user a shortcut to file a GitHub issue requesting the recipe.
@@ -1495,6 +1499,22 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
                 FixAction::Steps {
                     label: "Re-install JavaScript dependencies (yarn install)".into(),
                     steps: vec![FixStep::new(&["yarn", "install"], &gql_dir)],
+                },
+            ));
+        } else if svc.name.starts_with("connector") {
+            // The connector frequently crashes on startup because OpenCTI is still
+            // initialising.  Recipe: wait CONNECTOR_CRASH_WAIT_SECS to let OpenCTI
+            // finish, then the user can press R to restart the connector.
+            let mut body = body_base;
+            body.push("  OpenCTI may not be fully initialised yet.".into());
+            body.push("  After waiting, press R on the overview screen to restart the connector.".into());
+            findings.push(Finding::fixable(
+                KIND_CRASH,
+                format!("Service crashed (exit {})", code),
+                body,
+                FixAction::Steps {
+                    label: format!("Wait {} s for OpenCTI to finish starting up", CONNECTOR_CRASH_WAIT_SECS),
+                    steps: vec![FixStep::new(&["sleep", &CONNECTOR_CRASH_WAIT_SECS.to_string()], repo_dir)],
                 },
             ));
         } else {
