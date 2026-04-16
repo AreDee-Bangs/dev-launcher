@@ -102,6 +102,12 @@ const KIND_CRASH:             &str = "service-crashed";
 /// the user restarts the connector after a startup crash.
 const CONNECTOR_CRASH_WAIT_SECS: u64 = 120;
 
+/// Log substring that identifies a partially-initialised Elasticsearch/OpenSearch
+/// index.  When the OpenCTI platform is killed mid-initialisation, the index is
+/// left in an inconsistent state and the platform refuses to start again until
+/// the data volumes are wiped.
+const OPENCTI_INDEX_EXISTS_ERR: &str = "index already exists";
+
 /// Kinds that have a known, implemented recipe in this binary.
 /// A finding whose kind is NOT in this list (and is not an info/ kind) will
 /// offer the user a shortcut to file a GitHub issue requesting the recipe.
@@ -1516,8 +1522,11 @@ fn diagnose_service(svc: &Svc, paths: &Paths) -> Vec<Finding> {
         ];
         if svc.name == "opencti-graphql" {
             // Check the log to distinguish between crash causes.
+            // tail_file returns an empty Vec when the log cannot be read, in
+            // which case has_index_exists is false and we fall back to the
+            // default yarn-install recipe below.
             let log_lines = tail_file(&svc.log_path, 100);
-            let has_index_exists = log_lines.iter().any(|l| l.contains("index already exists"));
+            let has_index_exists = log_lines.iter().any(|l| l.contains(OPENCTI_INDEX_EXISTS_ERR));
 
             if has_index_exists {
                 // Recipe: the Elasticsearch/OpenSearch index was left in a
