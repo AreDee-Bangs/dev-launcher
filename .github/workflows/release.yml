@@ -36,15 +36,6 @@ jobs:
             artifact: dev-feature-linux-arm64
             use_cross: true
 
-          # ── Windows ──────────────────────────────────────────────────────────
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: dev-feature-windows-x86_64.exe
-
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            artifact: dev-feature-windows-arm64.exe
-
     steps:
       - uses: actions/checkout@v4
 
@@ -74,18 +65,11 @@ jobs:
         if: matrix.use_cross != true
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Strip binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Strip binary
         run: strip target/${{ matrix.target }}/release/dev-feature
 
-      - name: Stage artifact (Unix)
-        if: runner.os != 'Windows'
+      - name: Stage artifact
         run: cp target/${{ matrix.target }}/release/dev-feature ${{ matrix.artifact }}
-
-      - name: Stage artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Copy-Item "target\${{ matrix.target }}\release\dev-feature.exe" "${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -113,7 +97,7 @@ jobs:
           chmod +x artifacts/dev-feature-macos
 
       - name: Mark binaries executable
-        run: chmod +x artifacts/dev-feature-linux-* artifacts/dev-feature-macos-*
+        run: chmod +x artifacts/dev-feature-*
 
       - name: Generate checksums
         working-directory: artifacts
@@ -127,7 +111,5 @@ jobs:
             artifacts/dev-feature-macos-x86_64
             artifacts/dev-feature-linux-x86_64
             artifacts/dev-feature-linux-arm64
-            artifacts/dev-feature-windows-x86_64.exe
-            artifacts/dev-feature-windows-arm64.exe
             checksums.sha256
           generate_release_notes: true

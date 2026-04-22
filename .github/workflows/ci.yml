@@ -24,6 +24,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          targets: x86_64-unknown-linux-musl
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -39,4 +40,9 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Build
-        run: cargo build --release
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo build --release --target x86_64-unknown-linux-musl
+          else
+            cargo build --release
+          fi
