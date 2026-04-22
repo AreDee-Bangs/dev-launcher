@@ -99,6 +99,14 @@ jobs:
       - name: Mark binaries executable
         run: chmod +x artifacts/dev-launcher-*
 
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: dev-launcher.ps1
+          sparse-checkout-cone-mode: false
+
+      - name: Stage PowerShell wrapper
+        run: cp dev-launcher.ps1 artifacts/dev-launcher.ps1
+
       - name: Generate checksums
         working-directory: artifacts
         run: shasum -a 256 * > ../checksums.sha256
@@ -111,5 +119,6 @@ jobs:
             artifacts/dev-launcher-macos-x86_64
             artifacts/dev-launcher-linux-x86_64
             artifacts/dev-launcher-linux-arm64
+            artifacts/dev-launcher.ps1
             checksums.sha256
           generate_release_notes: true

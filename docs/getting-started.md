@@ -14,6 +14,8 @@ Before installing, make sure the following are present on your machine:
 - **Python 3.13+** with `venv` available
 - **16 GB RAM** recommended when running all products simultaneously
 
+> **Windows users** — see the [Windows (WSL2)](#windows-wsl2) section below before continuing.
+
 ---
 
 ## Installation
@@ -31,6 +33,7 @@ Choose the binary that matches your platform:
 | macOS (universal) | `dev-launcher-macos` |
 | Linux x86\_64 | `dev-launcher-linux-x86_64` |
 | Linux arm64 | `dev-launcher-linux-arm64` |
+| Windows (WSL2 wrapper) | `dev-launcher.ps1` |
 
 ### macOS / Linux
 
@@ -43,6 +46,47 @@ sudo mv dev-launcher /usr/local/bin/
 ```
 
 Replace `dev-launcher-macos` with the correct filename for your platform if you are on Linux.
+
+### Windows (WSL2)
+
+`dev-launcher` uses Unix process groups and signals and must run inside WSL2.
+The PowerShell wrapper (`dev-launcher.ps1`) handles this transparently.
+
+**One-time setup:**
+
+1. **Install WSL2** (skip if already done):
+
+   ```powershell
+   wsl --install
+   # Reboot when prompted, then open a WSL2 terminal to complete Linux setup
+   ```
+
+2. **Install Docker Desktop** with the WSL2 backend enabled (Settings > Resources > WSL Integration).
+
+3. **Install the Linux binary inside WSL2** — open your WSL2 terminal and run:
+
+   ```sh
+   curl -Lo dev-launcher https://github.com/AreDee-Bangs/dev-launcher/releases/latest/download/dev-launcher-linux-x86_64
+   chmod +x dev-launcher
+   sudo mv dev-launcher /usr/local/bin/
+   ```
+
+4. **Download the PowerShell wrapper** from the same release page and place it somewhere on your `PATH` (e.g. `C:\Users\<you>\bin\dev-launcher.ps1`), or run it directly from any PowerShell terminal:
+
+   ```powershell
+   # Run from the directory where you saved dev-launcher.ps1
+   .\dev-launcher.ps1 --help
+   ```
+
+5. **Set your workspace root** in your PowerShell profile (`$PROFILE`):
+
+   ```powershell
+   $env:FILIGRAN_WORKSPACE_ROOT = "/home/<wsl-user>/dev/filigran"
+   ```
+
+   Use the Linux path (starting with `/home/...`), not a Windows path. The wrapper forwards `FILIGRAN_WORKSPACE_ROOT` and `FILIGRAN_LLM_KEY` into WSL2 automatically.
+
+**Usage** is then identical to macOS/Linux — all flags, workspace management, and TUI features work the same way.
 
 ### Verify the installation
 

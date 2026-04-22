@@ -3,7 +3,7 @@
 [![CI](https://github.com/AreDee-Bangs/dev-launcher/actions/workflows/ci.yml/badge.svg)](https://github.com/AreDee-Bangs/dev-launcher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/AreDee-Bangs/dev-launcher)](https://github.com/AreDee-Bangs/dev-launcher/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#installation)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20WSL2-lightgrey)](#installation)
 
 A Rust TUI launcher that spins up the full Filigran multi-product development stack (Filigran Copilot, OpenCTI, OpenAEV, ImportDoc connector) from git feature branches in a single command, replacing fragile shell scripts with process-group lifecycle management, live health monitoring, and automatic crash diagnosis.
 
@@ -31,6 +31,7 @@ Download the binary for your platform from [GitHub Releases](https://github.com/
 | macOS (universal) | `dev-launcher-macos` |
 | Linux x86_64 | `dev-launcher-linux-x86_64` |
 | Linux arm64 | `dev-launcher-linux-arm64` |
+| Windows (via WSL2) | `dev-launcher.ps1` + Linux binary |
 
 **macOS / Linux - manual install:**
 
@@ -45,6 +46,8 @@ mv dev-launcher-macos-arm64 /usr/local/bin/dev-launcher
 curl -fsSL https://github.com/AreDee-Bangs/dev-launcher/releases/latest/download/dev-launcher-macos-arm64 \
   -o /usr/local/bin/dev-launcher && chmod +x /usr/local/bin/dev-launcher
 ```
+
+**Windows:** `dev-launcher` runs inside WSL2. Install the Linux binary inside your WSL2 distro, then use the `dev-launcher.ps1` PowerShell wrapper from Windows. See [Windows setup](docs/getting-started.md#windows-wsl2) for the full walkthrough.
 
 The binary has no runtime dependencies - no Node.js, Python, or Rust toolchain required to run it.
 
