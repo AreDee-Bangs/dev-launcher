@@ -1710,10 +1710,8 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         InputEvent::Up => {
                             *cursor = cursor.saturating_sub(1);
                         }
-                        InputEvent::Down => {
-                            if visible_count > 0 {
-                                *cursor = (*cursor + 1).min(visible_count - 1);
-                            }
+                        InputEvent::Down if visible_count > 0 => {
+                            *cursor = (*cursor + 1).min(visible_count - 1);
                         }
                         InputEvent::Enter => {
                             let svcs = state.lock().unwrap();
@@ -1880,10 +1878,8 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         InputEvent::Up => {
                             *cursor = cursor.saturating_sub(1);
                         }
-                        InputEvent::Down => {
-                            if *cursor + 1 < findings.len() {
-                                *cursor += 1;
-                            }
+                        InputEvent::Down if *cursor + 1 < findings.len() => {
+                            *cursor += 1;
                         }
                         InputEvent::Enter => {
                             let idx = *svc_idx;

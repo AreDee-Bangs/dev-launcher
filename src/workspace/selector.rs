@@ -89,10 +89,8 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
                 KeyCode::Up | KeyCode::Char('k') => {
                     cursor = cursor.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if cursor + 1 < total {
-                        cursor += 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j') if cursor + 1 < total => {
+                    cursor += 1;
                 }
                 KeyCode::Enter => {
                     drain_input_events();
@@ -103,12 +101,10 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
                         return WorkspaceAction::Open(workspaces[cursor].clone());
                     }
                 }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
-                    if cursor < workspaces.len() {
-                        drain_input_events();
-                        drop(raw.take());
-                        return WorkspaceAction::Delete(workspaces[cursor].clone());
-                    }
+                KeyCode::Char('d') | KeyCode::Char('D') if cursor < workspaces.len() => {
+                    drain_input_events();
+                    drop(raw.take());
+                    return WorkspaceAction::Delete(workspaces[cursor].clone());
                 }
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                     drain_input_events();
@@ -476,10 +472,8 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
             KeyCode::Up | KeyCode::Char('k') => {
                 cursor = cursor.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if cursor + 1 < choices.len() {
-                    cursor += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j') if cursor + 1 < choices.len() => {
+                cursor += 1;
             }
             KeyCode::Char(' ') => {
                 if choices[cursor].available || !choices[cursor].branch.is_empty() {
@@ -683,10 +677,8 @@ pub fn run_flag_selector(slug: &str, product: &str, choices: &mut [FlagChoice]) 
                 KeyCode::Up | KeyCode::Char('k') => {
                     cursor = cursor.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if cursor + 1 < choices.len() {
-                        cursor += 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j') if cursor + 1 < choices.len() => {
+                    cursor += 1;
                 }
                 KeyCode::Char(' ') => {
                     choices[cursor].enabled = !choices[cursor].enabled;

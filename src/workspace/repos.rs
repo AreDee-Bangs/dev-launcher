@@ -177,15 +177,11 @@ pub fn run_clone_selector(dest: &Path, choices: &mut [CloneChoice]) -> bool {
                 KeyCode::Up | KeyCode::Char('k') => {
                     cursor = cursor.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if cursor + 1 < choices.len() {
-                        cursor += 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j') if cursor + 1 < choices.len() => {
+                    cursor += 1;
                 }
-                KeyCode::Char(' ') => {
-                    if !choices[cursor].present {
-                        choices[cursor].enabled = !choices[cursor].enabled;
-                    }
+                KeyCode::Char(' ') if !choices[cursor].present => {
+                    choices[cursor].enabled = !choices[cursor].enabled;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     for c in choices.iter_mut() {
