@@ -17,8 +17,7 @@ fn main() {
         #[cfg(windows)]
         {
             std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command",
-                    "Get-Date -Format 'MMddyyyyHHmm'"])
+                .args(["-NoProfile", "-Command", "Get-Date -Format 'MMddyyyyHHmm'"])
                 .output()
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
