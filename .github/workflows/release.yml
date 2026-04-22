@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── macOS ────────────────────────────────────────────────────────────
+          - os: macos-latest          # Apple Silicon runner
+            target: aarch64-apple-darwin
+            artifact: dev-launcher-macos-arm64
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: dev-launcher-macos-x86_64
+
+          # ── Linux (static musl binaries) ─────────────────────────────────────
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: dev-launcher-linux-x86_64
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: dev-launcher-linux-arm64
+            use_cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl-tools (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Install cross (Linux ARM64)
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: matrix.use_cross != true
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: strip target/${{ matrix.target }}/release/dev-launcher
+
+      - name: Stage artifact
+        run: cp target/${{ matrix.target }}/release/dev-launcher ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Publish release
+    runs-on: macos-latest
+    needs: build
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+          path: artifacts
+
+      - name: Create macOS universal binary
+        run: |
+          lipo -create \
+            artifacts/dev-launcher-macos-arm64 \
+            artifacts/dev-launcher-macos-x86_64 \
+            -output artifacts/dev-launcher-macos
+          chmod +x artifacts/dev-launcher-macos
+
+      - name: Mark binaries executable
+        run: chmod +x artifacts/dev-launcher-*
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: shasum -a 256 * > ../checksums.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/dev-launcher-macos
+            artifacts/dev-launcher-macos-arm64
+            artifacts/dev-launcher-macos-x86_64
+            artifacts/dev-launcher-linux-x86_64
+            artifacts/dev-launcher-linux-arm64
+            checksums.sha256
+          generate_release_notes: true
