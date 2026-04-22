@@ -107,9 +107,6 @@ jobs:
         run: chmod +x artifacts/dev-launcher-*
 
       - uses: actions/checkout@v4
-        with:
-          sparse-checkout: dev-launcher.ps1
-          sparse-checkout-cone-mode: false
 
       - name: Stage PowerShell wrapper
         run: cp dev-launcher.ps1 artifacts/dev-launcher.ps1
