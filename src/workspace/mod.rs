@@ -11,8 +11,8 @@ pub use env::{
 };
 pub use git::{
     branch_to_slug, current_branch, current_commit_short, derive_branch_from_path, ensure_worktree,
-    ensure_worktree_at_commit, ensure_worktree_branch, parse_commit_ref, worktree_dirty_reasons,
-    COMMIT_PREFIX,
+    ensure_worktree_at_commit, ensure_worktree_branch, parse_commit_ref, worktree_delete_blockers,
+    worktree_dirty_reasons, COMMIT_PREFIX,
 };
 pub use repos::{
     clone_repos, load_repos, run_clone_selector, CloneChoice, RepoEntry, DEFAULT_REPOS_CONF,

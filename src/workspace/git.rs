@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::tui::{GRN, R, RED, YLW};
+use crate::tui::{GRN, R, YLW};
 
 /// Sentinel prefix used to store commit-pinned branches in workspace configs.
 pub const COMMIT_PREFIX: &str = "commit:";
@@ -51,6 +51,39 @@ pub fn current_commit_short(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
+fn run_git_quiet(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn main_checkout_label(dir: &Path) -> String {
+    let branch = current_branch(dir);
+    if !branch.is_empty() {
+        return format!("main checkout on {branch}");
+    }
+
+    let commit = current_commit_short(dir);
+    if !commit.is_empty() {
+        return format!("main checkout at {commit}");
+    }
+
+    "main local checkout".to_string()
+}
+
+fn print_worktree_fallback(repo: &str, ref_kind: &str, requested_ref: &str, main_repo: &Path) {
+    println!(
+        "  {GRN}✓{R}  {repo}: continuing from the {} because requested {ref_kind} {requested_ref} is not available for a new worktree",
+        main_checkout_label(main_repo),
+    );
+}
+
 /// Ensure a git worktree exists for `branch` (or a commit ref `commit:<hash>`).
 /// Commit refs delegate to `ensure_worktree_at_commit`; branch names use the
 /// standard `git worktree add` flow.
@@ -71,50 +104,40 @@ pub fn ensure_worktree_at_commit(workspace: &Path, repo: &str, commit: &str) -> 
 
     let main_repo = workspace.join(repo);
     if !main_repo.is_dir() {
-        println!("  {YLW}⚠{R}  {repo} main repo not found — cannot create worktree");
+        println!("  {YLW}⚠{R}  {repo} repo not found locally, skipping worktree setup");
         return target;
     }
 
     println!("  Creating detached worktree {repo} @ {commit}…");
-    let ok = Command::new("git")
-        .args([
+    let ok = run_git_quiet(
+        &main_repo,
+        &[
             "worktree",
             "add",
             "--detach",
             target.to_str().unwrap_or(""),
             commit,
-        ])
-        .current_dir(&main_repo)
-        .stdin(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        ],
+    );
 
     if !ok {
         // Commit may not be present locally — fetch and retry.
-        println!("  Fetching origin…");
-        let _ = Command::new("git")
-            .args(["fetch", "origin"])
-            .current_dir(&main_repo)
-            .stdin(Stdio::null())
-            .status();
-        let ok2 = Command::new("git")
-            .args([
+        println!("  Checking origin for {commit}…");
+        let _ = run_git_quiet(&main_repo, &["fetch", "origin"]);
+        let ok2 = run_git_quiet(
+            &main_repo,
+            &[
                 "worktree",
                 "add",
                 "--detach",
                 target.to_str().unwrap_or(""),
                 commit,
-            ])
-            .current_dir(&main_repo)
-            .stdin(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            ],
+        );
         if ok2 {
             println!("  {GRN}✓{R}  Worktree created: {}", target.display());
         } else {
-            println!("  {RED}✗{R}  Could not create worktree for {repo} @ {commit}");
+            print_worktree_fallback(repo, "commit", commit, &main_repo);
         }
     } else {
         println!("  {GRN}✓{R}  Worktree created: {}", target.display());
@@ -131,36 +154,30 @@ pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> Pat
 
     let main_repo = workspace.join(repo);
     if !main_repo.is_dir() {
-        println!("  {YLW}⚠{R}  {repo} main repo not found — cannot create worktree");
+        println!("  {YLW}⚠{R}  {repo} repo not found locally, skipping worktree setup");
         return target;
     }
 
     // If the main checkout is already on this branch a worktree would fail
     // ("already used by worktree").  Use the main repo directly instead.
     if current_branch(&main_repo) == branch {
-        println!("  {GRN}✓{R}  {repo} already on {branch} — using main checkout");
+        println!("  {GRN}✓{R}  {repo} already on {branch}, using the main checkout");
         return main_repo.clone();
     }
 
     println!("  Creating worktree {repo} @ {branch}…");
-    let ok = Command::new("git")
-        .args(["worktree", "add", target.to_str().unwrap_or(""), branch])
-        .current_dir(&main_repo)
-        .stdin(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = run_git_quiet(
+        &main_repo,
+        &["worktree", "add", target.to_str().unwrap_or(""), branch],
+    );
 
     if !ok {
         // Branch may not exist locally — fetch and retry with tracking.
-        println!("  Fetching origin/{branch}…");
-        let _ = Command::new("git")
-            .args(["fetch", "origin", branch])
-            .current_dir(&main_repo)
-            .stdin(Stdio::null())
-            .status();
-        let ok2 = Command::new("git")
-            .args([
+        println!("  Checking origin/{branch}…");
+        let _ = run_git_quiet(&main_repo, &["fetch", "origin", branch]);
+        let ok2 = run_git_quiet(
+            &main_repo,
+            &[
                 "worktree",
                 "add",
                 "--track",
@@ -168,14 +185,10 @@ pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> Pat
                 &slug,
                 target.to_str().unwrap_or(""),
                 &format!("origin/{branch}"),
-            ])
-            .current_dir(&main_repo)
-            .stdin(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            ],
+        );
         if !ok2 {
-            println!("  {RED}✗{R}  Could not create worktree for {repo} @ {branch}");
+            print_worktree_fallback(repo, "branch", branch, &main_repo);
         } else {
             println!("  {GRN}✓{R}  Worktree created: {}", target.display());
         }
@@ -228,6 +241,85 @@ pub fn worktree_dirty_reasons(dir: &Path) -> Vec<String> {
     }
 
     reasons
+}
+
+fn worktree_has_uncommitted_changes(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+
+    Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(dir)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| !line.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+enum OriginBranchStatus {
+    Present,
+    Missing,
+    Unknown,
+}
+
+fn origin_branch_status(main_repo: &Path, branch: &str) -> OriginBranchStatus {
+    if !main_repo.is_dir() {
+        return OriginBranchStatus::Unknown;
+    }
+
+    let origin_ref = format!("refs/remotes/origin/{branch}");
+    if run_git_quiet(main_repo, &["show-ref", "--verify", "--quiet", &origin_ref]) {
+        return OriginBranchStatus::Present;
+    }
+
+    let remote_head = format!("refs/heads/{branch}");
+    let status = Command::new("git")
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &remote_head,
+        ])
+        .current_dir(main_repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    match status.ok().and_then(|s| s.code()) {
+        Some(0) => OriginBranchStatus::Present,
+        Some(2) => OriginBranchStatus::Missing,
+        _ => OriginBranchStatus::Unknown,
+    }
+}
+
+pub fn worktree_delete_blockers(main_repo: &Path, worktree: &Path, branch: &str) -> Vec<String> {
+    let mut blockers = Vec::new();
+
+    if worktree_has_uncommitted_changes(worktree) {
+        blockers.push("uncommitted changes are still present".to_string());
+    }
+
+    if parse_commit_ref(branch).is_none() {
+        match origin_branch_status(main_repo, branch) {
+            OriginBranchStatus::Present => {}
+            OriginBranchStatus::Missing => {
+                blockers.push(format!("branch {branch} is not available on origin"));
+            }
+            OriginBranchStatus::Unknown => {
+                blockers.push(format!("origin could not be checked for branch {branch}"));
+            }
+        }
+    }
+
+    blockers
 }
 
 /// Read the current branch from a worktree path.  If the HEAD is detached, returns

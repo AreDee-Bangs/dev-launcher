@@ -8,7 +8,9 @@ use crate::tui::{
     drain_input_events, draw_ansi_lines, TuiGuard, BOLD, BUILD_VERSION, CYN, DIM, GRN, R, RED, YLW,
 };
 use crate::workspace::env::parse_env_file;
-use crate::workspace::git::{branch_to_slug, parse_commit_ref, worktree_dirty_reasons};
+use crate::workspace::git::{
+    branch_to_slug, parse_commit_ref, worktree_delete_blockers, worktree_dirty_reasons,
+};
 use crate::workspace::{WorkspaceConfig, PRODUCTS};
 
 pub enum WorkspaceAction {
@@ -136,6 +138,12 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
         worktree: std::path::PathBuf,
         reasons: Vec<String>,
     }
+    struct BlockedEntry {
+        repo: String,
+        worktree: std::path::PathBuf,
+        reasons: Vec<String>,
+    }
+    let mut blocked: Vec<BlockedEntry> = Vec::new();
     let mut dirty: Vec<DirtyEntry> = Vec::new();
     let mut worktrees_to_remove: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut main_checkouts: Vec<(String, std::path::PathBuf)> = Vec::new();
@@ -161,6 +169,14 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
                 main_checkouts.push((entry.repo.clone(), main));
             }
         } else {
+            let blockers = worktree_delete_blockers(&main, &wt, &entry.branch);
+            if !blockers.is_empty() {
+                blocked.push(BlockedEntry {
+                    repo: entry.repo.clone(),
+                    worktree: wt.clone(),
+                    reasons: blockers,
+                });
+            }
             let reasons = worktree_dirty_reasons(&wt);
             if !reasons.is_empty() {
                 dirty.push(DirtyEntry {
@@ -171,6 +187,24 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
             }
             worktrees_to_remove.push((entry.repo.clone(), wt));
         }
+    }
+
+    if !blocked.is_empty() {
+        println!("  {RED}{BOLD}Deletion blocked.{R}\n");
+        println!("  Resolve these Git blockers before removing the workspace:\n");
+        for b in &blocked {
+            println!(
+                "  {RED}▶{R}  {BOLD}{}{R}  ({})",
+                b.repo,
+                b.reasons.join(", ")
+            );
+            println!("     {DIM}{}{R}", b.worktree.display());
+        }
+        println!();
+        println!("  {DIM}A worktree cannot be deleted while local changes are still present or the branch is not available on origin.{R}");
+        println!("  {DIM}Commit, discard, or push the branch first, then retry.{R}");
+        println!();
+        return;
     }
 
     if !worktrees_to_remove.is_empty() {

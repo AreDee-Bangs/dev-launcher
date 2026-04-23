@@ -120,7 +120,7 @@ Each product also gets its own Docker Compose project suffix derived from the wo
 
 **New**: pressing N in the selector exits the list and prompts for branch names to create a fresh workspace.
 
-**Deleted**: pressing D in the selector removes the worktrees, Docker volumes, and env files for that workspace. The `workspace.conf` entry is tombstoned (kept for audit purposes) but the directory under `.dev-workspaces/` can be removed manually afterward.
+**Deleted**: pressing D in the selector removes the worktrees, Docker volumes, and env files for that workspace. Deletion is blocked first if a worktree still has uncommitted changes or its branch cannot be verified on `origin`. The `workspace.conf` entry is tombstoned (kept for audit purposes) but the directory under `.dev-workspaces/` can be removed manually afterward.
 
 ## Workspace selector keys
 
