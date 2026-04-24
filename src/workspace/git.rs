@@ -167,6 +167,25 @@ fn run_git_visible(dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Pull fast-forward from origin in `worktree` for `branch`, if a remote tracking ref exists.
+/// Best-effort: silently skips if no remote ref or if the pull fails (e.g. diverged history).
+fn pull_ff_from_origin(worktree: &Path, main_repo: &Path, branch: &str) {
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    if !ref_exists(main_repo, &remote_ref) {
+        return;
+    }
+    let ok = Command::new("git")
+        .args(["pull", "--ff-only", "origin", branch])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        println!("  {YLW}⚠{R}  Could not fast-forward {branch} from origin (diverged or unreachable) — worktree may be behind");
+    }
+}
+
 pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> PathBuf {
     let slug = branch_to_slug(branch);
     let target = workspace.join(format!("{}-{}", repo, slug));
@@ -194,6 +213,7 @@ pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> Pat
         &main_repo,
         &["worktree", "add", target.to_str().unwrap_or(""), branch],
     ) {
+        pull_ff_from_origin(&target, &main_repo, branch);
         println!("  {GRN}✓{R}  Worktree created: {}", target.display());
         return target;
     }
@@ -209,11 +229,15 @@ pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> Pat
     let remote_ref = format!("refs/remotes/origin/{branch}");
 
     let ok2 = if ref_exists(&main_repo, &local_ref) {
-        // Local branch already exists — add the worktree directly.
-        run_git_visible(
+        // Local branch already exists — add the worktree, then sync with origin.
+        let added = run_git_visible(
             &main_repo,
             &["worktree", "add", target.to_str().unwrap_or(""), branch],
-        )
+        );
+        if added {
+            pull_ff_from_origin(&target, &main_repo, branch);
+        }
+        added
     } else if ref_exists(&main_repo, &remote_ref) {
         // Remote tracking ref exists — create a local tracking branch via -b.
         run_git_visible(
