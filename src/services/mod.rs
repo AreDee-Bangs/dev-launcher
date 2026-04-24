@@ -86,6 +86,7 @@ pub struct SpawnCmd {
 
 // ── Svc ───────────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct Svc {
     pub name: String,
     pub url: Option<String>,

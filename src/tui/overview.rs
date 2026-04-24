@@ -9,6 +9,7 @@ pub fn build_overview_lines(
     logs_dir: &Path,
     cursor: usize,
     has_tui: bool,
+    show_paths: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
     out.push(format!(
@@ -58,6 +59,12 @@ pub fn build_overview_lines(
         if let Some(diag) = &s.diagnosis {
             out.push(format!("        {YLW}▸ {diag}{R}"));
         }
+
+        if show_paths {
+            if let Some(dir) = s.spawn_cmd.as_ref().map(|c| c.dir.display().to_string()) {
+                out.push(format!("        {DIM}{dir}{R}"));
+            }
+        }
     }
 
     out.push(String::new());
@@ -83,7 +90,8 @@ pub fn build_overview_lines(
     }
 
     if has_tui {
-        out.push(format!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   R restart   e credentials   q quit{R}"));
+        let paths_hint = if show_paths { "p hide paths" } else { "p paths" };
+        out.push(format!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   R restart   e credentials   {paths_hint}   q quit{R}"));
     } else {
         out.push(format!(
             "  {DIM}Ctrl+C to stop   tail -f {}/*.log{R}",

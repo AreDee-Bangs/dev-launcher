@@ -145,6 +145,28 @@ pub fn ensure_worktree_at_commit(workspace: &Path, repo: &str, commit: &str) -> 
     target
 }
 
+fn ref_exists(dir: &Path, refname: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", refname])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn run_git_visible(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> PathBuf {
     let slug = branch_to_slug(branch);
     let target = workspace.join(format!("{}-{}", repo, slug));
@@ -166,16 +188,35 @@ pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> Pat
     }
 
     println!("  Creating worktree {repo} @ {branch}…");
-    let ok = run_git_quiet(
+
+    // Try 1: direct add (works if branch exists locally and isn't checked out elsewhere).
+    if run_git_quiet(
         &main_repo,
         &["worktree", "add", target.to_str().unwrap_or(""), branch],
-    );
+    ) {
+        println!("  {GRN}✓{R}  Worktree created: {}", target.display());
+        return target;
+    }
 
-    if !ok {
-        // Branch may not exist locally — fetch and retry with tracking.
-        println!("  Checking origin/{branch}…");
-        let _ = run_git_quiet(&main_repo, &["fetch", "origin", branch]);
-        let ok2 = run_git_quiet(
+    // Branch not found locally — fetch with an explicit refspec so that
+    // refs/remotes/origin/<branch> is created (plain `fetch origin <branch>`
+    // only writes FETCH_HEAD and does not create the remote-tracking ref).
+    println!("  Checking origin/{branch}…");
+    let refspec = format!("{branch}:refs/remotes/origin/{branch}");
+    let _ = run_git_quiet(&main_repo, &["fetch", "origin", &refspec]);
+
+    let local_ref = format!("refs/heads/{branch}");
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+
+    let ok2 = if ref_exists(&main_repo, &local_ref) {
+        // Local branch already exists — add the worktree directly.
+        run_git_visible(
+            &main_repo,
+            &["worktree", "add", target.to_str().unwrap_or(""), branch],
+        )
+    } else if ref_exists(&main_repo, &remote_ref) {
+        // Remote tracking ref exists — create a local tracking branch via -b.
+        run_git_visible(
             &main_repo,
             &[
                 "worktree",
@@ -186,14 +227,34 @@ pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> Pat
                 target.to_str().unwrap_or(""),
                 &format!("origin/{branch}"),
             ],
-        );
-        if !ok2 {
-            print_worktree_fallback(repo, "branch", branch, &main_repo);
-        } else {
-            println!("  {GRN}✓{R}  Worktree created: {}", target.display());
-        }
+        )
     } else {
+        // Branch doesn't exist locally or on origin — create it from origin/main.
+        let base = if ref_exists(&main_repo, "refs/remotes/origin/main") {
+            "origin/main"
+        } else if ref_exists(&main_repo, "refs/remotes/origin/master") {
+            "origin/master"
+        } else {
+            "HEAD"
+        };
+        println!("  Branch {branch} not found — creating from {base}…");
+        run_git_visible(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &slug,
+                target.to_str().unwrap_or(""),
+                base,
+            ],
+        )
+    };
+
+    if ok2 {
         println!("  {GRN}✓{R}  Worktree created: {}", target.display());
+    } else {
+        print_worktree_fallback(repo, "branch", branch, &main_repo);
     }
     target
 }

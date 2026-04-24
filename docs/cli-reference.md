@@ -60,7 +60,7 @@ These flags affect the current run only and are not persisted to the workspace c
 | Flag | Description |
 |------|-------------|
 | `--no-opencti-front` | Skip the OpenCTI React frontend. The Node.js GraphQL API still starts. Useful when only backend changes are being tested. |
-| `--no-openaev-front` | Skip the OpenAEV React frontend. |
+| `--no-openaev-front` | Skip the OpenAEV React frontend. Only has effect when OpenAEV is included in the workspace. |
 | `--logs-dir <PATH>` | Override the log directory. Each service writes a `.log` file there. Default: `/tmp/dev-launcher-logs/{workspace-hash}/`. |
 
 ## Root Configuration

@@ -36,6 +36,8 @@ Environment variables take precedence over the values set in `~/.dev-launcher/co
 |---|---|---|
 | `FILIGRAN_WORKSPACE_ROOT` | Workspace root path | `~/.dev-launcher/config` `workspace_root` |
 | `FILIGRAN_LLM_KEY` | LLM API key for crash diagnosis | `~/.dev-launcher/config` `llm_api_key` |
+| `FILIGRAN_LLM_URL` | LLM provider base URL | `~/.dev-launcher/config` `llm_url` |
+| `FILIGRAN_LLM_MODEL` | LLM model name override | `~/.dev-launcher/config` `llm_model` |
 
 ---
 
@@ -77,10 +79,20 @@ Each workspace stores its environment files under `{workspace_root}/.dev-workspa
 
 | File | Contents |
 |---|---|
-| `copilot.env` | Filigran Copilot settings: DB password, admin credentials, S3 config, platform mode, etc. |
+| `copilot.env` | Filigran Copilot settings: DB password, admin credentials, S3 config, `PLATFORM_MODE`, etc. |
 | `opencti.env` | OpenCTI GraphQL settings: admin email, password, token, encryption key |
 | `openaev.env` | OpenAEV settings |
 | `connector.env` | ImportDoc connector settings: OpenCTI token, licence key |
+
+### PLATFORM_MODE
+
+The `PLATFORM_MODE` key in `copilot.env` controls which UI and feature set Copilot exposes. It can be changed at any time via the interactive selector that appears before the dashboard when Copilot runs standalone (see [TUI Guide: Platform mode selector](tui-guide.md#platform-mode-selector)).
+
+| Value | Description |
+|---|---|
+| `xtm_one` | XTM One open platform (default) |
+| `copilot` | Filigran Copilot enterprise UI |
+| `dev` | Copilot UI with XTM One seeding, for testing |
 
 ### Port pre-flight corrections
 

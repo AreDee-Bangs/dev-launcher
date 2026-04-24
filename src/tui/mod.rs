@@ -120,6 +120,7 @@ pub enum InputEvent {
     Diagnose,
     Report,
     Restart,
+    TogglePaths,
 }
 
 /// Translate a crossterm `KeyEvent` into our `InputEvent` vocabulary.
@@ -136,6 +137,7 @@ pub fn map_key_event(ke: KeyEvent) -> Option<InputEvent> {
         KeyCode::Char('f') => Some(InputEvent::Follow),
         KeyCode::Char('e') => Some(InputEvent::Credentials),
         KeyCode::Char('d') => Some(InputEvent::Diagnose),
+        KeyCode::Char('p') | KeyCode::Char('P') => Some(InputEvent::TogglePaths),
         KeyCode::Char('r') if !ke.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(InputEvent::Report)
         }

@@ -189,24 +189,6 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
         }
     }
 
-    if !blocked.is_empty() {
-        println!("  {RED}{BOLD}Deletion blocked.{R}\n");
-        println!("  Resolve these Git blockers before removing the workspace:\n");
-        for b in &blocked {
-            println!(
-                "  {RED}▶{R}  {BOLD}{}{R}  ({})",
-                b.repo,
-                b.reasons.join(", ")
-            );
-            println!("     {DIM}{}{R}", b.worktree.display());
-        }
-        println!();
-        println!("  {DIM}A worktree cannot be deleted while local changes are still present or the branch is not available on origin.{R}");
-        println!("  {DIM}Commit, discard, or push the branch first, then retry.{R}");
-        println!();
-        return;
-    }
-
     if !worktrees_to_remove.is_empty() {
         println!("  Worktrees to be removed:");
         for (_, wt) in &worktrees_to_remove {
@@ -221,7 +203,38 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
     }
     println!();
 
-    if !dirty.is_empty() {
+    if !blocked.is_empty() {
+        println!("  {RED}{BOLD}Warning: the following worktrees have unresolved Git blockers:{R}\n");
+        for b in &blocked {
+            println!(
+                "  {RED}▶{R}  {BOLD}{}{R}  ({})",
+                b.repo,
+                b.reasons.join(", ")
+            );
+            println!("     {DIM}{}{R}", b.worktree.display());
+        }
+        println!();
+        println!("  {DIM}Forcing removal may permanently lose uncommitted work or unpushed branches.{R}");
+        println!();
+        print!("  Type {BOLD}YES{R} to force removal despite these blockers: ");
+        let _ = io::stdout().flush();
+        match read_line_or_interrupt() {
+            Some(l) if l.trim() == "YES" => {}
+            _ => {
+                println!("  Cancelled.");
+                return;
+            }
+        }
+        print!("  This cannot be undone.  Type {BOLD}YES{R} again to proceed: ");
+        let _ = io::stdout().flush();
+        match read_line_or_interrupt() {
+            Some(l) if l.trim() == "YES" => {}
+            _ => {
+                println!("  Cancelled.");
+                return;
+            }
+        }
+    } else if !dirty.is_empty() {
         println!("  {YLW}{BOLD}Warning: the following worktrees have ongoing work:{R}\n");
         for d in &dirty {
             println!(
@@ -616,24 +629,18 @@ pub fn choices_to_workspace(choices: &[ProductChoice]) -> WorkspaceConfig {
 }
 
 pub fn default_product_choices(workspace_root: &Path) -> Vec<ProductChoice> {
-    use crate::workspace::git::current_branch;
     PRODUCTS
         .iter()
         .map(|(repo, label, _, desc)| {
             let main_dir = workspace_root.join(repo);
             let available = main_dir.is_dir();
-            let branch = if available {
-                current_branch(&main_dir)
-            } else {
-                String::new()
-            };
             ProductChoice {
                 label,
                 desc,
                 repo,
-                enabled: available,
+                enabled: false,
                 available,
-                branch,
+                branch: String::new(),
             }
         })
         .collect()
