@@ -1584,7 +1584,11 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 .iter()
                 .position(|f| f.fix.is_some() && !f.resolved)
                 .unwrap_or(0);
-            mode = Mode::Diagnose { svc_idx, findings, cursor };
+            mode = Mode::Diagnose {
+                svc_idx,
+                findings,
+                cursor,
+            };
         }
 
         // ── Receive diagnosis results ─────────────────────────────────────────
@@ -1744,9 +1748,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                     .filter(|(_, s)| !matches!(s.health, Health::Pending))
                                     .map(|(i, _)| i)
                                     .collect();
-                                visible.get(*cursor).and_then(|&idx| {
-                                    svcs.get(idx).map(|s| (idx, s.clone()))
-                                })
+                                visible
+                                    .get(*cursor)
+                                    .and_then(|&idx| svcs.get(idx).map(|s| (idx, s.clone())))
                             };
                             if let Some((idx, svc)) = svc_to_diag {
                                 let findings = diagnose_service(&svc, &paths, &ws_env_dir);
@@ -1961,8 +1965,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                     println!();
                                     thread::sleep(Duration::from_millis(1200));
                                     raw_mode = TuiGuard::enter();
-                                    let svc_snap =
-                                        state.lock().unwrap().get(idx).cloned();
+                                    let svc_snap = state.lock().unwrap().get(idx).cloned();
                                     let new_findings = svc_snap
                                         .map(|svc| diagnose_service(&svc, &paths, &ws_env_dir))
                                         .unwrap_or_default();
@@ -2098,8 +2101,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                     let _ = io::stdout().flush();
                                     thread::sleep(Duration::from_millis(1500));
                                     raw_mode = TuiGuard::enter();
-                                    let svc_snap =
-                                        state.lock().unwrap().get(idx).cloned();
+                                    let svc_snap = state.lock().unwrap().get(idx).cloned();
                                     let new_findings = svc_snap
                                         .map(|svc| diagnose_service(&svc, &paths, &ws_env_dir))
                                         .unwrap_or_default();

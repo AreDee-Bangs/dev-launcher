@@ -204,7 +204,9 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
     println!();
 
     if !blocked.is_empty() {
-        println!("  {RED}{BOLD}Warning: the following worktrees have unresolved Git blockers:{R}\n");
+        println!(
+            "  {RED}{BOLD}Warning: the following worktrees have unresolved Git blockers:{R}\n"
+        );
         for b in &blocked {
             println!(
                 "  {RED}▶{R}  {BOLD}{}{R}  ({})",
@@ -214,7 +216,9 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
             println!("     {DIM}{}{R}", b.worktree.display());
         }
         println!();
-        println!("  {DIM}Forcing removal may permanently lose uncommitted work or unpushed branches.{R}");
+        println!(
+            "  {DIM}Forcing removal may permanently lose uncommitted work or unpushed branches.{R}"
+        );
         println!();
         print!("  Type {BOLD}YES{R} to force removal despite these blockers: ");
         let _ = io::stdout().flush();
