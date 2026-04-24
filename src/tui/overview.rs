@@ -90,7 +90,11 @@ pub fn build_overview_lines(
     }
 
     if has_tui {
-        let paths_hint = if show_paths { "p hide paths" } else { "p paths" };
+        let paths_hint = if show_paths {
+            "p hide paths"
+        } else {
+            "p paths"
+        };
         out.push(format!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   R restart   e credentials   {paths_hint}   q quit{R}"));
     } else {
         out.push(format!(
