@@ -87,7 +87,18 @@ impl WorkspaceConfig {
             })
             .collect();
         if parts.is_empty() {
-            "(empty)".to_string()
+            let enabled: Vec<&str> = self
+                .entries
+                .iter()
+                .zip(PRODUCTS.iter())
+                .filter(|(e, _)| e.enabled)
+                .map(|(_, (_, _, key, _))| *key)
+                .collect();
+            if enabled.is_empty() {
+                "(empty)".to_string()
+            } else {
+                enabled.join(" · ")
+            }
         } else {
             parts.join("  ")
         }

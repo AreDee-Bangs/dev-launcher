@@ -6,7 +6,7 @@ After `dev-launcher` launches the stack, it enters an interactive terminal dashb
 
 ## Overview mode
 
-The default mode. Shows a table of all services with the following columns:
+The default mode. Shows a table of all running and ready services. Services in `pending` state (waiting for a prerequisite) are hidden until they start.
 
 | Column | Description |
 |---|---|
@@ -20,24 +20,26 @@ The default mode. Shows a table of all services with the following columns:
 
 | State | Meaning |
 |---|---|
-| `pending` | Waiting for a prerequisite service to become healthy before starting |
+| `pending` | Waiting for a prerequisite service to become healthy before starting (hidden from the table) |
 | `launching` | Process spawned, no health URL configured -- treated as running |
 | `health probe #N` | Health URL is being polled (N = attempt number, polls every ~2s) |
 | `up` | Health URL returned 2xx -- service is fully ready |
 | `running` | Process is running (no health URL to poll) |
-| `degraded (reason)` | Pre-spawn check failed (port conflict, missing venv, Docker down) |
+| `degraded (reason)` | Pre-spawn check failed: port conflict (shows conflicting process name and PID), missing venv, or Docker down |
 | `crashed (N)` | Process exited with exit code N |
 
 ### Keybindings
 
 | Key | Action |
 |---|---|
-| `j` / `Down` | Move cursor down |
-| `k` / `Up` | Move cursor up |
-| `Enter` / `l` | Open Log View for the selected service |
+| `j` / `↓` | Move cursor down |
+| `k` / `↑` | Move cursor up |
+| `Enter` / `l` / `→` | Open Log View for the selected service |
 | `d` | Open Diagnose view for the selected service |
-| `c` | Open Credentials view |
-| `R` | Restart the selected service (kills process, re-spawns with same args) |
+| `e` | Open Credentials view |
+| `p` / `P` | Toggle full worktree paths on/off in the service table |
+| `r` | Generate a report for the selected service |
+| `R` (Shift+r) | Restart the selected service (kills process, re-spawns with same args) |
 | `q` / `Ctrl+C` | Graceful shutdown (kills all services, tears down Docker Compose, exits) |
 
 ---
@@ -50,13 +52,13 @@ Full-screen scrollable log output for the selected service.
 
 | Key | Action |
 |---|---|
-| `j` / `Down` | Scroll down one line |
-| `k` / `Up` | Scroll up one line |
+| `j` / `↓` | Scroll down one line |
+| `k` / `↑` | Scroll up one line |
 | `Page Down` | Scroll down half a screen |
 | `Page Up` | Scroll up half a screen |
 | `f` | Toggle follow mode (auto-scroll to newest line) |
 | `d` | Open Diagnose view for this service |
-| `q` / `Esc` / `Backspace` | Return to Overview |
+| `q` / `Esc` / `←` | Return to Overview |
 
 ---
 
@@ -71,7 +73,7 @@ Shows a list of findings for a crashed or degraded service. Findings come from t
 
 | Type | Description |
 |---|---|
-| Recipe available | The launcher knows how to fix this. Press `Enter` or `r` to apply the fix. |
+| Recipe available | The launcher knows how to fix this. Press `Enter` to apply the fix. |
 | Info only | Informational finding; no action needed. |
 | No recipe | The failure pattern is recognized but no automated fix exists. Press `i` to open a pre-filled GitHub issue requesting the recipe. |
 
@@ -89,9 +91,9 @@ Fix recipes can perform the following actions automatically:
 
 | Key | Action |
 |---|---|
-| `j` / `Down` | Move cursor down through findings |
-| `k` / `Up` | Move cursor up |
-| `Enter` / `r` | Apply the selected fix recipe |
+| `j` / `↓` | Move cursor down through findings |
+| `k` / `↑` | Move cursor up |
+| `Enter` | Apply the selected fix recipe |
 | `i` | Open a GitHub issue for the selected finding (opens in browser) |
 | `l` | Open Log View for this service |
 | `q` / `Esc` | Return to Overview |
@@ -100,7 +102,9 @@ Fix recipes can perform the following actions automatically:
 
 ## Credentials view
 
-Shows all configured API credentials for the current workspace:
+Shows all configured credentials for the current workspace, read directly from the workspace `.env` files. Content is workspace-specific -- values reflect what is actually set for the active workspace.
+
+Typical entries include:
 
 - Copilot admin email and password
 - Copilot base URL and frontend URL
@@ -115,15 +119,32 @@ Shows all configured API credentials for the current workspace:
 
 ---
 
+## Platform mode selector
+
+When Copilot runs standalone (without OpenCTI), a platform mode selector appears before the dashboard starts. It lets you set the `PLATFORM_MODE` environment variable for the workspace without editing the `.env` file directly.
+
+The selection is saved to the workspace `copilot.env` and persists across restarts.
+
+| Mode | Label | Description |
+|---|---|---|
+| `xtm_one` | XTM One | Open platform -- XTM One UI, EE features via license (default) |
+| `copilot` | Filigran Copilot | Enterprise -- Copilot UI, license required |
+| `dev` | Dev | Copilot UI + XTM One seeding (for testing) |
+
+### Keybindings
+
+| Key | Action |
+|---|---|
+| `j` / `↓` | Move cursor down |
+| `k` / `↑` | Move cursor up |
+| `Enter` | Confirm selection |
+| `Esc` | Cancel (keep current value) |
+
+---
+
 ## Service startup ordering
 
-Services that depend on others show `pending` in the health column until their prerequisites are healthy. The dependency is also noted inline -- for example:
-
-```
-degraded (Waiting for copilot-backend...)
-```
-
-Once the prerequisite reaches `up` or `running`, the dependent service spawns automatically without any user interaction.
+Services that depend on others show `pending` in the health column until their prerequisites are healthy, and are not shown in the Overview table. Once the prerequisite reaches `up` or `running`, the dependent service spawns automatically without any user interaction.
 
 ---
 

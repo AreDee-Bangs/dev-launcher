@@ -1440,6 +1440,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
     let has_tui = raw_mode.is_some();
     let mut mode = Mode::Overview { cursor: 0 };
     let mut creds: Vec<CredEntry> = Vec::new();
+    let mut show_paths = false;
 
     let (tx, rx) = mpsc::sync_channel::<InputEvent>(32);
     if has_tui {
@@ -1548,6 +1549,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
         }
 
         // ── Crash detection ───────────────────────────────────────────────────
+        let mut auto_diagnose: Option<(usize, crate::services::Svc)> = None;
         {
             let mut svcs = state.lock().unwrap();
             for p in &mut procs {
@@ -1570,16 +1572,19 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         });
 
                         if has_tui && matches!(mode, Mode::Overview { .. }) {
-                            let findings = diagnose_service(&svcs[p.idx], &paths, &ws_env_dir);
-                            mode = Mode::Diagnose {
-                                svc_idx: p.idx,
-                                findings,
-                                cursor: 0,
-                            };
+                            auto_diagnose = Some((p.idx, svcs[p.idx].clone()));
                         }
                     }
                 }
             }
+        }
+        if let Some((svc_idx, svc)) = auto_diagnose {
+            let findings = diagnose_service(&svc, &paths, &ws_env_dir);
+            let cursor = findings
+                .iter()
+                .position(|f| f.fix.is_some() && !f.resolved)
+                .unwrap_or(0);
+            mode = Mode::Diagnose { svc_idx, findings, cursor };
         }
 
         // ── Receive diagnosis results ─────────────────────────────────────────
@@ -1731,20 +1736,28 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                             }
                         }
                         InputEvent::Diagnose => {
-                            let svcs = state.lock().unwrap();
-                            let visible: Vec<usize> = svcs
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, s)| !matches!(s.health, Health::Pending))
-                                .map(|(i, _)| i)
-                                .collect();
-                            if let Some(&idx) = visible.get(*cursor) {
-                                let findings = diagnose_service(&svcs[idx], &paths, &ws_env_dir);
-                                drop(svcs);
+                            let svc_to_diag: Option<(usize, crate::services::Svc)> = {
+                                let svcs = state.lock().unwrap();
+                                let visible: Vec<usize> = svcs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, s)| !matches!(s.health, Health::Pending))
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                visible.get(*cursor).and_then(|&idx| {
+                                    svcs.get(idx).map(|s| (idx, s.clone()))
+                                })
+                            };
+                            if let Some((idx, svc)) = svc_to_diag {
+                                let findings = diagnose_service(&svc, &paths, &ws_env_dir);
+                                let diag_cursor = findings
+                                    .iter()
+                                    .position(|f| f.fix.is_some() && !f.resolved)
+                                    .unwrap_or(0);
                                 mode = Mode::Diagnose {
                                     svc_idx: idx,
                                     findings,
-                                    cursor: 0,
+                                    cursor: diag_cursor,
                                 };
                             }
                         }
@@ -1812,6 +1825,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                             creds = gather_credentials(&ws_env_dir, &paths);
                             mode = Mode::Credentials;
                         }
+                        InputEvent::TogglePaths => {
+                            show_paths = !show_paths;
+                        }
                         _ => {}
                     },
                     Mode::LogView {
@@ -1848,17 +1864,22 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         }
                         InputEvent::Diagnose => {
                             let idx = *svc_idx;
-                            let findings = {
+                            let svc_clone = {
                                 let svcs = state.lock().unwrap();
-                                svcs.get(idx)
-                                    .map(|svc| diagnose_service(svc, &paths, &ws_env_dir))
-                                    .unwrap_or_default()
+                                svcs.get(idx).cloned()
                             };
-                            mode = Mode::Diagnose {
-                                svc_idx: idx,
-                                findings,
-                                cursor: 0,
-                            };
+                            if let Some(svc) = svc_clone {
+                                let findings = diagnose_service(&svc, &paths, &ws_env_dir);
+                                let diag_cursor = findings
+                                    .iter()
+                                    .position(|f| f.fix.is_some() && !f.resolved)
+                                    .unwrap_or(0);
+                                mode = Mode::Diagnose {
+                                    svc_idx: idx,
+                                    findings,
+                                    cursor: diag_cursor,
+                                };
+                            }
                         }
                         _ => {}
                     },
@@ -1868,12 +1889,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         svc_idx,
                     } => match event {
                         InputEvent::Back => {
-                            let idx = *svc_idx;
-                            mode = Mode::LogView {
-                                svc_idx: idx,
-                                scroll: 0,
-                                follow: true,
-                            };
+                            mode = Mode::Overview { cursor: 0 };
                         }
                         InputEvent::Up => {
                             *cursor = cursor.saturating_sub(1);
@@ -1945,12 +1961,11 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                     println!();
                                     thread::sleep(Duration::from_millis(1200));
                                     raw_mode = TuiGuard::enter();
-                                    let new_findings = {
-                                        let svcs = state.lock().unwrap();
-                                        svcs.get(idx)
-                                            .map(|svc| diagnose_service(svc, &paths, &ws_env_dir))
-                                            .unwrap_or_default()
-                                    };
+                                    let svc_snap =
+                                        state.lock().unwrap().get(idx).cloned();
+                                    let new_findings = svc_snap
+                                        .map(|svc| diagnose_service(&svc, &paths, &ws_env_dir))
+                                        .unwrap_or_default();
                                     let new_cursor = new_findings
                                         .iter()
                                         .position(|f| f.fix.is_some() && !f.resolved)
@@ -2083,12 +2098,11 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                     let _ = io::stdout().flush();
                                     thread::sleep(Duration::from_millis(1500));
                                     raw_mode = TuiGuard::enter();
-                                    let new_findings = {
-                                        let svcs = state.lock().unwrap();
-                                        svcs.get(idx)
-                                            .map(|svc| diagnose_service(svc, &paths, &ws_env_dir))
-                                            .unwrap_or_default()
-                                    };
+                                    let svc_snap =
+                                        state.lock().unwrap().get(idx).cloned();
+                                    let new_findings = svc_snap
+                                        .map(|svc| diagnose_service(&svc, &paths, &ws_env_dir))
+                                        .unwrap_or_default();
                                     mode = Mode::Diagnose {
                                         svc_idx: idx,
                                         findings: new_findings,
@@ -2121,7 +2135,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 let svcs = state.lock().unwrap();
                 let lines = match &mode {
                     Mode::Overview { cursor } => {
-                        build_overview_lines(&svcs, &slug, &logs_dir, *cursor, has_tui)
+                        build_overview_lines(&svcs, &slug, &logs_dir, *cursor, has_tui, show_paths)
                     }
                     Mode::LogView {
                         svc_idx,

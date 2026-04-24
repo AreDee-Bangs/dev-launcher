@@ -120,15 +120,24 @@ Each product also gets its own Docker Compose project suffix derived from the wo
 
 **New**: pressing N in the selector exits the list and prompts for branch names to create a fresh workspace.
 
-**Deleted**: pressing D in the selector removes the worktrees, Docker volumes, and env files for that workspace. Deletion is blocked first if a worktree still has uncommitted changes or its branch cannot be verified on `origin`. The `workspace.conf` entry is tombstoned (kept for audit purposes) but the directory under `.dev-workspaces/` can be removed manually afterward.
+**Deleted**: pressing D in the selector opens a deletion confirmation flow that:
+
+1. Lists all worktrees that will be removed.
+2. Checks for **Git blockers** -- uncommitted changes or branches not yet pushed to `origin`. If blockers are found, you must type `YES` twice to force removal. This is a safety gate against losing work.
+3. If no blockers exist but the worktree has staged or unstaged changes, a single `YES` confirmation is required.
+4. Removes the worktrees, Docker volumes, and env files for that workspace.
+
+The `workspace.conf` entry is **tombstoned** rather than deleted: a `deleted=<date>` line is appended to the file, and the workspace is hidden from the selector. The `.dev-workspaces/<hash>/` directory itself can be removed manually afterward if desired.
 
 ## Workspace selector keys
 
 | Key | Action |
 |---|---|
-| Enter | Resume the selected workspace |
-| N | Create a new workspace |
-| D | Delete the selected workspace |
+| `↑` / `k` | Move cursor up |
+| `↓` / `j` | Move cursor down |
+| `Enter` | Resume the selected workspace (or create new if `[+]` is selected) |
+| `d` / `D` | Delete the selected workspace |
+| `q` / `Esc` | Quit without launching |
 
 ## Full directory layout reference
 

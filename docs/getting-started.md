@@ -134,7 +134,13 @@ If `FILIGRAN_WORKSPACE_ROOT` is not set and no saved config exists at `~/.dev-la
 2. **Detects missing repositories** and offers to clone them automatically.
 3. **Saves the configuration** to `~/.dev-launcher/config` so the wizard does not run again.
 
-After the wizard completes, the launcher proceeds normally.
+After the workspace root is set, the launcher runs an **environment wizard** the first time a workspace is created. The wizard:
+
+- Detects required variables that carry placeholder values (`ChangeMe`, `TODO`, etc.) in each product's `.env` file.
+- Prompts you once for each missing value (admin credentials, licence keys, PEM certificates).
+- Auto-generates secrets that do not need manual input (UUID tokens, base64 encryption keys, random passwords) and reuses them across workspaces on the same machine.
+
+You will not be prompted again for auto-generated values on subsequent workspaces.
 
 ---
 
@@ -158,16 +164,18 @@ dev-launcher --workspace a1b2c3d4
 
 ## Adding LLM-assisted diagnosis (optional)
 
-The crash-diagnosis engine can optionally send unknown failure output to an LLM for analysis. To enable it, add your API key to `~/.dev-launcher/config`:
+The crash-diagnosis engine can optionally send unknown failure output to an LLM for one-sentence analysis. To enable it, set your API key in `~/.dev-launcher/config`:
 
 ```
 llm_api_key=sk-ant-...
 ```
 
-Alternatively, set the `FILIGRAN_LLM_KEY` environment variable in your shell profile:
+Or via environment variables in your shell profile:
 
 ```sh
-export FILIGRAN_LLM_KEY="sk-ant-..."
+export FILIGRAN_LLM_KEY="sk-ant-..."         # API key (required)
+export FILIGRAN_LLM_URL="https://..."        # Provider base URL (optional; auto-detected from key prefix)
+export FILIGRAN_LLM_MODEL="claude-haiku-4-5-20251001"  # Model override (optional)
 ```
 
-For the full list of configuration options, see [`docs/configuration.md`](configuration.md).
+The provider is auto-detected from the key prefix (`sk-ant-` → Anthropic, `sk-` → OpenAI) or from the URL when both are supplied. For the full list of configuration options, see [`docs/configuration.md`](configuration.md).
