@@ -482,6 +482,27 @@ fn main() {
     let workspace_root = resolve_workspace_root(&args);
     let ws_dir = workspaces_dir(&workspace_root);
 
+    // Stopping flag and signal handlers are registered once for the entire
+    // process lifetime; the flag is reset at the top of each session.
+    let stopping: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    {
+        let stopping = Arc::clone(&stopping);
+        ctrlc::set_handler(move || {
+            stopping.store(true, Ordering::Relaxed);
+        })
+        .expect("failed to set Ctrl+C handler");
+    }
+    unsafe {
+        libc::signal(
+            libc::SIGHUP,
+            sighup_handler as *const () as libc::sighandler_t,
+        );
+    }
+
+    'session: loop {
+        stopping.store(false, Ordering::Relaxed);
+        SIGHUP_STOP.store(false, Ordering::Relaxed);
+
     let (workspace_cfg, choices, clean_start) = resolve_workspace(&args, &workspace_root, &ws_dir);
     ensure_cooked_output();
     let slug = workspace_cfg.hash.clone();
@@ -621,24 +642,9 @@ fn main() {
 
     let state: State = Arc::new(Mutex::new(Vec::new()));
     let mut procs: Vec<Proc> = Vec::new();
-    let stopping: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     let (diag_tx, diag_rx) = mpsc::sync_channel::<DiagEvent>(32);
     let mut diagnosed: HashSet<usize> = HashSet::new();
-
-    {
-        let stopping = Arc::clone(&stopping);
-        ctrlc::set_handler(move || {
-            stopping.store(true, Ordering::Relaxed);
-        })
-        .expect("failed to set Ctrl+C handler");
-    }
-    unsafe {
-        libc::signal(
-            libc::SIGHUP,
-            sighup_handler as *const () as libc::sighandler_t,
-        );
-    }
 
     kill_orphaned_pids(&slug);
 
@@ -1441,6 +1447,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
     let mut mode = Mode::Overview { cursor: 0 };
     let mut creds: Vec<CredEntry> = Vec::new();
     let mut show_paths = false;
+    // Set to true when the user explicitly presses q/Esc from Overview so that
+    // we return to the workspace selector instead of exiting the process.
+    let mut want_restart = false;
 
     let (tx, rx) = mpsc::sync_channel::<InputEvent>(32);
     if has_tui {
@@ -1545,7 +1554,14 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 thread::sleep(Duration::from_millis(100));
             }
 
-            break;
+            // Return to the workspace selector when the user pressed q/Esc,
+            // or exit the process for Ctrl+C / SIGHUP.
+            if want_restart {
+                print!("\x1b[H\x1b[2J");
+                let _ = io::stdout().flush();
+                continue 'session;
+            }
+            break 'session;
         }
 
         // ── Crash detection ───────────────────────────────────────────────────
@@ -1823,6 +1839,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                             }
                         }
                         InputEvent::Back => {
+                            want_restart = true;
                             stopping.store(true, Ordering::Relaxed);
                         }
                         InputEvent::Credentials => {
@@ -2166,4 +2183,5 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
 
         thread::sleep(Duration::from_millis(20));
     }
+    } // 'session loop
 }
