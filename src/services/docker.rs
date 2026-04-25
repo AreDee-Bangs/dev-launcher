@@ -56,8 +56,12 @@ pub fn parse_compose_container_names(compose_file: &Path) -> Vec<(String, String
     result
 }
 
-/// Write a compose override file to `/tmp` that appends `{ws_hash[..8]}` to every
-/// explicit `container_name:` in the given compose file.
+/// Write a compose override file next to `compose_file` that appends
+/// `{ws_hash[..8]}` to every explicit `container_name:`, so that multiple
+/// workspaces can run side-by-side without container name conflicts.
+///
+/// The file is written alongside the compose file (not in /tmp) so that it
+/// survives reboots and is always available for `docker compose up`.
 ///
 /// Returns `None` if the compose file has no explicit container names.
 pub fn write_compose_override(compose_file: &Path, ws_hash: &str) -> Option<PathBuf> {
@@ -67,7 +71,10 @@ pub fn write_compose_override(compose_file: &Path, ws_hash: &str) -> Option<Path
     }
 
     let suffix = &ws_hash[..8.min(ws_hash.len())];
-    let out_path = PathBuf::from(format!("/tmp/dev-launcher-override-{suffix}.yml"));
+    let out_path = compose_file
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("docker-compose.override-{suffix}.yml"));
 
     let mut lines = vec!["services:".to_string()];
     for (svc, cn) in &mappings {
@@ -188,21 +195,17 @@ pub struct DockerProject {
     pub override_file: Option<PathBuf>,
 }
 
-/// Run `docker compose -p <project> -f <file> [-f <override>] down`.
+/// Run `docker compose -p <project> down`.
+///
+/// We intentionally omit `-f` here: Docker Compose v2 locates containers via
+/// the `com.docker.compose.project` label, so the project name alone is
+/// sufficient.  Passing `-f` would require the override file (written to /tmp
+/// at startup) to still exist, which is not guaranteed across reboots or
+/// session restarts.
 pub fn docker_compose_down(dp: &DockerProject) {
     print!("  Stopping {} containers…\r\n", dp.label);
     let _ = io::stdout().flush();
-    let file_str = dp.compose_file.to_str().unwrap_or("");
-    let ov_str = dp
-        .override_file
-        .as_ref()
-        .and_then(|p| p.to_str())
-        .unwrap_or("");
-    let mut argv: Vec<&str> = vec!["compose", "-p", &dp.project, "-f", file_str];
-    if !ov_str.is_empty() {
-        argv.extend_from_slice(&["-f", ov_str]);
-    }
-    argv.push("down");
+    let argv: Vec<&str> = vec!["compose", "-p", &dp.project, "down"];
     let code = run_blocking("docker", &argv, &dp.work_dir);
     if code == 0 {
         print!("  {GRN}✓{R}  {} containers stopped.\r\n", dp.label);

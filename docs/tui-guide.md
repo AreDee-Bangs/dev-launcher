@@ -40,7 +40,8 @@ The default mode. Shows a table of all running and ready services. Services in `
 | `p` / `P` | Toggle full worktree paths on/off in the service table |
 | `r` | Generate a report for the selected service |
 | `R` (Shift+r) | Restart the selected service (kills process, re-spawns with same args) |
-| `q` / `Ctrl+C` | Graceful shutdown (kills all services, tears down Docker Compose, exits) |
+| `q` / `Esc` | Return to the workspace/product selector |
+| `Ctrl+C` | Graceful shutdown (kills all services, tears down Docker Compose, exits) |
 
 ---
 
@@ -150,11 +151,16 @@ Services that depend on others show `pending` in the health column until their p
 
 ## Shutdown
 
-Pressing `q` or `Ctrl+C` in any mode triggers a graceful shutdown sequence:
+Pressing `q` in any mode stops all services and returns to the workspace/product selector so you can switch products or branches without relaunching the binary.
+
+Pressing `Ctrl+C` performs the same graceful shutdown and then exits the process entirely.
+
+The shutdown sequence is:
 
 1. All spawned processes receive `SIGTERM`.
-2. A 3-second grace period allows in-flight requests to complete.
-3. Docker Compose projects are stopped (`docker compose down`).
-4. The TUI exits cleanly.
+2. A grace period allows in-flight requests to complete (5 s by default; 180 s for `opencti-graphql`).
+3. Any process that has not exited by the deadline receives `SIGKILL`.
+4. Docker Compose projects are stopped via `docker compose -p <project> down` (project-name lookup -- no dependency on temporary override files).
+5. The TUI exits or returns to the selector.
 
-Pressing `Ctrl+C` twice (or sending `SIGKILL`) bypasses the grace period and terminates processes immediately. On the next launch, `dev-launcher` detects orphaned PIDs from the previous session and kills them before starting new processes.
+On the next launch, `dev-launcher` detects orphaned PIDs from the previous session and kills them before starting new processes.

@@ -48,12 +48,12 @@ use tui::{
 use workspace::{
     branch_to_slug, choices_to_workspace, compute_workspace_hash, current_branch,
     current_commit_short, default_product_choices, deploy_workspace_env, discover_flags_in_dir,
-    ensure_worktree, extract_url_port, init_workspace_env, list_workspaces, load_workspace,
-    parse_env_file, patch_url_default, port_in_use, preflight_port_checks, read_active_flags,
-    read_env_url_port, run_env_wizard, run_flag_selector, run_platform_mode_selector,
-    run_product_selector, run_workspace_delete, run_workspace_selector, save_workspace, today,
-    workspace_to_choices, workspaces_dir, write_active_flags, write_env_file, ws_env_path,
-    FlagChoice, LaunchMode, PortCheck, ProductChoice, WorkspaceAction, WorkspaceConfig,
+    ensure_worktree, extract_url_port, init_workspace_env, list_workspaces,
+    load_workspace, parse_env_file, patch_url_default, port_in_use, preflight_port_checks,
+    read_active_flags, read_env_url_port, run_env_wizard, run_flag_selector,
+    run_platform_mode_selector, run_product_selector, run_workspace_delete, run_workspace_selector,
+    save_workspace, today, workspace_to_choices, workspaces_dir, write_active_flags, write_env_file,
+    ws_env_path, FlagChoice, LaunchMode, PortCheck, ProductChoice, WorkspaceAction, WorkspaceConfig,
     WorkspaceEntry, COMMIT_PREFIX, CONNECTOR_ENV_VARS, COPILOT_ENV_VARS, OPENCTI_ENV_VARS,
 };
 
@@ -184,12 +184,97 @@ fn maven_cmd(openaev_root: &Path) -> String {
     }
 }
 
+fn bootstrap_infra_dir(dir: &Path, repo: &str) {
+    if dir.is_dir() {
+        return;
+    }
+    println!("  Bootstrapping {repo} infra directory…");
+    match repo {
+        "grafana" => {
+            fs::create_dir_all(dir.join("provisioning/datasources"))
+                .expect("cannot create grafana dir");
+            let _ = fs::write(
+                dir.join("docker-compose.dev.yml"),
+                include_str!("infra/grafana/docker-compose.dev.yml"),
+            );
+            let _ = fs::write(
+                dir.join("loki-config.yml"),
+                include_str!("infra/grafana/loki-config.yml"),
+            );
+            let _ = fs::write(
+                dir.join("promtail-config.yml"),
+                include_str!("infra/grafana/promtail-config.yml"),
+            );
+            let _ = fs::write(
+                dir.join("provisioning/datasources/loki.yml"),
+                include_str!("infra/grafana/provisioning/datasources/loki.yml"),
+            );
+            let env_path = dir.join(".env");
+            if !env_path.exists() {
+                let _ = fs::write(
+                    &env_path,
+                    "\
+# Grafana dev environment — edit to override defaults from docker-compose.dev.yml
+# Uncomment and change any value you want to customise.
+
+#GRAFANA_PORT=3200
+#LOKI_PORT=3101
+
+# By default Grafana runs with anonymous Admin access (no login required).
+# To enable the login form, set the three variables below.
+#GF_AUTH_ANONYMOUS_ENABLED=false
+#GF_AUTH_DISABLE_LOGIN_FORM=false
+#GF_SECURITY_ADMIN_USER=admin
+#GF_SECURITY_ADMIN_PASSWORD=admin
+",
+                );
+            }
+        }
+        "langfuse" => {
+            fs::create_dir_all(dir).expect("cannot create langfuse dir");
+            let _ = fs::write(
+                dir.join("docker-compose.dev.yml"),
+                include_str!("infra/langfuse/docker-compose.dev.yml"),
+            );
+            let env_path = dir.join(".env");
+            if !env_path.exists() {
+                let _ = fs::write(
+                    &env_path,
+                    "\
+# Langfuse dev environment — edit to override defaults from docker-compose.dev.yml
+# Uncomment and change any value you want to customise.
+
+#LANGFUSE_PORT=3201
+#LANGFUSE_DB_PORT=5433
+#LANGFUSE_DB_PASSWORD=langfuse_dev
+
+#LANGFUSE_ADMIN_EMAIL=admin@example.com
+#LANGFUSE_ADMIN_PASSWORD=changeme
+#LANGFUSE_ADMIN_NAME=Admin
+
+#LANGFUSE_PROJECT_NAME=filigran-dev
+#LANGFUSE_PUBLIC_KEY=lf_pk_dev_changeme_publickey
+#LANGFUSE_SECRET_KEY=lf_sk_dev_changeme_secretkey
+
+# Secrets — change these if you expose this instance beyond localhost.
+#LANGFUSE_NEXTAUTH_SECRET=langfuse_dev_nextauth_secret_changeme
+#LANGFUSE_SALT=langfuse_dev_salt_changeme
+",
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn clean_docker_for_workspace(
     slug: &str,
     paths: &Paths,
     no_copilot: bool,
     no_opencti: bool,
     no_openaev: bool,
+    no_grafana: bool,
+    no_langfuse: bool,
 ) {
     use services::{resolve_product_docker_for_down, run_blocking_logged};
 
@@ -202,6 +287,8 @@ fn clean_docker_for_workspace(
         ("filigran-copilot", paths.copilot.as_path(), no_copilot),
         ("opencti", paths.opencti.as_path(), no_opencti),
         ("openaev", paths.openaev.as_path(), no_openaev),
+        ("grafana", paths.grafana.as_path(), no_grafana),
+        ("langfuse", paths.langfuse.as_path(), no_langfuse),
     ];
 
     for &(repo, dir, skip) in products {
@@ -590,6 +677,9 @@ fn main() {
                 get_worktree_override(choices[3].repo),
             )
             .join("internal-import-file/import-document-ai"),
+            // Infra products: always use the fixed workspace_root dir (no branches/worktrees).
+            grafana: workspace_root.join("grafana"),
+            langfuse: workspace_root.join("langfuse"),
         }
     };
 
@@ -597,6 +687,8 @@ fn main() {
     let no_opencti = !(choices[1].enabled && paths.opencti.is_dir());
     let no_openaev = !(choices[2].enabled && paths.openaev.is_dir());
     let no_connector = !(choices[3].enabled && paths.connector.is_dir());
+    let no_grafana = !choices[4].enabled;
+    let no_langfuse = !choices[5].enabled;
     let no_opencti_front = no_opencti || args.no_opencti_front;
     let no_openaev_front = no_openaev || args.no_openaev_front;
 
@@ -817,7 +909,15 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
     ensure_corepack();
 
     if clean_start {
-        clean_docker_for_workspace(&slug, &paths, no_copilot, no_opencti, no_openaev);
+        clean_docker_for_workspace(
+            &slug,
+            &paths,
+            no_copilot,
+            no_opencti,
+            no_openaev,
+            no_grafana,
+            no_langfuse,
+        );
     }
 
     print!("  Checking Docker… ");
@@ -957,6 +1057,66 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     project,
                     compose_file: dc,
                     work_dir: dev_dir,
+                    override_file: ov,
+                });
+            }
+        }
+        if !no_grafana {
+            bootstrap_infra_dir(&paths.grafana, "grafana");
+            let dc = paths.grafana.join("docker-compose.dev.yml");
+            if dc.exists() {
+                let project = ws_docker_project("grafana-dev", &slug);
+                let ov = write_compose_override(&dc, &slug);
+                let ov_str = ov
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let env_file = paths.grafana.join(".env");
+                let env_file_str = env_file.to_string_lossy().into_owned();
+                let mut extra: Vec<&str> = if env_file.exists() {
+                    vec!["--env-file", &env_file_str]
+                } else {
+                    vec![]
+                };
+                if ov.is_some() {
+                    extra.extend_from_slice(&["-f", &ov_str]);
+                }
+                docker_compose_up("Grafana", &project, &dc, &paths.grafana, &extra);
+                docker_projects.push(DockerProject {
+                    label: "Grafana".into(),
+                    project,
+                    compose_file: dc,
+                    work_dir: paths.grafana.clone(),
+                    override_file: ov,
+                });
+            }
+        }
+        if !no_langfuse {
+            bootstrap_infra_dir(&paths.langfuse, "langfuse");
+            let dc = paths.langfuse.join("docker-compose.dev.yml");
+            if dc.exists() {
+                let project = ws_docker_project("langfuse-dev", &slug);
+                let ov = write_compose_override(&dc, &slug);
+                let ov_str = ov
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let env_file = paths.langfuse.join(".env");
+                let env_file_str = env_file.to_string_lossy().into_owned();
+                let mut extra: Vec<&str> = if env_file.exists() {
+                    vec!["--env-file", &env_file_str]
+                } else {
+                    vec![]
+                };
+                if ov.is_some() {
+                    extra.extend_from_slice(&["-f", &ov_str]);
+                }
+                docker_compose_up("Langfuse", &project, &dc, &paths.langfuse, &extra);
+                docker_projects.push(DockerProject {
+                    label: "Langfuse".into(),
+                    project,
+                    compose_file: dc,
+                    work_dir: paths.langfuse.clone(),
                     override_file: ov,
                 });
             }
@@ -1347,6 +1507,32 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     }
                 }
             }
+        }
+
+        // Grafana (Docker-only — no host process to spawn)
+        if !no_grafana {
+            let mut svc = services::Svc::new(
+                "grafana",
+                Some("http://localhost:3200"),
+                "/api/health",
+                60,
+                logs_dir.join("grafana.log"),
+            );
+            svc.health = Health::Launching;
+            svcs.push(svc);
+        }
+
+        // Langfuse (Docker-only — no host process to spawn)
+        if !no_langfuse {
+            let mut svc = services::Svc::new(
+                "langfuse",
+                Some("http://localhost:3201"),
+                "/api/public/health",
+                120,
+                logs_dir.join("langfuse.log"),
+            );
+            svc.health = Health::Launching;
+            svcs.push(svc);
         }
 
         // Connector

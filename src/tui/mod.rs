@@ -34,7 +34,12 @@ pub const RED: &str = "\x1b[31m";
 pub const CYN: &str = "\x1b[36m";
 
 // ── Build version ─────────────────────────────────────────────────────────────
-pub const BUILD_VERSION: &str = concat!("dev-launcher.", env!("BUILD_TIMESTAMP"));
+pub const BUILD_VERSION: &str = concat!(
+    "dev-launcher v",
+    env!("CARGO_PKG_VERSION"),
+    "-",
+    env!("GIT_SHA")
+);
 
 // ── Warm-gradient "Enter run fix" label ───────────────────────────────────────
 pub const ENTER_RUN_FIX: &str = concat!(

@@ -46,7 +46,24 @@ pub const PRODUCTS: &[(&str, &str, &str, &str)] = &[
         "connector",
         "import-document-ai",
     ),
+    (
+        "grafana",
+        "Grafana",
+        "grafana",
+        "grafana · loki · promtail",
+    ),
+    (
+        "langfuse",
+        "Langfuse",
+        "langfuse",
+        "tracing · observability",
+    ),
 ];
+
+/// Returns true for Docker-only infra products that have no git repo or branch concept.
+pub fn is_infra_product(key: &str) -> bool {
+    matches!(key, "grafana" | "langfuse")
+}
 
 /// Return `{workspace_root}/.dev-workspaces`.
 pub fn workspaces_dir(workspace_root: &Path) -> PathBuf {

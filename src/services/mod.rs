@@ -155,4 +155,6 @@ pub struct Paths {
     pub opencti: PathBuf,
     pub connector: PathBuf,
     pub openaev: PathBuf,
+    pub grafana: PathBuf,
+    pub langfuse: PathBuf,
 }

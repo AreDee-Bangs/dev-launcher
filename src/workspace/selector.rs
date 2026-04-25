@@ -11,7 +11,7 @@ use crate::workspace::env::parse_env_file;
 use crate::workspace::git::{
     branch_to_slug, parse_commit_ref, worktree_delete_blockers, worktree_dirty_reasons,
 };
-use crate::workspace::{WorkspaceConfig, PRODUCTS};
+use crate::workspace::{is_infra_product, WorkspaceConfig, PRODUCTS};
 
 pub enum WorkspaceAction {
     Open(WorkspaceConfig),
@@ -527,7 +527,8 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
                 cursor += 1;
             }
             KeyCode::Char(' ') => {
-                if choices[cursor].available || !choices[cursor].branch.is_empty() {
+                let c = &choices[cursor];
+                if c.available || !c.branch.is_empty() || is_infra_product(c.repo) {
                     choices[cursor].enabled = !choices[cursor].enabled;
                 } else {
                     drop(raw.take());
@@ -545,26 +546,30 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
                 }
             }
             KeyCode::Char('b') | KeyCode::Char('B') => {
-                drop(raw.take());
-                let current = &choices[cursor].branch;
-                if current.is_empty() {
-                    print!("\n  Branch for {} : ", choices[cursor].label);
+                if is_infra_product(choices[cursor].repo) {
+                    // infra products have no branches
                 } else {
-                    print!(
-                        "\n  Branch for {} (Enter to keep {current}): ",
-                        choices[cursor].label
-                    );
-                }
-                let _ = io::stdout().flush();
-                if let Some(input) = read_line_or_interrupt() {
-                    let trimmed = input.trim().to_string();
-                    if !trimmed.is_empty() {
-                        choices[cursor].branch = trimmed;
-                        choices[cursor].enabled = true;
-                        choices[cursor].available = true;
+                    drop(raw.take());
+                    let current = &choices[cursor].branch;
+                    if current.is_empty() {
+                        print!("\n  Branch for {} : ", choices[cursor].label);
+                    } else {
+                        print!(
+                            "\n  Branch for {} (Enter to keep {current}): ",
+                            choices[cursor].label
+                        );
                     }
+                    let _ = io::stdout().flush();
+                    if let Some(input) = read_line_or_interrupt() {
+                        let trimmed = input.trim().to_string();
+                        if !trimmed.is_empty() {
+                            choices[cursor].branch = trimmed;
+                            choices[cursor].enabled = true;
+                            choices[cursor].available = true;
+                        }
+                    }
+                    raw = TuiGuard::enter();
                 }
-                raw = TuiGuard::enter();
             }
             KeyCode::Enter => {
                 return LaunchMode::Normal;
@@ -587,7 +592,7 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
 pub fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> Vec<ProductChoice> {
     PRODUCTS
         .iter()
-        .map(|(repo, label, _, desc)| {
+        .map(|(repo, label, key, desc)| {
             let saved = config.entries.iter().find(|e| e.repo.as_str() == *repo);
             let branch = saved.map(|e| e.branch.clone()).unwrap_or_default();
             let enabled = saved.map(|e| e.enabled).unwrap_or(false);
@@ -602,12 +607,15 @@ pub fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> 
                     workspace_root.join(repo)
                 }
             };
+            // Infra products are always available — directories are bootstrapped on launch.
+            let available =
+                is_infra_product(key) || path.is_dir() || workspace_root.join(repo).is_dir();
             ProductChoice {
                 label,
                 desc,
                 repo,
                 enabled,
-                available: path.is_dir() || workspace_root.join(repo).is_dir(),
+                available,
                 branch,
             }
         })
@@ -635,9 +643,10 @@ pub fn choices_to_workspace(choices: &[ProductChoice]) -> WorkspaceConfig {
 pub fn default_product_choices(workspace_root: &Path) -> Vec<ProductChoice> {
     PRODUCTS
         .iter()
-        .map(|(repo, label, _, desc)| {
+        .map(|(repo, label, key, desc)| {
             let main_dir = workspace_root.join(repo);
-            let available = main_dir.is_dir();
+            // Infra products are always available — directories are bootstrapped on launch.
+            let available = is_infra_product(key) || main_dir.is_dir();
             ProductChoice {
                 label,
                 desc,
