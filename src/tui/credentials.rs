@@ -10,8 +10,13 @@ pub struct CredEntry {
     pub value: String,
 }
 
+/// Read a key from a parsed .env map, falling back to `default` when absent.
+fn env_or<'a>(map: &'a std::collections::HashMap<String, String>, key: &str, default: &'a str) -> &'a str {
+    map.get(key).map(|s| s.as_str()).unwrap_or(default)
+}
+
 /// Collect user-facing credentials from each product's workspace .env file.
-pub fn gather_credentials(ws_env_dir: &Path, _paths: &Paths) -> Vec<CredEntry> {
+pub fn gather_credentials(ws_env_dir: &Path, paths: &Paths) -> Vec<CredEntry> {
     let mut out: Vec<CredEntry> = Vec::new();
 
     let copilot_env = ws_env_dir.join("copilot.env");
@@ -75,6 +80,26 @@ pub fn gather_credentials(ws_env_dir: &Path, _paths: &Paths) -> Vec<CredEntry> {
                 label: "OpenCTI token",
                 value: v.clone(),
             });
+        }
+    }
+
+    // Langfuse -- reads from the infra .env, falls back to compose defaults.
+    if paths.langfuse.is_dir() {
+        let map = parse_env_file(&paths.langfuse.join(".env"));
+        let port = env_or(&map, "LANGFUSE_PORT", "3201");
+        for (label, key, default) in [
+            ("URL",           "",                      ""),
+            ("Admin e-mail",  "LANGFUSE_ADMIN_EMAIL",  "admin@example.com"),
+            ("Admin password","LANGFUSE_ADMIN_PASSWORD","changeme"),
+            ("Public key",    "LANGFUSE_PUBLIC_KEY",   "lf_pk_dev_changeme_publickey"),
+            ("Secret key",    "LANGFUSE_SECRET_KEY",   "lf_sk_dev_changeme_secretkey"),
+        ] {
+            let value = if label == "URL" {
+                format!("http://localhost:{port}")
+            } else {
+                env_or(&map, key, default).to_string()
+            };
+            out.push(CredEntry { product: "Langfuse", label, value });
         }
     }
 
