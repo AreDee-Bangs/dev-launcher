@@ -41,6 +41,9 @@ pub struct RepoManifest {
     pub docker: ManifestDocker,
     pub services: Vec<SvcDef>,
     pub bootstrap: Vec<BootstrapDef>,
+    /// Required Python major.minor (e.g. "3.13"). When set, the launcher
+    /// checks any venv Python binary against this before starting services.
+    pub python_version: Option<String>,
 }
 
 // ── Manifest loading ──────────────────────────────────────────────────────────
@@ -74,9 +77,11 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
         Docker,
         Service,
         Bootstrap,
+        Python,
     }
 
     let mut section = Section::None;
+    let mut python_version: Option<String> = None;
     let mut svc_name = String::new();
     let mut svc_args: Vec<String> = Vec::new();
     let mut svc_cwd = String::new();
@@ -186,6 +191,8 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                 section = Section::Docker;
             } else if inner == "bootstrap" {
                 section = Section::Bootstrap;
+            } else if inner == "python" {
+                section = Section::Python;
             } else if let Some(rest) = inner.strip_prefix("service ") {
                 svc_name = rest.trim().to_string();
                 section = Section::Service;
@@ -226,6 +233,10 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                     "cwd" => bs_cwd = if v.is_empty() { None } else { Some(v) },
                     _ => {}
                 },
+                Section::Python => match k {
+                    "version" => python_version = if v.is_empty() { None } else { Some(v) },
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -262,6 +273,7 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
         docker,
         services,
         bootstrap,
+        python_version,
     })
 }
 
@@ -351,12 +363,67 @@ pub fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
         docker,
         services,
         bootstrap,
+        python_version: detect_python_version(repo_dir),
+    }
+}
+
+/// Detect the required Python major.minor for a repo by inspecting:
+/// 1. `.python-version` file (pyenv / mise convention)
+/// 2. `backend/pyproject.toml` — `requires-python` or ruff `target-version`
+fn detect_python_version(repo_dir: &Path) -> Option<String> {
+    // .python-version: first line is e.g. "3.13.2" or "3.13"
+    if let Ok(content) = fs::read_to_string(repo_dir.join(".python-version")) {
+        let line = content.lines().next().unwrap_or("").trim().to_string();
+        if !line.is_empty() {
+            return Some(major_minor(&line));
+        }
+    }
+    // backend/pyproject.toml
+    let ppt = repo_dir.join("backend/pyproject.toml");
+    if let Ok(content) = fs::read_to_string(&ppt) {
+        for line in content.lines() {
+            let t = line.trim();
+            // requires-python = ">=3.13" or "==3.13.*"
+            if let Some(rest) = t.strip_prefix("requires-python") {
+                let v = rest.trim_start_matches([' ', '=', '"', '\'', '>', '<', '~', '^', '!']);
+                let v = v.trim_matches(['"', '\'', ' ']);
+                if !v.is_empty() {
+                    return Some(major_minor(v));
+                }
+            }
+            // ruff target-version = "py313"
+            if let Some(rest) = t.strip_prefix("target-version") {
+                let v = rest.trim_start_matches([' ', '=', '"', '\''])
+                    .trim_matches(['"', '\'', ' ']);
+                if let Some(pyver) = v.strip_prefix("py") {
+                    if pyver.len() >= 3 {
+                        let (major, minor) = pyver.split_at(1);
+                        return Some(format!("{}.{}", major, minor));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn major_minor(v: &str) -> String {
+    let parts: Vec<&str> = v.splitn(3, '.').collect();
+    match parts.as_slice() {
+        [major, minor, ..] => format!("{}.{}", major, minor),
+        [major] => major.to_string(),
+        _ => v.to_string(),
     }
 }
 
 pub fn save_dev_launcher_conf(conf_path: &Path, repo_name: &str, manifest: &RepoManifest) {
     let mut out = format!("# {} — dev-launcher launcher configuration\n", repo_name);
     out.push_str("# Auto-generated. Edit to customize. Re-run dev-launcher to apply changes.\n\n");
+
+    if let Some(ref v) = manifest.python_version {
+        out.push_str("[python]\n");
+        out.push_str(&format!("version = {}\n\n", v));
+    }
 
     out.push_str("[docker]\n");
     if let Some(ref cd) = manifest.docker.compose_dev {
@@ -452,14 +519,44 @@ pub fn patch_manifest_ports(manifest: &mut RepoManifest, backend_port: u16, fron
     }
 }
 
+/// Run `python --version` and return the major.minor string (e.g. "3.14").
+fn venv_python_version(python_bin: &Path) -> Option<String> {
+    let out = Command::new(python_bin)
+        .arg("--version")
+        .output()
+        .ok()?;
+    // output is on stdout for Python 3, e.g. "Python 3.14.2\n"
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let version_str = raw.trim().strip_prefix("Python ")?;
+    Some(major_minor(version_str))
+}
+
 pub fn run_manifest_bootstrap(repo_dir: &Path, manifest: &RepoManifest) -> bool {
     let mut ok = true;
     for step in &manifest.bootstrap {
         match step {
             BootstrapDef::Check { path, missing_hint } => {
-                if !repo_dir.join(path).exists() {
+                let full = repo_dir.join(path);
+                if !full.exists() {
                     println!("  {YLW}⚠{R}  {missing_hint}");
                     ok = false;
+                    continue;
+                }
+                // If this is a Python binary and a required version is set, verify it.
+                if let Some(ref required) = manifest.python_version {
+                    if path.contains("python") {
+                        if let Some(actual) = venv_python_version(&full) {
+                            if !actual.starts_with(required.as_str()) {
+                                println!(
+                                    "  {YLW}⚠{R}  venv uses Python {actual} but Python {required} is required"
+                                );
+                                println!(
+                                    "  {DIM}    → delete {path} directory and re-run ./dev.sh{R}"
+                                );
+                                ok = false;
+                            }
+                        }
+                    }
                 }
             }
             BootstrapDef::RunIfMissing {
