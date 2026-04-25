@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::services::docker::run_blocking;
-use crate::tui::{DIM, R, YLW};
+use crate::tui::{DIM, GRN, R, YLW};
 
 // ── Manifest data types ───────────────────────────────────────────────────────
 
@@ -33,6 +33,14 @@ pub enum BootstrapDef {
         check: String,
         command: Vec<String>,
         cwd: Option<String>,
+    },
+    /// Keep a venv in sync with a requirements file.
+    /// Computes SHA-256 of `requirements`, compares to `.launcher-reqs-hash`
+    /// inside the venv directory, and runs `pip install -r <requirements>` when
+    /// the hash differs or the sentinel is missing.
+    SyncPip {
+        requirements: String,
+        pip: String,
     },
 }
 
@@ -95,6 +103,8 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
     let mut bs_run_if = String::new();
     let mut bs_command: Vec<String> = Vec::new();
     let mut bs_cwd: Option<String> = None;
+    let mut bs_requirements = String::new();
+    let mut bs_pip = String::new();
 
     let flush_service = |name: &str,
                          args: &Vec<String>,
@@ -124,6 +134,8 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                            run_if: &str,
                            command: &Vec<String>,
                            cwd: &Option<String>,
+                           requirements: &str,
+                           pip: &str,
                            bootstrap: &mut Vec<BootstrapDef>| {
         if !check.is_empty() && !missing.is_empty() {
             bootstrap.push(BootstrapDef::Check {
@@ -135,6 +147,11 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                 check: run_if.to_string(),
                 command: command.clone(),
                 cwd: cwd.clone(),
+            });
+        } else if !requirements.is_empty() && !pip.is_empty() {
+            bootstrap.push(BootstrapDef::SyncPip {
+                requirements: requirements.to_string(),
+                pip: pip.to_string(),
             });
         }
     };
@@ -175,6 +192,8 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                         &bs_run_if,
                         &bs_command,
                         &bs_cwd,
+                        &bs_requirements,
+                        &bs_pip,
                         &mut bootstrap,
                     );
                     bs_check = String::new();
@@ -182,6 +201,8 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                     bs_run_if = String::new();
                     bs_command = Vec::new();
                     bs_cwd = None;
+                    bs_requirements = String::new();
+                    bs_pip = String::new();
                 }
                 _ => {}
             }
@@ -231,6 +252,8 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                     "run_if_missing" => bs_run_if = v,
                     "command" => bs_command = v.split_whitespace().map(|s| s.to_string()).collect(),
                     "cwd" => bs_cwd = if v.is_empty() { None } else { Some(v) },
+                    "requirements" => bs_requirements = v,
+                    "pip" => bs_pip = v,
                     _ => {}
                 },
                 Section::Python => match k {
@@ -263,6 +286,8 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                 &bs_run_if,
                 &bs_command,
                 &bs_cwd,
+                &bs_requirements,
+                &bs_pip,
                 &mut bootstrap,
             );
         }
@@ -337,6 +362,14 @@ pub fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
             path: "backend/.venv/bin/python".to_string(),
             missing_hint: "Run ./dev.sh once to create the Python venv".to_string(),
         });
+        // Keep the venv in sync with requirements.txt automatically.
+        let reqs = backend_dir.join("requirements.txt");
+        if reqs.exists() {
+            bootstrap.push(BootstrapDef::SyncPip {
+                requirements: "backend/requirements.txt".to_string(),
+                pip: "backend/.venv/bin/pip".to_string(),
+            });
+        }
         let _ = python;
     }
 
@@ -473,6 +506,10 @@ pub fn save_dev_launcher_conf(conf_path: &Path, repo_name: &str, manifest: &Repo
                     out.push_str(&format!("cwd            = {}\n", c));
                 }
             }
+            BootstrapDef::SyncPip { requirements, pip } => {
+                out.push_str(&format!("requirements = {}\n", requirements));
+                out.push_str(&format!("pip          = {}\n", pip));
+            }
         }
         out.push('\n');
     }
@@ -517,6 +554,19 @@ pub fn patch_manifest_ports(manifest: &mut RepoManifest, backend_port: u16, fron
             }
         }
     }
+}
+
+/// Compute a simple SHA-256 hex digest of a file's contents.
+fn file_sha256(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    // FNV-1a — stable across Rust versions, collision-resistant enough for
+    // drift detection (not cryptographic, but sufficient here).
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in &data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(format!("{:016x}-{}", hash, data.len()))
 }
 
 /// Run `python --version` and return the major.minor string (e.g. "3.14").
@@ -572,6 +622,36 @@ pub fn run_manifest_bootstrap(repo_dir: &Path, manifest: &RepoManifest) -> bool 
                     if let Some((prog, args)) = command.split_first() {
                         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                         run_blocking(prog, &args_ref, &work_dir);
+                    }
+                }
+            }
+            BootstrapDef::SyncPip { requirements, pip } => {
+                let reqs_path = repo_dir.join(requirements);
+                let pip_path  = repo_dir.join(pip);
+                if !reqs_path.exists() || !pip_path.exists() {
+                    continue;
+                }
+                // Sentinel lives inside the venv directory alongside the pip binary.
+                let sentinel = pip_path.parent()
+                    .map(|p| p.join(".launcher-reqs-hash"))
+                    .unwrap_or_else(|| repo_dir.join(".launcher-reqs-hash"));
+
+                let current_hash = file_sha256(&reqs_path);
+                let stored_hash  = fs::read_to_string(&sentinel).ok();
+
+                if current_hash.as_deref() != stored_hash.as_deref() {
+                    println!("  {DIM}requirements.txt changed — running pip install…{R}");
+                    let pip_str  = pip_path.to_string_lossy().into_owned();
+                    let reqs_str = reqs_path.to_string_lossy().into_owned();
+                    let code = run_blocking(&pip_str, &["install", "-q", "-r", &reqs_str], repo_dir);
+                    if code == 0 {
+                        if let Some(ref h) = current_hash {
+                            let _ = fs::write(&sentinel, h);
+                        }
+                        println!("  {GRN}✓{R}  pip install done");
+                    } else {
+                        println!("  {YLW}⚠{R}  pip install failed (exit {code})");
+                        ok = false;
                     }
                 }
             }

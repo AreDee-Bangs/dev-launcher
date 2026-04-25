@@ -621,6 +621,9 @@ pub fn diagnose_service(svc: &Svc, paths: &Paths, ws_env_dir: &Path) -> Vec<Find
                         }
                     }
                 }
+                BootstrapDef::SyncPip { .. } => {
+                    // SyncPip is handled at startup; nothing to diagnose here.
+                }
             }
         }
     }
