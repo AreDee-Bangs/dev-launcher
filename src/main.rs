@@ -34,10 +34,11 @@ use diagnosis::{create_github_issue, diagnose_service, needs_recipe, DiagEvent, 
 use services::{
     docker_available, docker_compose_down, docker_compose_up, ensure_opencti_env,
     ensure_opencti_graphql_python_deps, kill_orphaned_pids, load_repo_manifest,
-    opensearch_ready, patch_manifest_ports, pid_file_path, probe, read_compose_postgres_password,
-    record_pid, compress_rotated_logs, resolve_docker_project, rotate_log, run_blocking,
-    run_manifest_bootstrap, sighup_handler, spawn_svc, split_health_url_parts,
-    wait_for_opensearch, wipe_opencti_es_indices_if_stale, write_compose_override, ws_docker_project,
+    mark_detached, detached_marker_path, opensearch_ready, patch_manifest_ports, pid_file_path,
+    probe, read_compose_postgres_password, record_pid, compress_rotated_logs,
+    resolve_docker_project, rotate_log, run_blocking, run_manifest_bootstrap, sighup_handler,
+    spawn_svc, split_health_url_parts, wait_for_opensearch, wipe_opencti_es_indices_if_stale,
+    write_compose_override, ws_docker_project,
     DockerProject, Health, Paths, Proc, SpawnCmd, State, SIGHUP_STOP,
 };
 use tui::{
@@ -1786,9 +1787,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
         // ── Detach (M) — leave TUI without stopping the stack ─────────────────
         if want_detach {
             drop(raw_mode.take());
-            // Remove the PID file so the next invocation of this slug does not
-            // think these are orphaned processes and kill them.
-            let _ = fs::remove_file(pid_file_path(&slug));
+            // Write a detach marker so kill_orphaned_pids knows these PIDs are
+            // intentional and skips them on the next invocation of this slug.
+            mark_detached(&slug);
             print!("\x1b[H\x1b[2J");
             let _ = io::stdout().flush();
             compress_rotated_logs(&logs_dir);
@@ -1873,6 +1874,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                     render_shutdown(&slug, &pairs, &term_status, started.elapsed(), timed_out);
                     thread::sleep(Duration::from_millis(600));
                     let _ = fs::remove_file(pid_file_path(&slug));
+                    let _ = fs::remove_file(detached_marker_path(&slug));
                     eprintln!("[dev-launcher] All processes stopped. PID file removed.");
                     if !docker_projects.is_empty() {
                         print!("\r\n");

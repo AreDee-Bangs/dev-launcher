@@ -17,8 +17,9 @@ pub use manifest::{
     ManifestDocker, RepoManifest, SvcDef,
 };
 pub use process::{
-    compress_rotated_logs, kill_orphaned_pids, open_log, pid_file_path, probe, record_pid,
-    rotate_log, sighup_handler, spawn_svc, Proc, SIGHUP_STOP,
+    compress_rotated_logs, detached_marker_path, kill_orphaned_pids, mark_detached, open_log,
+    pid_file_path, probe, record_pid, rotate_log, sighup_handler, spawn_svc, workspace_run_status,
+    Proc, WorkspaceRunStatus, SIGHUP_STOP,
 };
 
 use std::collections::HashMap;

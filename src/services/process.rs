@@ -21,7 +21,50 @@ pub fn pid_file_path(slug: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/dev-launcher-{slug}.pids"))
 }
 
+/// Path of the detach marker file for a given slug.
+pub fn detached_marker_path(slug: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/dev-launcher-{slug}.detached"))
+}
+
+/// Write the detach marker so kill_orphaned_pids knows these PIDs are intentional.
+pub fn mark_detached(slug: &str) {
+    let _ = fs::write(detached_marker_path(slug), "");
+}
+
+/// Running status of a workspace derived from its PID file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceRunStatus {
+    NotRunning,
+    Running,
+    Degraded,
+    Failed,
+}
+
+/// Check how many recorded PIDs are still alive and return a status.
+pub fn workspace_run_status(slug: &str) -> WorkspaceRunStatus {
+    let Ok(content) = fs::read_to_string(pid_file_path(slug)) else {
+        return WorkspaceRunStatus::NotRunning;
+    };
+    let pids: Vec<i32> = content
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    if pids.is_empty() {
+        return WorkspaceRunStatus::NotRunning;
+    }
+    let alive = pids
+        .iter()
+        .filter(|&&pid| unsafe { libc::kill(pid, 0) == 0 })
+        .count();
+    match alive {
+        0 => WorkspaceRunStatus::Failed,
+        n if n == pids.len() => WorkspaceRunStatus::Running,
+        _ => WorkspaceRunStatus::Degraded,
+    }
+}
+
 /// Kill any PIDs recorded in a leftover PID file from a crashed previous session.
+/// Skips killing if a detach marker exists and processes are still alive (intentional detach).
 pub fn kill_orphaned_pids(slug: &str) {
     let path = pid_file_path(slug);
     let Ok(content) = fs::read_to_string(&path) else {
@@ -34,6 +77,18 @@ pub fn kill_orphaned_pids(slug: &str) {
     if pids.is_empty() {
         return;
     }
+
+    let marker = detached_marker_path(slug);
+    if marker.exists() {
+        let any_alive = pids.iter().any(|&pid| unsafe { libc::kill(pid, 0) == 0 });
+        if any_alive {
+            // Intentionally detached — leave them running.
+            return;
+        }
+        // All dead — clean up the stale marker.
+        let _ = fs::remove_file(&marker);
+    }
+
     eprintln!("  [dev-launcher] Found orphaned PIDs from a previous session: {pids:?}");
     eprintln!("  [dev-launcher] Sending SIGTERM…");
     for &pid in &pids {

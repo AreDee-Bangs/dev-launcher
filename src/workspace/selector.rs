@@ -4,6 +4,7 @@ use std::path::Path;
 use crossterm::event::{self, Event, KeyCode};
 
 use crate::config::read_line_or_interrupt;
+use crate::services::{workspace_run_status, WorkspaceRunStatus};
 use crate::tui::{
     drain_input_events, draw_ansi_lines, TuiGuard, BOLD, BUILD_VERSION, CYN, DIM, GRN, R, RED, YLW,
 };
@@ -50,7 +51,13 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
         } else {
             summary.clone()
         };
-        out.push(format!("  {marker}{hash}  {:<54}{date}{offset_tag}", summary_display));
+        let status_dot = match workspace_run_status(&ws.hash) {
+            WorkspaceRunStatus::Running => format!(" {GRN}●{R}"),
+            WorkspaceRunStatus::Degraded => format!(" {YLW}●{R}"),
+            WorkspaceRunStatus::Failed => format!(" {RED}●{R}"),
+            WorkspaceRunStatus::NotRunning => "  ".to_string(),
+        };
+        out.push(format!("  {marker}{hash}{status_dot}  {:<54}{date}{offset_tag}", summary_display));
     }
 
     let new_idx = workspaces.len();
