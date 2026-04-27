@@ -44,6 +44,14 @@ pub enum BootstrapDef {
         requirements: String,
         pip: String,
     },
+    /// Keep a yarn workspace in sync with its lockfile.
+    /// Computes SHA-256 of `yarn_lock`, compares to `.yarn/.launcher-yarn-hash`
+    /// inside the workspace directory, and runs `yarn install` when the hash
+    /// differs, is missing, or `.yarn/install-state.gz` doesn't exist.
+    SyncYarn {
+        yarn_lock: String,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Default)]
@@ -120,6 +128,10 @@ enum YamlBootstrap {
         requirements: String,
         pip: String,
     },
+    SyncYarn {
+        yarn_lock: String,
+        cwd: Option<String>,
+    },
     RunIfMissing {
         run_if_missing: String,
         command: String,
@@ -191,6 +203,9 @@ fn parse_yaml_content(content: &str) -> Option<RepoManifest> {
             },
             YamlBootstrap::SyncPip { requirements, pip } => {
                 BootstrapDef::SyncPip { requirements, pip }
+            }
+            YamlBootstrap::SyncYarn { yarn_lock, cwd } => {
+                BootstrapDef::SyncYarn { yarn_lock, cwd }
             }
             YamlBootstrap::RunIfMissing {
                 run_if_missing,
@@ -429,11 +444,19 @@ pub fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
             log_name: None,
             requires: Vec::new(),
         });
-        bootstrap.push(BootstrapDef::RunIfMissing {
-            check: "frontend/node_modules".to_string(),
-            command: vec!["yarn".to_string(), "install".to_string()],
-            cwd: Some("frontend".to_string()),
-        });
+        let yarn_lock = frontend_dir.join("yarn.lock");
+        if yarn_lock.exists() {
+            bootstrap.push(BootstrapDef::SyncYarn {
+                yarn_lock: "frontend/yarn.lock".to_string(),
+                cwd: Some("frontend".to_string()),
+            });
+        } else {
+            bootstrap.push(BootstrapDef::RunIfMissing {
+                check: "frontend/node_modules".to_string(),
+                command: vec!["yarn".to_string(), "install".to_string()],
+                cwd: Some("frontend".to_string()),
+            });
+        }
     }
 
     RepoManifest {
@@ -561,6 +584,12 @@ pub fn save_dev_launcher_conf(conf_path: &Path, repo_name: &str, manifest: &Repo
                 BootstrapDef::SyncPip { requirements, pip } => {
                     out.push_str(&format!("  - requirements: {}\n", ys(requirements)));
                     out.push_str(&format!("    pip: {}\n", ys(pip)));
+                }
+                BootstrapDef::SyncYarn { yarn_lock, cwd } => {
+                    out.push_str(&format!("  - yarn_lock: {}\n", ys(yarn_lock)));
+                    if let Some(ref c) = cwd {
+                        out.push_str(&format!("    cwd: {}\n", ys(c)));
+                    }
                 }
             }
         }
@@ -730,6 +759,40 @@ pub fn run_manifest_bootstrap(repo_dir: &Path, manifest: &RepoManifest) -> bool 
                         println!("  {GRN}✓{R}  pip install done");
                     } else {
                         println!("  {YLW}⚠{R}  pip install failed (exit {code})");
+                        ok = false;
+                    }
+                }
+            }
+            BootstrapDef::SyncYarn { yarn_lock, cwd } => {
+                let lock_path = repo_dir.join(yarn_lock);
+                if !lock_path.exists() {
+                    continue;
+                }
+                let work_dir = cwd
+                    .as_deref()
+                    .map(|c| repo_dir.join(c))
+                    .unwrap_or_else(|| repo_dir.to_owned());
+                // Sentinel lives in .yarn/ alongside install-state.gz.
+                let sentinel = work_dir.join(".yarn/.launcher-yarn-hash");
+                let install_state = work_dir.join(".yarn/install-state.gz");
+
+                let current_hash = file_sha256(&lock_path);
+                let stored_hash  = fs::read_to_string(&sentinel).ok();
+
+                let needs_install = !install_state.exists()
+                    || current_hash.as_deref() != stored_hash.as_deref();
+
+                if needs_install {
+                    println!("  {DIM}yarn.lock changed — running yarn install…{R}");
+                    let code = run_blocking("yarn", &["install"], &work_dir);
+                    if code == 0 {
+                        if let Some(ref h) = current_hash {
+                            let _ = fs::create_dir_all(sentinel.parent().unwrap_or(&work_dir));
+                            let _ = fs::write(&sentinel, h);
+                        }
+                        println!("  {GRN}✓{R}  yarn install done");
+                    } else {
+                        println!("  {YLW}⚠{R}  yarn install failed (exit {code})");
                         ok = false;
                     }
                 }
