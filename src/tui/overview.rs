@@ -41,10 +41,15 @@ pub fn build_overview_lines(
             ("  ".to_string(), s.name.to_string())
         };
 
-        let status_col = if has_tui && row == cursor {
-            pad_ansi(&s.health.label_plain(), 32)
+        let restart_marker = if s.recently_restarted() {
+            format!("{BOLD}{GRN}↺{R} ")
         } else {
-            pad_ansi(&s.health.label(), 32)
+            String::new()
+        };
+        let status_col = if has_tui && row == cursor {
+            pad_ansi(&format!("{restart_marker}{}", s.health.label_plain()), 32)
+        } else {
+            pad_ansi(&format!("{restart_marker}{}", s.health.label()), 32)
         };
 
         let mut line = format!("  {marker}{:<26}{status_col}{:<7}", name_str, pid);
@@ -95,7 +100,7 @@ pub fn build_overview_lines(
         } else {
             "p paths"
         };
-        out.push(format!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   R restart   e credentials   {paths_hint}   q quit{R}"));
+        out.push(format!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   R restart   s stop   ^R restart all   e credentials   {paths_hint}   q quit{R}"));
     } else {
         out.push(format!(
             "  {DIM}Ctrl+C to stop   tail -f {}/*.log{R}",

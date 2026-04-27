@@ -97,7 +97,7 @@ pub fn diagnose_service(svc: &Svc, paths: &Paths, ws_env_dir: &Path) -> Vec<Find
                     FixAction::Steps {
                         label: "Create Python virtual environment and install dependencies".into(),
                         steps: venv_fix_steps(&bd),
-                        restart_after: false,
+                        restart_after: true,
                     },
                     KIND_PYTHON_VENV,
                 )
@@ -555,7 +555,7 @@ pub fn diagnose_service(svc: &Svc, paths: &Paths, ws_env_dir: &Path) -> Vec<Find
                 FixAction::Steps {
                     label: "Create Python virtual environment and install dependencies".into(),
                     steps: venv_fix_steps(&backend_dir),
-                    restart_after: false,
+                    restart_after: true,
                 },
             ));
         }

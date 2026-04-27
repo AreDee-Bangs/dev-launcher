@@ -35,9 +35,10 @@ use services::{
     docker_available, docker_compose_down, docker_compose_up, ensure_opencti_env,
     ensure_opencti_graphql_python_deps, kill_orphaned_pids, load_repo_manifest,
     patch_manifest_ports, pid_file_path, probe, read_compose_postgres_password, record_pid,
-    resolve_docker_project, run_blocking, run_manifest_bootstrap, sighup_handler, spawn_svc,
-    split_health_url_parts, wipe_opencti_es_indices_if_stale, write_compose_override,
-    ws_docker_project, DockerProject, Health, Paths, Proc, SpawnCmd, State, SIGHUP_STOP,
+    compress_rotated_logs, resolve_docker_project, rotate_log, run_blocking,
+    run_manifest_bootstrap, sighup_handler, spawn_svc, split_health_url_parts,
+    wipe_opencti_es_indices_if_stale, write_compose_override, ws_docker_project, DockerProject,
+    Health, Paths, Proc, SpawnCmd, State, SIGHUP_STOP,
 };
 use tui::{
     build_credentials_lines, build_diagnose_lines, build_log_view_lines, build_overview_lines,
@@ -154,6 +155,30 @@ fn copilot_backend_env(copilot_dir: &Path) -> HashMap<String, String> {
     env
 }
 
+fn ensure_copilot_backend_venv(backend_dir: &Path) {
+    let venv = backend_dir.join(".venv");
+    if venv.join("bin/python").exists() {
+        return;
+    }
+    println!("  Creating Copilot backend Python venv…");
+    let _ = io::stdout().flush();
+    run_blocking("python3", &["-m", "venv", ".venv"], backend_dir);
+    let pip = venv.join("bin/pip").to_string_lossy().into_owned();
+    if backend_dir.join("requirements.txt").exists() {
+        println!("  Installing Python dependencies…");
+        let _ = io::stdout().flush();
+        let reqs = backend_dir
+            .join("requirements.txt")
+            .to_string_lossy()
+            .into_owned();
+        run_blocking(&pip, &["install", "-r", &reqs], backend_dir);
+    } else if backend_dir.join("pyproject.toml").exists() {
+        println!("  Installing Python dependencies…");
+        let _ = io::stdout().flush();
+        run_blocking(&pip, &["install", "-e", "."], backend_dir);
+    }
+}
+
 fn ensure_copilot_fe_deps(dir: &Path) {
     if !dir.join("node_modules").is_dir() {
         println!("  Installing Copilot frontend deps…");
@@ -185,30 +210,32 @@ fn maven_cmd(openaev_root: &Path) -> String {
 }
 
 fn bootstrap_infra_dir(dir: &Path, repo: &str) {
-    if dir.is_dir() {
-        return;
+    let is_new = !dir.is_dir();
+    if is_new {
+        println!("  Bootstrapping {repo} infra directory…");
     }
-    println!("  Bootstrapping {repo} infra directory…");
     match repo {
         "grafana" => {
             fs::create_dir_all(dir.join("provisioning/datasources"))
                 .expect("cannot create grafana dir");
-            let _ = fs::write(
-                dir.join("docker-compose.dev.yml"),
-                include_str!("infra/grafana/docker-compose.dev.yml"),
-            );
-            let _ = fs::write(
-                dir.join("loki-config.yml"),
-                include_str!("infra/grafana/loki-config.yml"),
-            );
-            let _ = fs::write(
-                dir.join("promtail-config.yml"),
-                include_str!("infra/grafana/promtail-config.yml"),
-            );
-            let _ = fs::write(
-                dir.join("provisioning/datasources/loki.yml"),
-                include_str!("infra/grafana/provisioning/datasources/loki.yml"),
-            );
+            if is_new {
+                let _ = fs::write(
+                    dir.join("docker-compose.dev.yml"),
+                    include_str!("infra/grafana/docker-compose.dev.yml"),
+                );
+                let _ = fs::write(
+                    dir.join("loki-config.yml"),
+                    include_str!("infra/grafana/loki-config.yml"),
+                );
+                let _ = fs::write(
+                    dir.join("promtail-config.yml"),
+                    include_str!("infra/grafana/promtail-config.yml"),
+                );
+                let _ = fs::write(
+                    dir.join("provisioning/datasources/loki.yml"),
+                    include_str!("infra/grafana/provisioning/datasources/loki.yml"),
+                );
+            }
             let env_path = dir.join(".env");
             if !env_path.exists() {
                 let _ = fs::write(
@@ -232,10 +259,12 @@ fn bootstrap_infra_dir(dir: &Path, repo: &str) {
         }
         "langfuse" => {
             fs::create_dir_all(dir).expect("cannot create langfuse dir");
-            let _ = fs::write(
-                dir.join("docker-compose.dev.yml"),
-                include_str!("infra/langfuse/docker-compose.dev.yml"),
-            );
+            if is_new {
+                let _ = fs::write(
+                    dir.join("docker-compose.dev.yml"),
+                    include_str!("infra/langfuse/docker-compose.dev.yml"),
+                );
+            }
             let env_path = dir.join(".env");
             if !env_path.exists() {
                 let _ = fs::write(
@@ -594,10 +623,22 @@ fn main() {
     ensure_cooked_output();
     let slug = workspace_cfg.hash.clone();
 
-    let logs_dir = args
-        .logs_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/dev-launcher-logs/{}", slug)));
+    let logs_dir = args.logs_dir.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let ts = std::process::Command::new("date")
+            .arg("+%Y%m%d-%H%M%S")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string())
+            });
+        PathBuf::from(format!("{home}/.dev-launcher/logs/{slug}/{ts}"))
+    });
     fs::create_dir_all(&logs_dir).expect("cannot create logs_dir");
 
     let get_worktree_override = |repo: &str| -> Option<&PathBuf> {
@@ -1217,16 +1258,6 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     } else {
                         def.args[0].clone()
                     };
-                    if (prog.starts_with('/') || prog.starts_with("./") || prog.contains("/."))
-                        && !PathBuf::from(&prog).exists()
-                    {
-                        svc.health = Health::Degraded(format!(
-                            "{} not found — run ./dev.sh once",
-                            &def.args[0]
-                        ));
-                        svcs.push(svc);
-                        continue;
-                    }
                     let rest: Vec<&str> = def.args[1..].iter().map(|s| s.as_str()).collect();
                     let empty_env: HashMap<String, String> = HashMap::new();
                     let env = if def.cwd == "backend" {
@@ -1234,6 +1265,23 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     } else {
                         &empty_env
                     };
+                    if (prog.starts_with('/') || prog.starts_with("./") || prog.contains("/."))
+                        && !PathBuf::from(&prog).exists()
+                    {
+                        svc.spawn_cmd = Some(SpawnCmd {
+                            prog: prog.clone(),
+                            args: rest.iter().map(|s| s.to_string()).collect(),
+                            dir: work_dir.clone(),
+                            env: env.clone(),
+                            requires_docker: def.requires_docker,
+                        });
+                        svc.health = Health::Degraded(format!(
+                            "{} not found — run ./dev.sh once",
+                            &def.args[0]
+                        ));
+                        svcs.push(svc);
+                        continue;
+                    }
                     if !def.requires.is_empty() {
                         let unmet: Vec<&str> = def
                             .requires
@@ -1262,6 +1310,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 let backend_url = format!("http://localhost:{copilot_backend_port}");
                 let frontend_url = format!("http://localhost:{copilot_frontend_port}");
                 let backend_dir = paths.copilot.join("backend");
+                ensure_copilot_backend_venv(&backend_dir);
                 let python = backend_dir.join(".venv/bin/python");
                 let backend_env = copilot_backend_env(&paths.copilot);
                 let mut svc = services::Svc::new(
@@ -1295,6 +1344,27 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         &backend_env
                     );
                 } else {
+                    svc.spawn_cmd = Some(SpawnCmd {
+                        prog: python.to_str().unwrap().to_string(),
+                        args: [
+                            "-m",
+                            "uvicorn",
+                            "app.main:application",
+                            "--reload",
+                            "--host",
+                            "0.0.0.0",
+                            "--port",
+                            backend_port_str.as_str(),
+                            "--timeout-graceful-shutdown",
+                            "3",
+                        ]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                        dir: backend_dir.clone(),
+                        env: backend_env.clone(),
+                        requires_docker: false,
+                    });
                     svc.health =
                         Health::Degraded("venv missing — run ./dev.sh once to set up".into());
                     svcs.push(svc);
@@ -1318,6 +1388,16 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         &backend_env
                     );
                 } else {
+                    svc.spawn_cmd = Some(SpawnCmd {
+                        prog: python.to_str().unwrap().to_string(),
+                        args: ["-m", "saq", "app.worker.settings"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                        dir: backend_dir.clone(),
+                        env: backend_env.clone(),
+                        requires_docker: false,
+                    });
                     svc.health = Health::Degraded("venv missing".into());
                     svcs.push(svc);
                 }
@@ -1647,6 +1727,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
     let render_interval = Duration::from_millis(500);
     let mut last_render = Instant::now();
     let mut force_render = true;
+    let mut last_rotation_check = Instant::now();
+    const LOG_ROTATION_INTERVAL_SECS: u64 = 30;
+    const LOG_MAX_BYTES: u64 = 3_000_000;
 
     loop {
         // ── Shutdown ─────────────────────────────────────────────────────────
@@ -1740,6 +1823,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 thread::sleep(Duration::from_millis(100));
             }
 
+            // Compress rotated log files before leaving this session.
+            compress_rotated_logs(&logs_dir);
+
             // Return to the workspace selector when the user pressed q/Esc,
             // or exit the process for Ctrl+C / SIGHUP.
             if want_restart {
@@ -1800,6 +1886,26 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 svc.diagnosis = Some(msg);
             }
             force_render = true;
+        }
+
+        // ── Auto log rotation ─────────────────────────────────────────────────
+        if last_rotation_check.elapsed().as_secs() >= LOG_ROTATION_INTERVAL_SECS {
+            let log_paths: Vec<PathBuf> = {
+                let svcs = state.lock().unwrap();
+                svcs.iter()
+                    .filter(|s| !matches!(s.health, Health::Pending))
+                    .map(|s| s.log_path.clone())
+                    .collect()
+            };
+            for path in &log_paths {
+                if let Ok(meta) = fs::metadata(path) {
+                    if meta.len() > LOG_MAX_BYTES {
+                        let _ = rotate_log(path);
+                        force_render = true;
+                    }
+                }
+            }
+            last_rotation_check = Instant::now();
         }
 
         // ── Auto-spawn services waiting on requires ───────────────────────────
@@ -2011,6 +2117,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                                 };
                                                 svcs[idx].pid = Some(child.id());
                                                 svcs[idx].started_at = Some(Instant::now());
+                                                svcs[idx].restarted_at = Some(Instant::now());
                                                 svcs[idx].diagnosis = None;
                                                 procs.push(Proc { idx, pgid, child });
                                             }
@@ -2021,8 +2128,198 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                         }
                                     }
                                     force_render = true;
+                                } else {
+                                    force_render = true;
                                 }
                             }
+                        }
+                        InputEvent::Stop => {
+                            let visible: Vec<usize> = {
+                                let svcs = state.lock().unwrap();
+                                svcs.iter()
+                                    .enumerate()
+                                    .filter(|(_, s)| !matches!(s.health, Health::Pending))
+                                    .map(|(i, _)| i)
+                                    .collect()
+                            };
+                            if let Some(&idx) = visible.get(*cursor) {
+                                let is_stopped = {
+                                    let svcs = state.lock().unwrap();
+                                    matches!(svcs[idx].health, Health::Stopped)
+                                };
+                                if !is_stopped {
+                                    if let Some(pos) = procs.iter().position(|p| p.idx == idx) {
+                                        unsafe {
+                                            libc::kill(-procs[pos].pgid, libc::SIGKILL);
+                                        }
+                                        procs.remove(pos);
+                                    }
+                                    let mut svcs = state.lock().unwrap();
+                                    svcs[idx].health = Health::Stopped;
+                                    svcs[idx].pid = None;
+                                    svcs[idx].diagnosis = None;
+                                    force_render = true;
+                                }
+                            }
+                        }
+                        InputEvent::FullRestart => {
+                            drop(raw_mode.take());
+                            ensure_cooked_output();
+                            print!("\x1b[H\x1b[2J");
+                            let _ = io::stdout().flush();
+
+                            let svc_names: Vec<String> = {
+                                let svcs = state.lock().unwrap();
+                                svcs.iter()
+                                    .filter(|s| {
+                                        !matches!(s.health, Health::Pending)
+                                            && s.spawn_cmd.is_some()
+                                    })
+                                    .map(|s| s.name.clone())
+                                    .collect()
+                            };
+
+                            let p = |s: &str| {
+                                print!("{s}\r\n");
+                            };
+                            p(&format!(
+                                "\n  {BOLD}{YLW}⚠  Full stack restart{R}\n"
+                            ));
+                            p("  The following will be restarted:");
+                            for name in &svc_names {
+                                p(&format!("    {DIM}•{R}  {name}"));
+                            }
+                            for dp in &docker_projects {
+                                p(&format!(
+                                    "    {DIM}•{R}  Docker — {} containers",
+                                    dp.label
+                                ));
+                            }
+                            p("");
+                            p(&format!(
+                                "  {DIM}Database data and volumes are NOT wiped.{R}"
+                            ));
+                            p("");
+                            p(&format!(
+                                "  {CYN}Enter{R} confirm   {DIM}q / Esc{R} cancel"
+                            ));
+                            let _ = io::stdout().flush();
+
+                            let _ = crossterm::terminal::enable_raw_mode();
+                            let confirmed = loop {
+                                if stopping.load(Ordering::Relaxed) {
+                                    break false;
+                                }
+                                if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                                    if let Ok(Event::Key(k)) = event::read() {
+                                        match k.code {
+                                            KeyCode::Enter => break true,
+                                            KeyCode::Char('q') | KeyCode::Esc => break false,
+                                            KeyCode::Char('c')
+                                                if k.modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                break false
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            };
+                            let _ = crossterm::terminal::disable_raw_mode();
+
+                            if confirmed {
+                                ensure_cooked_output();
+                                print!("\x1b[H\x1b[2J");
+                                let p = |s: &str| {
+                                    print!("{s}\r\n");
+                                };
+                                p(&format!("\n  {BOLD}Restarting full stack…{R}\n"));
+                                let _ = io::stdout().flush();
+
+                                // Kill all processes
+                                for proc in &mut procs {
+                                    unsafe { libc::kill(-proc.pgid, libc::SIGKILL) };
+                                }
+                                procs.clear();
+                                diagnosed.clear();
+
+                                // Reset service states
+                                {
+                                    let mut svcs = state.lock().unwrap();
+                                    for svc in svcs.iter_mut() {
+                                        if !matches!(svc.health, Health::Pending) {
+                                            svc.pid = None;
+                                            svc.diagnosis = None;
+                                            if svc.spawn_cmd.is_some() {
+                                                svc.health = Health::Launching;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Restart Docker projects
+                                for dp in &docker_projects {
+                                    p(&format!(
+                                        "  {DIM}docker compose restart  {}{R}",
+                                        dp.label
+                                    ));
+                                    let _ = io::stdout().flush();
+                                    let proj = dp.project.as_str();
+                                    run_blocking(
+                                        "docker",
+                                        &["compose", "-p", proj, "restart"],
+                                        &dp.work_dir,
+                                    );
+                                }
+
+                                // Re-spawn all services
+                                let spawn_targets: Vec<(usize, SpawnCmd, PathBuf)> = {
+                                    let svcs = state.lock().unwrap();
+                                    svcs.iter()
+                                        .enumerate()
+                                        .filter_map(|(i, s)| {
+                                            s.spawn_cmd
+                                                .clone()
+                                                .map(|cmd| (i, cmd, s.log_path.clone()))
+                                        })
+                                        .collect()
+                                };
+                                for (idx, cmd, log_path) in spawn_targets {
+                                    let args: Vec<&str> =
+                                        cmd.args.iter().map(|s| s.as_str()).collect();
+                                    match spawn_svc(
+                                        &cmd.prog, &args, &cmd.dir, &cmd.env, &log_path,
+                                    ) {
+                                        Ok((child, pgid)) => {
+                                            let mut svcs = state.lock().unwrap();
+                                            let has_url = svcs[idx].url.is_some();
+                                            record_pid(&slug, child.id());
+                                            svcs[idx].health = if has_url {
+                                                Health::Launching
+                                            } else {
+                                                Health::Running
+                                            };
+                                            svcs[idx].pid = Some(child.id());
+                                            svcs[idx].started_at = Some(Instant::now());
+                                            svcs[idx].restarted_at = Some(Instant::now());
+                                            svcs[idx].diagnosis = None;
+                                            procs.push(Proc { idx, pgid, child });
+                                        }
+                                        Err(e) => {
+                                            let mut svcs = state.lock().unwrap();
+                                            svcs[idx].health = Health::Degraded(e.to_string());
+                                        }
+                                    }
+                                }
+
+                                thread::sleep(Duration::from_millis(400));
+                            }
+
+                            drain_input_events();
+                            raw_mode = TuiGuard::enter();
+                            mode = Mode::Overview { cursor: 0 };
+                            force_render = true;
                         }
                         InputEvent::Back => {
                             want_restart = true;
@@ -2088,6 +2385,18 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                 };
                             }
                         }
+                        InputEvent::RotateLog => {
+                            let log_path = {
+                                let svcs = state.lock().unwrap();
+                                svcs.get(*svc_idx).map(|s| s.log_path.clone())
+                            };
+                            if let Some(path) = log_path {
+                                let _ = rotate_log(&path);
+                                *scroll = 0;
+                                *follow = true;
+                            }
+                            force_render = true;
+                        }
                         _ => {}
                     },
                     Mode::Diagnose {
@@ -2146,6 +2455,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                                 };
                                                 svcs[idx].pid = Some(child.id());
                                                 svcs[idx].started_at = Some(Instant::now());
+                                                svcs[idx].restarted_at = Some(Instant::now());
                                                 svcs[idx].diagnosis = None;
                                                 procs.push(Proc { idx, pgid, child });
                                                 println!(

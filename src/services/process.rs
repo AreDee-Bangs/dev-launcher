@@ -120,6 +120,58 @@ pub fn spawn_svc(
     Ok((child, pgid))
 }
 
+// ── Log rotation ─────────────────────────────────────────────────────────────
+
+/// Copy current log → .log.1 (shift older rotations up to 5), then truncate.
+///
+/// Child processes keep their O_APPEND fd open; after truncation the kernel
+/// appends from offset 0, so writes continue seamlessly without changing the fd.
+pub fn rotate_log(log_path: &Path) -> io::Result<()> {
+    const MAX_ROTATIONS: usize = 5;
+
+    for n in (1..MAX_ROTATIONS).rev() {
+        let src = PathBuf::from(format!("{}.{n}", log_path.display()));
+        let dst = PathBuf::from(format!("{}.{}", log_path.display(), n + 1));
+        if src.exists() {
+            let _ = fs::rename(&src, &dst);
+        }
+    }
+    let overflow = PathBuf::from(format!("{}.{}", log_path.display(), MAX_ROTATIONS + 1));
+    let _ = fs::remove_file(&overflow);
+
+    if log_path.exists() && log_path.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        let rotated = PathBuf::from(format!("{}.1", log_path.display()));
+        fs::copy(log_path, &rotated)?;
+    }
+
+    let _ = OpenOptions::new().write(true).truncate(true).open(log_path);
+    Ok(())
+}
+
+/// gzip-compress all rotated log files (*.log.N) in the session directory.
+/// Leaves *.log (current active files) uncompressed.
+pub fn compress_rotated_logs(logs_dir: &Path) {
+    let Ok(entries) = fs::read_dir(logs_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".gz") {
+            continue;
+        }
+        // Match *.log.<number>  e.g. copilot-worker.log.1
+        let mut parts = name.rsplitn(2, '.');
+        let ext = parts.next().unwrap_or("");
+        let stem = parts.next().unwrap_or("");
+        if ext.parse::<u32>().is_ok() && stem.contains(".log") {
+            let _ = Command::new("gzip").arg("-f").arg(&path).status();
+        }
+    }
+}
+
 // ── Health probe ──────────────────────────────────────────────────────────────
 
 pub fn probe(url: &str) -> bool {

@@ -16,8 +16,8 @@ pub use manifest::{
     ManifestDocker, RepoManifest, SvcDef,
 };
 pub use process::{
-    kill_orphaned_pids, open_log, pid_file_path, probe, record_pid, sighup_handler, spawn_svc,
-    Proc, SIGHUP_STOP,
+    compress_rotated_logs, kill_orphaned_pids, open_log, pid_file_path, probe, record_pid,
+    rotate_log, sighup_handler, spawn_svc, Proc, SIGHUP_STOP,
 };
 
 use std::collections::HashMap;
@@ -36,6 +36,7 @@ pub enum Health {
     Probing(u32),
     Up,
     Running,
+    Stopped,
     Degraded(String),
     Crashed(i32),
 }
@@ -48,6 +49,7 @@ impl Health {
             Health::Probing(n) => format!("{YLW}health probe #{n}{R}"),
             Health::Up => format!("{GRN}up{R}"),
             Health::Running => format!("{CYN}running{R}"),
+            Health::Stopped => format!("{DIM}stopped{R}"),
             Health::Degraded(msg) => format!("{RED}degraded ({msg}){R}"),
             Health::Crashed(code) => format!("{RED}crashed ({code}){R}"),
         }
@@ -60,6 +62,7 @@ impl Health {
             Health::Probing(n) => format!("health probe #{n}"),
             Health::Up => "up".into(),
             Health::Running => "running".into(),
+            Health::Stopped => "stopped".into(),
             Health::Degraded(msg) => format!("degraded ({msg})"),
             Health::Crashed(code) => format!("crashed ({code})"),
         }
@@ -68,7 +71,7 @@ impl Health {
     pub fn is_done(&self) -> bool {
         matches!(
             self,
-            Health::Up | Health::Running | Health::Degraded(_) | Health::Crashed(_)
+            Health::Up | Health::Running | Health::Stopped | Health::Degraded(_) | Health::Crashed(_)
         )
     }
 }
@@ -94,6 +97,7 @@ pub struct Svc {
     pub health: Health,
     pub pid: Option<u32>,
     pub started_at: Option<Instant>,
+    pub restarted_at: Option<Instant>,
     pub startup_timeout: Duration,
     pub log_path: PathBuf,
     pub diagnosis: Option<String>,
@@ -116,6 +120,7 @@ impl Svc {
             health: Health::Pending,
             pid: None,
             started_at: None,
+            restarted_at: None,
             startup_timeout: Duration::from_secs(timeout_secs),
             log_path,
             diagnosis: None,
@@ -136,6 +141,12 @@ impl Svc {
 
     pub fn is_healthy(&self) -> bool {
         matches!(self.health, Health::Up | Health::Running)
+    }
+
+    pub fn recently_restarted(&self) -> bool {
+        self.restarted_at
+            .map(|t| t.elapsed().as_secs() < 5)
+            .unwrap_or(false)
     }
 
     pub fn is_waiting_for_requires(&self) -> bool {

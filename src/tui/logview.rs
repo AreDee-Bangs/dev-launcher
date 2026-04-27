@@ -64,7 +64,7 @@ pub fn build_log_view_lines(svc: &Svc, scroll: usize, follow: bool) -> Vec<Strin
         format!("{YLW}paused{R}  {DIM}(f = follow){R}")
     };
     out.push(format!(
-        "  {DIM}q/← back   ↑↓ scroll   PgUp/PgDn fast   d diagnose{R}   {follow_label}"
+        "  {DIM}q/← back   ↑↓ scroll   PgUp/PgDn fast   d diagnose   c rotate{R}   {follow_label}"
     ));
     out
 }

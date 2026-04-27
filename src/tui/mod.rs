@@ -125,6 +125,9 @@ pub enum InputEvent {
     Diagnose,
     Report,
     Restart,
+    Stop,
+    FullRestart,
+    RotateLog,
     TogglePaths,
 }
 
@@ -143,11 +146,18 @@ pub fn map_key_event(ke: KeyEvent) -> Option<InputEvent> {
         KeyCode::Char('e') => Some(InputEvent::Credentials),
         KeyCode::Char('d') => Some(InputEvent::Diagnose),
         KeyCode::Char('p') | KeyCode::Char('P') => Some(InputEvent::TogglePaths),
+        KeyCode::Char('r') if ke.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputEvent::FullRestart)
+        }
         KeyCode::Char('r') if !ke.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(InputEvent::Report)
         }
         KeyCode::Char('R') | KeyCode::Char('r') if ke.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(InputEvent::Restart)
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(InputEvent::Stop),
+        KeyCode::Char('c') if !ke.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputEvent::RotateLog)
         }
         _ => None,
     }
