@@ -4,7 +4,7 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::services::docker::run_blocking;
+use crate::services::docker::{ensure_gitignore_entries, run_blocking};
 use crate::tui::{DIM, GRN, R, YLW};
 
 // ── Manifest data types ───────────────────────────────────────────────────────
@@ -567,7 +567,10 @@ pub fn save_dev_launcher_conf(conf_path: &Path, repo_name: &str, manifest: &Repo
         out.push('\n');
     }
 
-    let _ = fs::write(conf_path, out);
+    let _ = fs::write(conf_path, &out);
+    if let Some(repo_dir) = conf_path.parent() {
+        ensure_gitignore_entries(repo_dir, &[".dev-launcher.conf"]);
+    }
 }
 
 /// Quote a YAML scalar value when it contains characters that could be

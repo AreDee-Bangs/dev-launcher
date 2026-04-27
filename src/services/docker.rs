@@ -71,10 +71,8 @@ pub fn write_compose_override(compose_file: &Path, ws_hash: &str) -> Option<Path
     }
 
     let suffix = &ws_hash[..8.min(ws_hash.len())];
-    let out_path = compose_file
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(format!("docker-compose.override-{suffix}.yml"));
+    let dir = compose_file.parent().unwrap_or(Path::new("."));
+    let out_path = dir.join("docker-compose.override-devlauncher.yml");
 
     let mut lines = vec!["services:".to_string()];
     for (svc, cn) in &mappings {
@@ -82,7 +80,31 @@ pub fn write_compose_override(compose_file: &Path, ws_hash: &str) -> Option<Path
         lines.push(format!("    container_name: {cn}-{suffix}"));
     }
     fs::write(&out_path, lines.join("\n") + "\n").ok()?;
+    ensure_gitignore_entries(dir, &["docker-compose.override-devlauncher.yml"]);
     Some(out_path)
+}
+
+/// Append `patterns` to `<dir>/.gitignore` if not already present.
+pub fn ensure_gitignore_entries(dir: &Path, patterns: &[&str]) {
+    let gitignore = dir.join(".gitignore");
+    let existing = fs::read_to_string(&gitignore).unwrap_or_default();
+    let to_add: Vec<&&str> = patterns
+        .iter()
+        .filter(|&&p| !existing.lines().any(|l| l.trim() == p))
+        .collect();
+    if to_add.is_empty() {
+        return;
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str("\n# dev-launcher\n");
+    for &&p in &to_add {
+        content.push_str(p);
+        content.push('\n');
+    }
+    let _ = fs::write(&gitignore, content);
 }
 
 /// Stop and remove any containers whose name contains `name_fragment`.

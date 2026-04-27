@@ -6,7 +6,8 @@ pub use docker::{
     compose_host_port, docker_available, docker_compose_down, docker_compose_running_count,
     docker_compose_up, docker_kill_by_name_fragment, parse_compose_container_names,
     replace_port_in_value, resolve_product_docker_for_down, run_blocking, run_blocking_logged,
-    wipe_opencti_es_indices_if_stale, write_compose_override, ws_docker_project, DockerProject,
+    ensure_gitignore_entries, wipe_opencti_es_indices_if_stale, write_compose_override,
+    ws_docker_project, DockerProject,
 };
 pub use manifest::{
     ensure_opencti_env, ensure_opencti_graphql_python_deps, infer_repo_manifest,
