@@ -129,6 +129,8 @@ pub enum InputEvent {
     FullRestart,
     RotateLog,
     TogglePaths,
+    /// Leave the TUI and return to the workspace selector without stopping the stack.
+    Detach,
 }
 
 /// Translate a crossterm `KeyEvent` into our `InputEvent` vocabulary.
@@ -156,6 +158,7 @@ pub fn map_key_event(ke: KeyEvent) -> Option<InputEvent> {
             Some(InputEvent::Restart)
         }
         KeyCode::Char('s') | KeyCode::Char('S') => Some(InputEvent::Stop),
+        KeyCode::Char('m') | KeyCode::Char('M') => Some(InputEvent::Detach),
         KeyCode::Char('c') if !ke.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(InputEvent::RotateLog)
         }

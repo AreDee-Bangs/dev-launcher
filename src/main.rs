@@ -1764,6 +1764,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
     // Set to true when the user explicitly presses q/Esc from Overview so that
     // we return to the workspace selector instead of exiting the process.
     let mut want_restart = false;
+    // Set to true when the user presses M from Overview to leave the TUI without
+    // stopping the stack (detach).  We skip the shutdown sequence entirely.
+    let mut want_detach = false;
 
     let (tx, rx) = mpsc::sync_channel::<InputEvent>(32);
     if has_tui {
@@ -1780,6 +1783,18 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
     const LOG_MAX_BYTES: u64 = 3_000_000;
 
     loop {
+        // ── Detach (M) — leave TUI without stopping the stack ─────────────────
+        if want_detach {
+            drop(raw_mode.take());
+            // Remove the PID file so the next invocation of this slug does not
+            // think these are orphaned processes and kill them.
+            let _ = fs::remove_file(pid_file_path(&slug));
+            print!("\x1b[H\x1b[2J");
+            let _ = io::stdout().flush();
+            compress_rotated_logs(&logs_dir);
+            continue 'session;
+        }
+
         // ── Shutdown ─────────────────────────────────────────────────────────
         if stopping.load(Ordering::Relaxed) || SIGHUP_STOP.load(Ordering::Relaxed) {
             drop(raw_mode.take());
@@ -2401,6 +2416,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                         InputEvent::Back => {
                             want_restart = true;
                             stopping.store(true, Ordering::Relaxed);
+                        }
+                        InputEvent::Detach => {
+                            want_detach = true;
                         }
                         InputEvent::Credentials => {
                             creds = gather_credentials(&ws_env_dir, &paths);
