@@ -167,21 +167,35 @@ fn run_git_visible(dir: &Path, args: &[&str]) -> bool {
 }
 
 /// Pull fast-forward from origin in `worktree` for `branch`, if a remote tracking ref exists.
-/// Best-effort: silently skips if no remote ref or if the pull fails (e.g. diverged history).
+/// Falls back to `reset --hard origin/<branch>` when the remote has diverged (force push).
 fn pull_ff_from_origin(worktree: &Path, main_repo: &Path, branch: &str) {
     let remote_ref = format!("refs/remotes/origin/{branch}");
     if !ref_exists(main_repo, &remote_ref) {
         return;
     }
-    let ok = Command::new("git")
+    let ff_ok = Command::new("git")
         .args(["pull", "--ff-only", "origin", branch])
         .current_dir(worktree)
         .stdin(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !ok {
-        println!("  {YLW}⚠{R}  Could not fast-forward {branch} from origin (diverged or unreachable) — worktree may be behind");
+    if ff_ok {
+        return;
+    }
+    // Fast-forward failed — remote likely had a force push.  Since dev-stack
+    // worktrees hold no local work, reset hard to the remote tip.
+    let reset_ok = Command::new("git")
+        .args(["reset", "--hard", &format!("origin/{branch}")])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if reset_ok {
+        println!("  {YLW}⚡{R}  {branch} diverged from origin (force push?) — reset to remote tip");
+    } else {
+        println!("  {YLW}⚠{R}  Could not sync {branch} from origin — worktree may be behind");
     }
 }
 
