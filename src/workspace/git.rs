@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::tui::{GRN, R, YLW};
+use crate::tui::{CYN, DIM, GRN, R, RED, YLW};
 
 /// Sentinel prefix used to store commit-pinned branches in workspace configs.
 pub const COMMIT_PREFIX: &str = "commit:";
@@ -103,8 +103,7 @@ pub fn ensure_worktree_at_commit(workspace: &Path, repo: &str, commit: &str) -> 
     }
 
     let main_repo = workspace.join(repo);
-    if !main_repo.is_dir() {
-        println!("  {YLW}⚠{R}  {repo} repo not found locally, skipping worktree setup");
+    if !main_repo.is_dir() && !auto_clone_if_missing(workspace, repo) {
         return target;
     }
 
@@ -186,6 +185,52 @@ fn pull_ff_from_origin(worktree: &Path, main_repo: &Path, branch: &str) {
     }
 }
 
+/// Clone `repo` into `{workspace}/{repo}` using the URL from the repo registry.
+/// Returns `true` if the clone succeeded (or the directory already exists).
+fn auto_clone_if_missing(workspace: &Path, repo: &str) -> bool {
+    let main_repo = workspace.join(repo);
+    if main_repo.is_dir() {
+        return true;
+    }
+
+    let repos = super::repos::load_repos();
+    let Some(entry) = repos.iter().find(|e| e.dir == repo) else {
+        println!(
+            "  {YLW}⚠{R}  {repo}: not found locally and no clone URL registered — skipping"
+        );
+        return false;
+    };
+
+    println!(
+        "  {CYN}▶{R}  {repo} not cloned yet — cloning from {DIM}{}{R}…",
+        entry.url
+    );
+    let target = workspace.join(repo);
+    let status = Command::new("git")
+        .args(["clone", &entry.url, target.to_str().unwrap_or("")])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("  {GRN}✓{R}  {repo} cloned");
+            true
+        }
+        Ok(s) => {
+            println!(
+                "  {RED}✗{R}  Failed to clone {repo} (exit {})",
+                s.code().unwrap_or(-1)
+            );
+            false
+        }
+        Err(e) => {
+            println!("  {RED}✗{R}  Failed to clone {repo}: {e}");
+            false
+        }
+    }
+}
+
 pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> PathBuf {
     let slug = branch_to_slug(branch);
     let target = workspace.join(format!("{}-{}", repo, slug));
@@ -194,8 +239,7 @@ pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> Pat
     }
 
     let main_repo = workspace.join(repo);
-    if !main_repo.is_dir() {
-        println!("  {YLW}⚠{R}  {repo} repo not found locally, skipping worktree setup");
+    if !main_repo.is_dir() && !auto_clone_if_missing(workspace, repo) {
         return target;
     }
 
