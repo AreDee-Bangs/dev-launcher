@@ -40,7 +40,8 @@ The default mode. Shows a table of all running and ready services. Services in `
 | `p` / `P` | Toggle full worktree paths on/off in the service table |
 | `r` | Generate a report for the selected service |
 | `R` (Shift+r) | Restart the selected service (kills process, re-spawns with same args) |
-| `q` / `Esc` | Return to the workspace/product selector |
+| `m` / `M` | Detach from the session (leave TUI, stack keeps running in background) |
+| `q` / `Esc` | Return to the workspace/product selector (stops all services first) |
 | `Ctrl+C` | Graceful shutdown (kills all services, tears down Docker Compose, exits) |
 
 ---
@@ -149,11 +150,39 @@ Services that depend on others show `pending` in the health column until their p
 
 ---
 
+## Detaching from a session
+
+Pressing `M` in Overview mode exits the TUI without stopping the stack. Host processes and Docker containers keep running in the background. A detach marker is written so that `dev-launcher` knows the session is intentional and does not kill it on the next launch.
+
+The workspace selector shows a green dot next to a running detached session.
+
+---
+
+## At-launch detached session check
+
+When the workspace selector is shown, `dev-launcher` inspects every workspace that has a detach marker and prompts for action if needed:
+
+| Session state | What you see | Options |
+|---|---|---|
+| **Clean** -- all host processes still alive | `● N process(es) alive` (green) | `[r]` reattach, `[s]` stop, `Enter` ignore |
+| **Dirty** -- host processes stopped, Docker containers still running | `● host processes stopped, Docker containers still running` (yellow) | `[c]` clean up Docker, `Enter` ignore (removes stale marker) |
+| **Stale** -- nothing running at all | (silent) | Marker and PID file removed automatically |
+
+**Reattach** removes the detach marker so that `kill_orphaned_pids` cleanly stops the old processes before the session restarts. Docker containers are left running across the restart, so startup is fast.
+
+**Clean up** calls `docker compose -p <project> down` for all product containers associated with the workspace, then removes the marker and PID file. No compose file is required -- Docker Compose v2 locates containers by project label.
+
+If multiple sessions need attention, they are handled one by one before the workspace selector appears.
+
+---
+
 ## Shutdown
 
 Pressing `q` in any mode stops all services and returns to the workspace/product selector so you can switch products or branches without relaunching the binary.
 
 Pressing `Ctrl+C` performs the same graceful shutdown and then exits the process entirely.
+
+When quitting from the workspace or product selector, `dev-launcher` checks for detached sessions still running and offers to stop them before exiting.
 
 The shutdown sequence is:
 

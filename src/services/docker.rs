@@ -308,6 +308,39 @@ pub fn docker_compose_running_count(project: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Check whether any Docker containers for a workspace are still running.
+/// Probes the five well-known base project names derived from the workspace hash.
+pub fn docker_running_for_workspace(hash: &str) -> bool {
+    let suffix = &hash[..8.min(hash.len())];
+    for base in &["copilot-dev", "opencti-dev", "openaev-dev", "grafana-dev", "langfuse-dev"] {
+        if docker_compose_running_count(&format!("{base}-{suffix}")) > 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Stop all Docker containers for a workspace using only the project label.
+/// Docker Compose v2 finds containers via the label, so no compose file is required.
+pub fn docker_down_workspace(hash: &str) {
+    let suffix = &hash[..8.min(hash.len())];
+    for base in &["copilot-dev", "opencti-dev", "openaev-dev", "grafana-dev", "langfuse-dev"] {
+        let project = format!("{base}-{suffix}");
+        if docker_compose_running_count(&project) == 0 {
+            continue;
+        }
+        print!("  Stopping {base} containers…\r\n");
+        let _ = io::stdout().flush();
+        let code = run_blocking("docker", &["compose", "-p", &project, "down"], Path::new("/tmp"));
+        if code == 0 {
+            print!("  {GRN}✓{R}  {base} containers stopped.\r\n");
+        } else {
+            print!("  {RED}✗{R}  docker down for {base} failed (exit {code}).\r\n");
+        }
+        let _ = io::stdout().flush();
+    }
+}
+
 // ── DockerProject ─────────────────────────────────────────────────────────────
 
 /// A Docker Compose project that was brought up by this session.

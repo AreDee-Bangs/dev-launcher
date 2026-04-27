@@ -32,14 +32,15 @@ use args::Args;
 use config::{load_config, resolve_workspace_root};
 use diagnosis::{create_github_issue, diagnose_service, needs_recipe, DiagEvent, IssueContext};
 use services::{
-    docker_available, docker_compose_down, docker_compose_up, ensure_opencti_env,
+    alive_pid_count, docker_available, docker_compose_down, docker_compose_up,
+    docker_down_workspace, docker_running_for_workspace, ensure_opencti_env,
     ensure_opencti_graphql_python_deps, kill_orphaned_pids, load_repo_manifest,
     mark_detached, detached_marker_path, opensearch_ready, patch_manifest_ports, pid_file_path,
     probe, read_compose_postgres_password, record_pid, compress_rotated_logs,
     resolve_docker_project, rotate_log, run_blocking, run_manifest_bootstrap, sighup_handler,
-    spawn_svc, split_health_url_parts, wait_for_opensearch, wipe_opencti_es_indices_if_stale,
-    write_compose_override, ws_docker_project,
-    DockerProject, Health, Paths, Proc, SpawnCmd, State, SIGHUP_STOP,
+    shutdown_detached_session, spawn_svc, split_health_url_parts, wait_for_opensearch,
+    wipe_opencti_es_indices_if_stale, workspace_run_status, write_compose_override, ws_docker_project,
+    DockerProject, Health, Paths, Proc, SpawnCmd, State, WorkspaceRunStatus, SIGHUP_STOP,
 };
 use tui::{
     build_credentials_lines, build_diagnose_lines, build_log_view_lines, build_overview_lines,
@@ -490,6 +491,99 @@ fn build_entries_from_branches(args: &Args) -> Vec<WorkspaceEntry> {
         .collect()
 }
 
+/// At-launch check for detached sessions that need attention.
+///
+/// - Clean (host processes alive): offers reattach (removes marker → processes are
+///   killed and restarted by kill_orphaned_pids) or stop.
+/// - Dirty (host processes dead, Docker still running): offers a Docker cleanup.
+/// - Stale (nothing running): silently removes marker and PID file.
+///
+/// Returns Some((cfg, choices)) when the user chose to reattach a session.
+fn check_detached_sessions_at_launch(
+    ws_dir: &Path,
+    workspace_root: &Path,
+) -> Option<(WorkspaceConfig, Vec<ProductChoice>)> {
+    let workspaces = list_workspaces(ws_dir);
+    for w in workspaces {
+        if !detached_marker_path(&w.hash).exists() {
+            continue;
+        }
+        match workspace_run_status(&w.hash) {
+            WorkspaceRunStatus::Running | WorkspaceRunStatus::Degraded => {
+                let alive = alive_pid_count(&w.hash);
+                println!(
+                    "\n  Detached session still running: {}  {GRN}● {alive} process(es) alive{R}",
+                    w.summary()
+                );
+                print!("  [r] reattach   [s] stop   [Enter] ignore  ");
+                let _ = io::stdout().flush();
+                let mut answer = String::new();
+                let _ = io::stdin().read_line(&mut answer);
+                match answer.trim().to_ascii_lowercase().as_str() {
+                    "r" => {
+                        let _ = fs::remove_file(detached_marker_path(&w.hash));
+                        let choices = workspace_to_choices(&w, workspace_root);
+                        return Some((w, choices));
+                    }
+                    "s" => {
+                        shutdown_detached_session(&w.hash);
+                    }
+                    _ => {}
+                }
+            }
+            WorkspaceRunStatus::Failed | WorkspaceRunStatus::NotRunning => {
+                let docker_dirty = docker_running_for_workspace(&w.hash);
+                if docker_dirty {
+                    println!(
+                        "\n  Detached session is dirty: {}  {YLW}● host processes stopped, Docker containers still running{R}",
+                        w.summary()
+                    );
+                    print!("  [c] clean up Docker   [Enter] ignore  ");
+                    let _ = io::stdout().flush();
+                    let mut answer = String::new();
+                    let _ = io::stdin().read_line(&mut answer);
+                    if answer.trim().eq_ignore_ascii_case("c") {
+                        docker_down_workspace(&w.hash);
+                    }
+                }
+                let _ = fs::remove_file(detached_marker_path(&w.hash));
+                let _ = fs::remove_file(pid_file_path(&w.hash));
+            }
+        }
+    }
+    None
+}
+
+fn prompt_detached_shutdown(ws_dir: &Path) {
+    let workspaces = list_workspaces(ws_dir);
+    let active: Vec<WorkspaceConfig> = workspaces
+        .into_iter()
+        .filter(|w| {
+            detached_marker_path(&w.hash).exists()
+                && matches!(
+                    workspace_run_status(&w.hash),
+                    WorkspaceRunStatus::Running | WorkspaceRunStatus::Degraded
+                )
+        })
+        .collect();
+    if active.is_empty() {
+        return;
+    }
+    println!("\n  Detached session(s) still running:");
+    for w in &active {
+        println!("    • {}", w.summary());
+    }
+    print!("\n  Shut them down? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    let _ = io::stdin().read_line(&mut answer);
+    if answer.trim().eq_ignore_ascii_case("y") {
+        for w in active {
+            shutdown_detached_session(&w.hash);
+        }
+    }
+}
+
 fn build_new_workspace_interactive(
     workspace_root: &Path,
     ws_dir: &Path,
@@ -550,6 +644,10 @@ fn resolve_workspace(
         let choices = workspace_to_choices(&cfg, workspace_root);
         (cfg, choices, false)
     } else {
+        if let Some((cfg, choices)) = check_detached_sessions_at_launch(ws_dir, workspace_root) {
+            return (cfg, choices, false);
+        }
+
         let mut choices = 'selector: loop {
             let workspaces = list_workspaces(ws_dir);
             if workspaces.is_empty() {
@@ -568,6 +666,7 @@ fn resolve_workspace(
                     break default_product_choices(workspace_root);
                 }
                 WorkspaceAction::Quit => {
+                    prompt_detached_shutdown(ws_dir);
                     print!("\x1b[H\x1b[2J");
                     let _ = io::stdout().flush();
                     std::process::exit(0);
@@ -577,6 +676,7 @@ fn resolve_workspace(
         drain_input_events();
         let clean = match run_product_selector("", &mut choices) {
             LaunchMode::Quit => {
+                prompt_detached_shutdown(ws_dir);
                 print!("\x1b[H\x1b[2J");
                 let _ = io::stdout().flush();
                 std::process::exit(0);

@@ -31,6 +31,30 @@ pub fn mark_detached(slug: &str) {
     let _ = fs::write(detached_marker_path(slug), "");
 }
 
+/// Forcibly shut down a detached session: send SIGTERM to all recorded PIDs,
+/// wait up to 3 s, SIGKILL stragglers, then remove the PID file and marker.
+pub fn shutdown_detached_session(slug: &str) {
+    let path = pid_file_path(slug);
+    let pids: Vec<i32> = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    eprintln!("  [dev-launcher] Stopping detached session {slug}…");
+    for &pid in &pids {
+        unsafe { libc::kill(pid, libc::SIGTERM); }
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    for &pid in &pids {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            unsafe { libc::kill(pid, libc::SIGKILL); }
+        }
+    }
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(detached_marker_path(slug));
+    eprintln!("  [dev-launcher] Session {slug} stopped.");
+}
+
 /// Running status of a workspace derived from its PID file.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkspaceRunStatus {
@@ -61,6 +85,16 @@ pub fn workspace_run_status(slug: &str) -> WorkspaceRunStatus {
         n if n == pids.len() => WorkspaceRunStatus::Running,
         _ => WorkspaceRunStatus::Degraded,
     }
+}
+
+/// Count how many PIDs recorded in the session PID file are still alive.
+pub fn alive_pid_count(slug: &str) -> usize {
+    fs::read_to_string(pid_file_path(slug))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .filter(|&pid| unsafe { libc::kill(pid, 0) } == 0)
+        .count()
 }
 
 /// Kill any PIDs recorded in a leftover PID file from a crashed previous session.

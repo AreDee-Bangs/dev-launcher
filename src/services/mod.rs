@@ -4,7 +4,8 @@ pub mod process;
 
 pub use docker::{
     compose_host_port, docker_available, docker_compose_down, docker_compose_running_count,
-    docker_compose_up, docker_kill_by_name_fragment, opensearch_ready, parse_compose_container_names,
+    docker_compose_up, docker_down_workspace, docker_kill_by_name_fragment,
+    docker_running_for_workspace, opensearch_ready, parse_compose_container_names,
     replace_port_in_value, resolve_product_docker_for_down, run_blocking, run_blocking_logged,
     ensure_gitignore_entries, wait_for_opensearch, wipe_opencti_es_indices_if_stale,
     write_compose_override, ws_docker_project, DockerProject,
@@ -17,8 +18,9 @@ pub use manifest::{
     ManifestDocker, RepoManifest, SvcDef,
 };
 pub use process::{
-    compress_rotated_logs, detached_marker_path, kill_orphaned_pids, mark_detached, open_log,
-    pid_file_path, probe, record_pid, rotate_log, sighup_handler, spawn_svc, workspace_run_status,
+    alive_pid_count, compress_rotated_logs, detached_marker_path, kill_orphaned_pids,
+    mark_detached, open_log, pid_file_path, probe, record_pid, rotate_log, sighup_handler,
+    shutdown_detached_session, spawn_svc, workspace_run_status,
     Proc, WorkspaceRunStatus, SIGHUP_STOP,
 };
 
