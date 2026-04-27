@@ -1767,7 +1767,14 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                     logs_dir.join("copilot-frontend.log"),
                 );
                 if fe_dir.is_dir() {
-                    try_spawn!(svc, "yarn", &["dev"], &fe_dir, &HashMap::new());
+                    let fe_port_str = copilot_frontend_port.to_string();
+                    try_spawn!(
+                        svc,
+                        "yarn",
+                        &["dev", "--port", &fe_port_str],
+                        &fe_dir,
+                        &HashMap::new()
+                    );
                 }
             }
         }

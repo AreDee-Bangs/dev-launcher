@@ -29,9 +29,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Port step between workspaces — large enough so no port in the range 1025–15672
-/// from workspace N overlaps with any port from workspace N+1.
-pub const PORT_STEP: u16 = 15000;
+/// Port step between workspaces — each workspace gets a reserved block of 100 ports.
+pub const PORT_STEP: u16 = 100;
 
 // ── Workspace constants ───────────────────────────────────────────────────────
 
@@ -230,8 +229,8 @@ pub fn list_workspaces(dir: &Path) -> Vec<WorkspaceConfig> {
 }
 
 /// Return the smallest port offset (a multiple of [`PORT_STEP`]) not already
-/// claimed by any workspace in `ws_dir`.  Caps at 3 additional workspaces
-/// (offsets 0, 15000, 30000); falls back to 0 when the table is full.
+/// claimed by any workspace in `ws_dir`.  Caps at 9 extra workspaces
+/// (offsets 0, 100, 200, … 900); falls back to 0 when the table is full.
 pub fn find_free_offset(ws_dir: &Path) -> u16 {
     let taken: std::collections::HashSet<u16> =
         list_workspaces(ws_dir).into_iter().map(|c| c.port_offset).collect();
@@ -241,7 +240,7 @@ pub fn find_free_offset(ws_dir: &Path) -> u16 {
             return offset;
         }
         offset = offset.saturating_add(PORT_STEP);
-        if offset > 30000 {
+        if offset > 900 {
             return 0;
         }
     }
