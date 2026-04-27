@@ -29,7 +29,7 @@ use crossterm::{
 // ── Public re-exports from submodules ─────────────────────────────────────────
 
 use args::Args;
-use config::{load_config, resolve_workspace_root};
+use config::{load_config, read_line_or_interrupt, resolve_workspace_root};
 use diagnosis::{create_github_issue, diagnose_service, needs_recipe, DiagEvent, IssueContext};
 use services::{
     alive_pid_count, docker_available, docker_compose_down, docker_compose_up,
@@ -746,6 +746,41 @@ fn run_as_selector(args: &Args, workspace_root: &Path, ws_dir: &Path) {
     }
 }
 
+/// Ask (once per workspace) whether OpenCTI should connect to XTM One / Copilot.
+/// Saves `XTM_ONE_ENABLED=true/false` into the opencti workspace env so the
+/// answer persists across restarts without re-prompting.
+fn prompt_xtm_one_opencti_integration(opencti_env: &Path) {
+    let mut env = parse_env_file(opencti_env);
+    if env.contains_key("XTM_ONE_ENABLED") {
+        return; // Already answered for this workspace
+    }
+    println!();
+    println!(
+        "  {BOLD}OpenCTI + XTM One (Copilot) integration{R}"
+    );
+    println!("  {DIM}When enabled, OpenCTI will connect to the running Copilot instance{R}");
+    println!("  {DIM}using its platform registration token once it has started.{R}");
+    println!();
+    print!("  Enable XTM One integration in OpenCTI? [y/N] ");
+    let _ = io::stdout().flush();
+    let enabled = match read_line_or_interrupt() {
+        Some(l) => l.trim().eq_ignore_ascii_case("y"),
+        None => false,
+    };
+    env.insert(
+        "XTM_ONE_ENABLED".to_string(),
+        if enabled { "true" } else { "false" }.to_string(),
+    );
+    write_env_file(opencti_env, &env);
+    if enabled {
+        println!(
+            "  {GRN}✓{R}  Integration enabled — XTM One token will be injected when Copilot is up.\n"
+        );
+    } else {
+        println!("  {DIM}Integration disabled for this workspace.{R}\n");
+    }
+}
+
 fn build_new_workspace_interactive(
     workspace_root: &Path,
     ws_dir: &Path,
@@ -1127,6 +1162,10 @@ APP__ENCRYPTION_KEY=ChangeMe\n",
         );
         apply_port_offset_to_env(&env_path, "opencti", port_offset);
         run_env_wizard(&env_path, OPENCTI_ENV_VARS, "OpenCTI");
+        // Ask once whether to activate the XTM One integration when Copilot is co-launched.
+        if !no_copilot && paths.copilot.is_dir() {
+            prompt_xtm_one_opencti_integration(&env_path);
+        }
     } else if no_opencti {
         println!("  {DIM}OpenCTI skipped.{R}\n");
     }
@@ -2303,21 +2342,29 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                         let repo_file = paths
                             .opencti
                             .join("opencti-platform/opencti-graphql/.env.dev");
-                        if ws_file.exists() {
-                            let mut fenv = parse_env_file(&ws_file);
-                            fenv.insert("XTM__XTM_ONE_URL".to_string(), url.clone());
-                            fenv.insert(
-                                "XTM__XTM_ONE_TOKEN".to_string(),
-                                "xtm-default-registration-token".to_string(),
-                            );
-                            write_env_file(&ws_file, &fenv);
-                            deploy_workspace_env(&ws_file, &repo_file);
+
+                        let xtm_one_enabled = parse_env_file(&ws_file)
+                            .get("XTM_ONE_ENABLED")
+                            .is_some_and(|v| v == "true");
+
+                        if xtm_one_enabled {
+                            // Read the actual registration token from the Copilot workspace env
+                            // (falls back to the well-known dev default if not overridden).
+                            let copilot_ws = ws_env_path(&ws_env_dir, "copilot");
+                            let xtm_token = parse_env_file(&copilot_ws)
+                                .get("PLATFORM_REGISTRATION_TOKEN")
+                                .cloned()
+                                .unwrap_or_else(|| "xtm-default-registration-token".to_string());
+                            if ws_file.exists() {
+                                let mut fenv = parse_env_file(&ws_file);
+                                fenv.insert("XTM__XTM_ONE_URL".to_string(), url.clone());
+                                fenv.insert("XTM__XTM_ONE_TOKEN".to_string(), xtm_token.clone());
+                                write_env_file(&ws_file, &fenv);
+                                deploy_workspace_env(&ws_file, &repo_file);
+                            }
+                            cmd.env.insert("XTM__XTM_ONE_URL".to_string(), url.clone());
+                            cmd.env.insert("XTM__XTM_ONE_TOKEN".to_string(), xtm_token);
                         }
-                        cmd.env.insert("XTM__XTM_ONE_URL".to_string(), url.clone());
-                        cmd.env.insert(
-                            "XTM__XTM_ONE_TOKEN".to_string(),
-                            "xtm-default-registration-token".to_string(),
-                        );
                     }
                     "openaev-backend" => {
                         let ws_file = ws_env_path(&ws_env_dir, "openaev");
