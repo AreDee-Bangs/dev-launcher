@@ -40,12 +40,17 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
         let hash = format!("{DIM}[{}]{R}", ws.hash);
         let summary = ws.summary();
         let date = format!("{DIM}{}{R}", ws.created);
+        let offset_tag = if ws.port_offset > 0 {
+            format!("  {DIM}+{}{R}", ws.port_offset)
+        } else {
+            String::new()
+        };
         let summary_display = if summary.len() > 52 {
             format!("{}…", &summary[..51])
         } else {
             summary.clone()
         };
-        out.push(format!("  {marker}{hash}  {:<54}{date}", summary_display));
+        out.push(format!("  {marker}{hash}  {:<54}{date}{offset_tag}", summary_display));
     }
 
     let new_idx = workspaces.len();
@@ -316,7 +321,7 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
         print!("  Stopping {} Docker containers… ", entry.repo);
         let _ = io::stdout().flush();
 
-        let ws_override = write_compose_override(&compose_file, ws_hash);
+        let ws_override = write_compose_override(&compose_file, ws_hash, 0);
         let mut argv_ws: Vec<&str> = vec!["compose", "-p", &ws_project, "-f", file_str];
         let ov_str: String;
         if let Some(ref ov) = ws_override {
@@ -637,6 +642,7 @@ pub fn choices_to_workspace(choices: &[ProductChoice]) -> WorkspaceConfig {
         hash,
         created: today(),
         entries,
+        port_offset: 0,
     }
 }
 

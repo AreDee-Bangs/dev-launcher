@@ -56,17 +56,27 @@ pub fn parse_compose_container_names(compose_file: &Path) -> Vec<(String, String
     result
 }
 
-/// Write a compose override file next to `compose_file` that appends
-/// `{ws_hash[..8]}` to every explicit `container_name:`, so that multiple
-/// workspaces can run side-by-side without container name conflicts.
+/// Write a compose override file next to `compose_file` that:
+/// - Appends `{ws_hash[..8]}` to every explicit `container_name:` to prevent
+///   collisions between workspaces.
+/// - When `port_offset > 0`, also remaps every host port by adding `port_offset`
+///   so that Docker services from two concurrent workspaces bind different host
+///   ports.
 ///
-/// The file is written alongside the compose file (not in /tmp) so that it
-/// survives reboots and is always available for `docker compose up`.
-///
-/// Returns `None` if the compose file has no explicit container names.
-pub fn write_compose_override(compose_file: &Path, ws_hash: &str) -> Option<PathBuf> {
-    let mappings = parse_compose_container_names(compose_file);
-    if mappings.is_empty() {
+/// Returns `None` if there is nothing to override.
+pub fn write_compose_override(
+    compose_file: &Path,
+    ws_hash: &str,
+    port_offset: u16,
+) -> Option<PathBuf> {
+    let name_mappings = parse_compose_container_names(compose_file);
+    let port_bindings = if port_offset > 0 {
+        parse_compose_port_bindings(compose_file)
+    } else {
+        Vec::new()
+    };
+
+    if name_mappings.is_empty() && port_bindings.is_empty() {
         return None;
     }
 
@@ -74,14 +84,107 @@ pub fn write_compose_override(compose_file: &Path, ws_hash: &str) -> Option<Path
     let dir = compose_file.parent().unwrap_or(Path::new("."));
     let out_path = dir.join("docker-compose.override-devlauncher.yml");
 
-    let mut lines = vec!["services:".to_string()];
-    for (svc, cn) in &mappings {
-        lines.push(format!("  {}:", svc));
-        lines.push(format!("    container_name: {cn}-{suffix}"));
+    // Collect all service names that need an entry (union of both lists).
+    let mut seen = std::collections::HashSet::new();
+    let mut all_svcs: Vec<String> = Vec::new();
+    for (s, _) in &name_mappings {
+        if seen.insert(s.clone()) {
+            all_svcs.push(s.clone());
+        }
     }
+    for (s, _, _) in &port_bindings {
+        if seen.insert(s.clone()) {
+            all_svcs.push(s.clone());
+        }
+    }
+
+    let mut lines = vec!["services:".to_string()];
+    for svc in &all_svcs {
+        lines.push(format!("  {}:", svc));
+        if let Some((_, cn)) = name_mappings.iter().find(|(s, _)| s == svc) {
+            lines.push(format!("    container_name: {cn}-{suffix}"));
+        }
+        let svc_ports: Vec<_> = port_bindings
+            .iter()
+            .filter(|(s, _, _)| s == svc)
+            .collect();
+        if !svc_ports.is_empty() {
+            lines.push("    ports:".to_string());
+            for (_, host_port, cont_port) in &svc_ports {
+                let new_host = host_port.saturating_add(port_offset);
+                lines.push(format!("      - \"{new_host}:{cont_port}\""));
+            }
+        }
+    }
+
     fs::write(&out_path, lines.join("\n") + "\n").ok()?;
     ensure_gitignore_entries(dir, &["docker-compose.override-devlauncher.yml"]);
     Some(out_path)
+}
+
+/// Parse every `host:container` port binding in a docker-compose YAML file.
+/// Returns `(service_name, host_port, container_port)` triples.
+fn parse_compose_port_bindings(compose_file: &Path) -> Vec<(String, u16, u16)> {
+    let content = match fs::read_to_string(compose_file) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut result = Vec::new();
+    let mut in_svcs = false;
+    let mut cur_svc = String::new();
+    let mut in_ports = false;
+
+    for line in content.lines() {
+        if line == "services:" {
+            in_svcs = true;
+            continue;
+        }
+        if !in_svcs {
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let indent = line.len() - line.trim_start().len();
+
+        // Service name at 2-space indent
+        if indent == 2 {
+            if let Some(svc) = trimmed.strip_suffix(':') {
+                if !svc.is_empty() && !svc.contains(' ') {
+                    cur_svc = svc.to_string();
+                }
+            }
+            in_ports = false;
+            continue;
+        }
+
+        // Property keys at 4-space indent
+        if indent == 4 {
+            in_ports = trimmed == "ports:";
+            continue;
+        }
+
+        // Port list entries at 6-space indent
+        if in_ports && indent == 6 && trimmed.starts_with('-') {
+            let entry = trimmed
+                .trim_start_matches('-')
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            if let Some(pos) = entry.find(':') {
+                let host_s = entry[..pos].trim();
+                let cont_s = entry[pos + 1..].trim();
+                if let (Ok(h), Ok(c)) = (host_s.parse::<u16>(), cont_s.parse::<u16>()) {
+                    result.push((cur_svc.clone(), h, c));
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Append `patterns` to `<dir>/.gitignore` if not already present.
@@ -346,6 +449,57 @@ pub fn resolve_product_docker_for_down(
 
     let ws_proj = ws_docker_project(&base, ws_hash);
     Some((ws_proj, base, compose_file))
+}
+
+// ── OpenSearch / Elasticsearch readiness ─────────────────────────────────────
+
+/// Return `true` if Elasticsearch/OpenSearch at `port` is accepting HTTP
+/// connections (any response code counts — even a 503 "red" cluster is ready
+/// enough for opencti-graphql to start).  Uses a short 500 ms connect timeout
+/// so callers in the TUI event loop are not blocked for long.
+pub fn opensearch_ready(port: u16) -> bool {
+    let url = format!("http://localhost:{port}/_cluster/health");
+    match ureq::get(&url).timeout(Duration::from_millis(500)).call() {
+        Ok(_) | Err(ureq::Error::Status(_, _)) => true,
+        Err(_) => false,
+    }
+}
+
+/// Block until Elasticsearch/OpenSearch at `port` responds, or `max_secs` have
+/// elapsed.  Prints a one-time "waiting…" line while polling.  Returns `true`
+/// if ES became reachable before the timeout.
+///
+/// Safe to call from the main thread before the TUI starts (no lock held by
+/// other threads at that point).
+pub fn wait_for_opensearch(port: u16, max_secs: u64) -> bool {
+    use crate::tui::YLW;
+
+    let url = format!("http://localhost:{port}/_cluster/health");
+    let deadline = std::time::Instant::now() + Duration::from_secs(max_secs);
+    let mut ticks: u32 = 0;
+    loop {
+        match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
+            Ok(_) | Err(ureq::Error::Status(_, _)) => {
+                if ticks > 0 {
+                    println!("  {GRN}✓{R}  OpenSearch/ES ready on :{port}");
+                }
+                return true;
+            }
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        if ticks == 0 {
+            println!("  {DIM}Waiting for OpenSearch/ES on :{port}…{R}");
+        }
+        ticks += 1;
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    println!(
+        "  {YLW}⚠{R}  OpenSearch/ES did not respond within {max_secs}s — opencti-graphql may fail on startup"
+    );
+    false
 }
 
 // ── Elasticsearch index wipe ───────────────────────────────────────────────────

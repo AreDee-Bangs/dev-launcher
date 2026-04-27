@@ -696,6 +696,37 @@ pub fn run_manifest_bootstrap(repo_dir: &Path, manifest: &RepoManifest) -> bool 
             BootstrapDef::Check { path, missing_hint } => {
                 let full = repo_dir.join(path);
                 if !full.exists() {
+                    // Auto-create a Python venv rather than failing with a hint.
+                    if path.contains(".venv") && path.contains("python") {
+                        // Derive .venv dir and its parent (the backend cwd) from the path.
+                        // e.g. "backend/.venv/bin/python" → cwd=backend, venv=.venv
+                        let venv_dir = full
+                            .parent() // bin/
+                            .and_then(|p| p.parent()); // .venv/
+                        let work_dir = venv_dir
+                            .and_then(|v| v.parent()) // backend/
+                            .unwrap_or(repo_dir);
+                        let venv_name = venv_dir
+                            .and_then(|v| v.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(".venv");
+                        // Prefer a versioned python binary if the manifest specifies one.
+                        let python_cmd = manifest
+                            .python_version
+                            .as_deref()
+                            .map(|v| format!("python{v}"))
+                            .unwrap_or_else(|| "python3".to_string());
+                        println!("  {DIM}Creating Python venv ({venv_name}) with {python_cmd}…{R}");
+                        let code = run_blocking(&python_cmd, &["-m", "venv", venv_name], work_dir);
+                        if code != 0 {
+                            println!(
+                                "  {YLW}⚠{R}  Could not auto-create venv (exit {code})"
+                            );
+                            println!("  {DIM}    {missing_hint}{R}");
+                            ok = false;
+                        }
+                        continue;
+                    }
                     println!("  {YLW}⚠{R}  {missing_hint}");
                     ok = false;
                     continue;

@@ -34,11 +34,11 @@ use diagnosis::{create_github_issue, diagnose_service, needs_recipe, DiagEvent, 
 use services::{
     docker_available, docker_compose_down, docker_compose_up, ensure_opencti_env,
     ensure_opencti_graphql_python_deps, kill_orphaned_pids, load_repo_manifest,
-    patch_manifest_ports, pid_file_path, probe, read_compose_postgres_password, record_pid,
-    compress_rotated_logs, resolve_docker_project, rotate_log, run_blocking,
+    opensearch_ready, patch_manifest_ports, pid_file_path, probe, read_compose_postgres_password,
+    record_pid, compress_rotated_logs, resolve_docker_project, rotate_log, run_blocking,
     run_manifest_bootstrap, sighup_handler, spawn_svc, split_health_url_parts,
-    wipe_opencti_es_indices_if_stale, write_compose_override, ws_docker_project, DockerProject,
-    Health, Paths, Proc, SpawnCmd, State, SIGHUP_STOP,
+    wait_for_opensearch, wipe_opencti_es_indices_if_stale, write_compose_override, ws_docker_project,
+    DockerProject, Health, Paths, Proc, SpawnCmd, State, SIGHUP_STOP,
 };
 use tui::{
     build_credentials_lines, build_diagnose_lines, build_log_view_lines, build_overview_lines,
@@ -47,11 +47,11 @@ use tui::{
     BUILD_VERSION, CYN, DIM, GRN, R, RED, YLW,
 };
 use workspace::{
-    branch_to_slug, choices_to_workspace, compute_workspace_hash, current_branch,
-    current_commit_short, default_product_choices, deploy_workspace_env, discover_flags_in_dir,
-    ensure_worktree, extract_url_port, init_workspace_env, list_workspaces,
-    load_workspace, parse_env_file, patch_url_default, port_in_use, preflight_port_checks,
-    read_active_flags, read_env_url_port, run_env_wizard, run_flag_selector,
+    apply_port_offset_to_env, branch_to_slug, choices_to_workspace, compute_workspace_hash,
+    current_branch, current_commit_short, default_product_choices, deploy_workspace_env,
+    discover_flags_in_dir, ensure_worktree, extract_url_port, find_free_offset, init_workspace_env,
+    list_workspaces, load_workspace, parse_env_file, patch_url_default, port_in_use,
+    preflight_port_checks, read_active_flags, read_env_url_port, run_env_wizard, run_flag_selector,
     run_platform_mode_selector, run_product_selector, run_workspace_delete, run_workspace_selector,
     save_workspace, today, workspace_to_choices, workspaces_dir, write_active_flags, write_env_file,
     ws_env_path, FlagChoice, LaunchMode, PortCheck, ProductChoice, WorkspaceAction, WorkspaceConfig,
@@ -378,7 +378,7 @@ fn clean_docker_for_workspace(
         let file_str = compose_file.to_str().unwrap_or("");
 
         println!("    {DIM}─ (a) workspace-scoped down -v{R}");
-        let ws_override = write_compose_override(&compose_file, slug);
+        let ws_override = write_compose_override(&compose_file, slug, 0);
         let mut argv: Vec<&str> = vec!["compose", "-p", &ws_proj, "-f", file_str];
         let ov_str: String;
         if let Some(ref ov) = ws_override {
@@ -499,7 +499,8 @@ fn build_new_workspace_interactive(
         LaunchMode::Clean => true,
         LaunchMode::Normal => false,
     };
-    let cfg = choices_to_workspace(&choices);
+    let mut cfg = choices_to_workspace(&choices);
+    cfg.port_offset = find_free_offset(ws_dir);
     save_workspace(ws_dir, &cfg);
     (cfg, choices, clean)
 }
@@ -540,6 +541,7 @@ fn resolve_workspace(
                 hash: hash.clone(),
                 created: today(),
                 entries,
+                port_offset: find_free_offset(ws_dir),
             };
             save_workspace(ws_dir, &c);
             c
@@ -733,6 +735,21 @@ fn main() {
     let no_opencti_front = no_opencti || args.no_opencti_front;
     let no_openaev_front = no_openaev || args.no_openaev_front;
 
+    // ── Port offset — derives workspace-specific ports from the stored offset ──
+    let port_offset = workspace_cfg.port_offset;
+    // Elasticsearch/OpenSearch host port (workspace-specific)
+    let es_port: u16 = 9200u16.saturating_add(port_offset);
+    // opencti-graphql GraphQL server port
+    let opencti_gql_port: u16 = 4000u16.saturating_add(port_offset);
+    // openaev Spring Boot server port
+    let openaev_be_port: u16 = 8080u16.saturating_add(port_offset);
+    if port_offset > 0 {
+        println!(
+            "  {DIM}Port offset +{port_offset}  \
+             (opencti:{opencti_gql_port}  es:{es_port}  openaev:{openaev_be_port}){R}"
+        );
+    }
+
     if !no_opencti && paths.opencti.is_dir() {
         let gql_dir = paths.opencti.join("opencti-platform/opencti-graphql");
         let env_file = gql_dir.join(".env.dev");
@@ -824,6 +841,12 @@ fn main() {
         );
         patch_url_default(&env_path, "BASE_URL", 8000, 8100);
         patch_url_default(&env_path, "FRONTEND_URL", 3000, 3100);
+        // Apply workspace port offset (idempotent — no-op when offset is 0)
+        if port_offset > 0 {
+            patch_url_default(&env_path, "BASE_URL", 8100, 8100u16.saturating_add(port_offset));
+            patch_url_default(&env_path, "FRONTEND_URL", 3100, 3100u16.saturating_add(port_offset));
+            apply_port_offset_to_env(&env_path, "copilot", port_offset);
+        }
         run_platform_mode_selector(&env_path, &stopping);
         run_env_wizard(&env_path, COPILOT_ENV_VARS, "Copilot");
     } else if no_copilot {
@@ -844,6 +867,7 @@ APP__ADMIN__PASSWORD=ChangeMe\n\
 APP__ADMIN__TOKEN=ChangeMe\n\
 APP__ENCRYPTION_KEY=ChangeMe\n",
         );
+        apply_port_offset_to_env(&env_path, "opencti", port_offset);
         run_env_wizard(&env_path, OPENCTI_ENV_VARS, "OpenCTI");
     } else if no_opencti {
         println!("  {DIM}OpenCTI skipped.{R}\n");
@@ -859,18 +883,17 @@ APP__ENCRYPTION_KEY=ChangeMe\n",
             &templates,
             "# OpenAEV dev environment\n",
         );
+        apply_port_offset_to_env(&env_path, "openaev", port_offset);
     } else if no_openaev {
         println!("  {DIM}OpenAEV skipped.{R}\n");
     }
 
     if !no_connector && paths.connector.is_dir() {
         let env_path = ws_env_path(&ws_env_dir, "connector");
-        init_workspace_env(
-            &env_path,
-            Some(&paths.connector.join(".env.dev")),
-            &[],
+        let opencti_url_default = format!("http://localhost:{opencti_gql_port}");
+        let connector_hardcoded = format!(
             "# Connector dev environment — fill in before running\n\
-OPENCTI_URL=http://localhost:4000\n\
+OPENCTI_URL={opencti_url_default}\n\
 OPENCTI_TOKEN=ChangeMe\n\
 CONNECTOR_TYPE=INTERNAL_IMPORT_FILE\n\
 CONNECTOR_ID=54263257-26dc-4cca-8c45-deea44cdecf1\n\
@@ -881,8 +904,15 @@ CONNECTOR_LOG_LEVEL=debug\n\
 CONNECTOR_WEB_SERVICE_URL=https://importdoc.ariane.testing.filigran.io\n\
 IMPORT_DOCUMENT_CREATE_INDICATOR=false\n\
 IMPORT_DOCUMENT_INCLUDE_RELATIONSHIPS=true\n\
-CONNECTOR_LICENCE_KEY_PEM=\n",
+CONNECTOR_LICENCE_KEY_PEM=\n"
         );
+        init_workspace_env(
+            &env_path,
+            Some(&paths.connector.join(".env.dev")),
+            &[],
+            &connector_hardcoded,
+        );
+        apply_port_offset_to_env(&env_path, "connector", port_offset);
     }
 
     if !no_opencti && !no_connector {
@@ -1021,7 +1051,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 (f, ws_docker_project("copilot-dev", &slug))
             };
             if dc.exists() {
-                let ov = write_compose_override(&dc, &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
                 let ov_str = ov
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -1052,7 +1082,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     .and_then(|m| m.docker.project.clone())
                     .unwrap_or_else(|| "opencti-dev".to_string());
                 let project = ws_docker_project(&base, &slug);
-                let ov = write_compose_override(&dc, &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
                 let ov_str = ov
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -1083,7 +1113,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     .and_then(|m| m.docker.project.clone())
                     .unwrap_or_else(|| "openaev-dev".to_string());
                 let project = ws_docker_project(&base, &slug);
-                let ov = write_compose_override(&dc, &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
                 let ov_str = ov
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -1107,7 +1137,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
             let dc = paths.grafana.join("docker-compose.dev.yml");
             if dc.exists() {
                 let project = ws_docker_project("grafana-dev", &slug);
-                let ov = write_compose_override(&dc, &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
                 let ov_str = ov
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -1137,7 +1167,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
             let dc = paths.langfuse.join("docker-compose.dev.yml");
             if dc.exists() {
                 let project = ws_docker_project("langfuse-dev", &slug);
-                let ov = write_compose_override(&dc, &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
                 let ov_str = ov
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -1441,7 +1471,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 .unwrap_or(false);
             let mut svc = services::Svc::new(
                 "opencti-graphql",
-                Some("http://localhost:4000"),
+                Some(format!("http://localhost:{opencti_gql_port}")),
                 "/health",
                 300,
                 logs_dir.join("opencti-graphql.log"),
@@ -1469,7 +1499,8 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     svc.health = Health::Degraded("Waiting for copilot-backend…".into());
                     svcs.push(svc);
                 } else {
-                    wipe_opencti_es_indices_if_stale(9200);
+                    wait_for_opensearch(es_port, 120);
+                    wipe_opencti_es_indices_if_stale(es_port);
                     try_spawn!(svc, "yarn", &["start"], &gql_dir, &gql_env);
                 }
             }
@@ -1479,7 +1510,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 ensure_opencti_fe_deps(&front_dir);
                 let mut svc = services::Svc::new(
                     "opencti-frontend",
-                    Some("http://localhost:3000"),
+                    Some(format!("http://localhost:{}", 3000u16.saturating_add(port_offset))),
                     "",
                     120,
                     logs_dir.join("opencti-frontend.log"),
@@ -1506,11 +1537,23 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
         // OpenAEV
         if !no_openaev && paths.openaev.is_dir() {
             let mvn = maven_cmd(&paths.openaev);
+            let mvn_available = if mvn == "mvn" {
+                Command::new("mvn")
+                    .arg("--version")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            } else {
+                PathBuf::from(&mvn).exists()
+            };
             let api_dir = paths.openaev.join("openaev-api");
 
             let mut svc = services::Svc::new(
                 "openaev-backend",
-                Some("http://localhost:8080"),
+                Some(format!("http://localhost:{openaev_be_port}")),
                 "/api/health?health_access_key=ChangeMe",
                 180,
                 logs_dir.join("openaev-backend.log"),
@@ -1518,6 +1561,11 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
             if !openaev_docker_ok {
                 svc.health =
                     Health::Degraded("Docker deps not running — start Docker first".into());
+                svcs.push(svc);
+            } else if !mvn_available {
+                svc.health = Health::Degraded(
+                    "Maven not found — install with 'brew install maven'".into(),
+                );
                 svcs.push(svc);
             } else if api_dir.is_dir() {
                 if !no_copilot && paths.copilot.is_dir() {
@@ -1843,10 +1891,21 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
             for p in &mut procs {
                 if let Some(code) = p.try_reap() {
                     let already_crashed = matches!(svcs[p.idx].health, Health::Crashed(_));
-                    svcs[p.idx].health = Health::Crashed(code);
+                    // If opencti-graphql crashes while ES is down, auto-defer so the
+                    // auto-spawn loop re-launches it once ES recovers.
+                    if svcs[p.idx].name == "opencti-graphql"
+                        && svcs[p.idx].spawn_cmd.is_some()
+                        && !opensearch_ready(es_port)
+                    {
+                        svcs[p.idx].health =
+                            Health::Degraded("Waiting for OpenSearch/ES…".into());
+                    } else {
+                        svcs[p.idx].health = Health::Crashed(code);
+                    }
                     force_render = true;
 
-                    if !already_crashed && !diagnosed.contains(&p.idx) {
+                    let is_real_crash = matches!(svcs[p.idx].health, Health::Crashed(_));
+                    if !already_crashed && !diagnosed.contains(&p.idx) && is_real_crash {
                         diagnosed.insert(p.idx);
                         let log_path = svcs[p.idx].log_path.clone();
                         let svc_idx = p.idx;
@@ -1937,10 +1996,17 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
             (candidates, url)
         };
         for (idx, svc_name, mut cmd, log_path) in spawn_candidates {
+            // Before spawning opencti-graphql, ensure ES is accepting connections.
+            // If not ready yet, defer to the next loop tick rather than crashing.
+            if svc_name == "opencti-graphql" && !opensearch_ready(es_port) {
+                let mut svcs = state.lock().unwrap();
+                svcs[idx].health = Health::Degraded("Waiting for OpenSearch/ES…".into());
+                continue;
+            }
             if let Some(ref url) = copilot_frontend_url {
                 match svc_name.as_str() {
                     "opencti-graphql" => {
-                        wipe_opencti_es_indices_if_stale(9200);
+                        wipe_opencti_es_indices_if_stale(es_port);
                         let ws_file = ws_env_path(&ws_env_dir, "opencti");
                         let repo_file = paths
                             .opencti
@@ -2094,12 +2160,23 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                         }
                                         procs.remove(pos);
                                     }
+                                    let svc_name = {
+                                        let svcs = state.lock().unwrap();
+                                        svcs.get(idx).map(|s| s.name.clone()).unwrap_or_default()
+                                    };
                                     let docker_ok = !cmd.requires_docker || docker_available();
                                     if !docker_ok {
                                         let mut svcs = state.lock().unwrap();
                                         svcs[idx].health = Health::Degraded(
                                             "Docker not running — start Docker first".into(),
                                         );
+                                    } else if svc_name == "opencti-graphql"
+                                        && !opensearch_ready(es_port)
+                                    {
+                                        // ES is still booting — defer to auto-spawn loop
+                                        let mut svcs = state.lock().unwrap();
+                                        svcs[idx].health =
+                                            Health::Degraded("Waiting for OpenSearch/ES…".into());
                                     } else {
                                         let args: Vec<&str> =
                                             cmd.args.iter().map(|s| s.as_str()).collect();

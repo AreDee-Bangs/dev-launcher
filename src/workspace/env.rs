@@ -360,6 +360,139 @@ pub fn preflight_port_checks(env_path: &Path, compose_file: &Path, checks: &[Por
     }
 }
 
+// ── Port offset application ───────────────────────────────────────────────────
+
+/// Patch the workspace `.env` file for `product` so every default port has
+/// `port_offset` added to it.  Safe to call on re-launches — only rewrites the
+/// file when a change is needed.
+pub fn apply_port_offset_to_env(env_path: &Path, product: &str, port_offset: u16) {
+    if port_offset == 0 || !env_path.exists() {
+        return;
+    }
+    let mut map = parse_env_file(env_path);
+    let mut changed = false;
+
+    match product {
+        "copilot" => {
+            // Database: default host port 5432
+            changed |= shift_url_port(&mut map, "DATABASE_URL", 5432, port_offset);
+            // Redis: preflight_port_checks already moved 6379→6380 (compose maps 6380:6379)
+            changed |= shift_url_port(&mut map, "REDIS_URL", 6380, port_offset);
+            // MinIO: preflight_port_checks already moved 9000→9002 (compose maps 9002:9000)
+            changed |= shift_url_port(&mut map, "S3_ENDPOINT", 9002, port_offset);
+            // BASE_URL and FRONTEND_URL are handled by patch_url_default in main.rs
+        }
+        "opencti" => {
+            // GraphQL server port
+            changed |= shift_plain_port(&mut map, "APP__PORT", 4000, port_offset);
+            // Elasticsearch: inject if absent, patch if present at default port
+            changed |= shift_or_inject_url(
+                &mut map,
+                "APP__ELASTICSEARCH__URL",
+                "http://localhost",
+                9200,
+                port_offset,
+            );
+            // Redis port (plain number)
+            changed |= shift_plain_port(&mut map, "APP__REDIS__PORT", 6379, port_offset);
+            // RabbitMQ port (plain number)
+            changed |= shift_plain_port(&mut map, "APP__RABBITMQ__PORT", 5672, port_offset);
+            // MinIO port (plain number)
+            changed |= shift_plain_port(&mut map, "APP__MINIO__PORT", 9000, port_offset);
+        }
+        "openaev" => {
+            // Spring Boot server port
+            changed |= shift_plain_port(&mut map, "SERVER_PORT", 8080, port_offset);
+        }
+        "connector" => {
+            // OpenCTI GraphQL URL used by the connector
+            changed |= shift_url_port(&mut map, "OPENCTI_URL", 4000, port_offset);
+        }
+        _ => {}
+    }
+
+    if changed {
+        write_env_file(env_path, &map);
+    }
+}
+
+/// Shift a URL-valued key's port from `from_port` to `from_port + offset`.
+/// No-ops when the key is absent, empty, or already at the target port.
+fn shift_url_port(
+    map: &mut HashMap<String, String>,
+    key: &str,
+    from_port: u16,
+    offset: u16,
+) -> bool {
+    let to_port = from_port.saturating_add(offset);
+    let val = match map.get(key) {
+        Some(v) if !v.is_empty() => v.clone(),
+        _ => return false,
+    };
+    if extract_url_port(&val) != Some(from_port) {
+        return false;
+    }
+    let patched = replace_port_in_value(&val, to_port);
+    if patched == val {
+        return false;
+    }
+    map.insert(key.to_string(), patched);
+    true
+}
+
+/// Shift a plain-number port key.  Writes `from_port + offset` when the key is
+/// absent (uses `from_port` as default) or currently equals `from_port`.
+fn shift_plain_port(
+    map: &mut HashMap<String, String>,
+    key: &str,
+    from_port: u16,
+    offset: u16,
+) -> bool {
+    let to_port = from_port.saturating_add(offset);
+    let cur = map
+        .get(key)
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(from_port);
+    if cur == to_port {
+        return false;
+    }
+    if cur != from_port {
+        return false; // user has a custom value — leave it alone
+    }
+    map.insert(key.to_string(), to_port.to_string());
+    true
+}
+
+/// Like `shift_url_port` but injects a `{base}:{from_port + offset}` value when
+/// the key is absent (so that services that read from `default.json` get the
+/// correct port injected into the environment).
+fn shift_or_inject_url(
+    map: &mut HashMap<String, String>,
+    key: &str,
+    base: &str,
+    from_port: u16,
+    offset: u16,
+) -> bool {
+    let to_port = from_port.saturating_add(offset);
+    match map.get(key) {
+        Some(v) if !v.is_empty() => {
+            if extract_url_port(v) == Some(to_port) {
+                return false; // already correct
+            }
+            if extract_url_port(v) != Some(from_port) {
+                return false; // custom value — leave alone
+            }
+            let patched = replace_port_in_value(v, to_port);
+            map.insert(key.to_string(), patched);
+            true
+        }
+        _ => {
+            map.insert(key.to_string(), format!("{base}:{to_port}"));
+            true
+        }
+    }
+}
+
 // ── Platform mode selector ────────────────────────────────────────────────────
 
 /// Interactive platform-mode selector shown when Copilot runs standalone (no OpenCTI).
