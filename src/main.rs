@@ -1105,6 +1105,35 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
         println!("  {DIM}Services that need infrastructure containers will start in Degraded state.{R}\n");
     }
 
+    let maven_ok = if !no_openaev && paths.openaev.is_dir() {
+        let mvn = maven_cmd(&paths.openaev);
+        print!("  Checking Maven… ");
+        let _ = io::stdout().flush();
+        let available = if mvn == "mvn" {
+            Command::new("mvn")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            PathBuf::from(&mvn).exists()
+        };
+        if available {
+            println!("{GRN}ok{R}");
+        } else {
+            println!("{RED}not found{R}");
+            println!("  {YLW}Install Maven before launching the stack:{R}");
+            println!("    brew install maven");
+            println!("  {DIM}openaev-backend will start in Degraded state.{R}\n");
+        }
+        available
+    } else {
+        true
+    };
+
     let copilot_env_path = ws_env_path(&ws_env_dir, "copilot");
     let copilot_backend_port = read_env_url_port(&copilot_env_path, "BASE_URL", 8100);
     let copilot_frontend_port = read_env_url_port(&copilot_env_path, "FRONTEND_URL", 3100);
@@ -1638,18 +1667,6 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
         // OpenAEV
         if !no_openaev && paths.openaev.is_dir() {
             let mvn = maven_cmd(&paths.openaev);
-            let mvn_available = if mvn == "mvn" {
-                Command::new("mvn")
-                    .arg("--version")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-            } else {
-                PathBuf::from(&mvn).exists()
-            };
             let api_dir = paths.openaev.join("openaev-api");
 
             let mut svc = services::Svc::new(
@@ -1663,7 +1680,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                 svc.health =
                     Health::Degraded("Docker deps not running — start Docker first".into());
                 svcs.push(svc);
-            } else if !mvn_available {
+            } else if !maven_ok {
                 svc.health = Health::Degraded(
                     "Maven not found — install with 'brew install maven'".into(),
                 );
