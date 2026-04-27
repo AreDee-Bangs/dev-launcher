@@ -19,8 +19,9 @@ pub use manifest::{
 };
 pub use process::{
     alive_pid_count, compress_rotated_logs, detached_marker_path, kill_orphaned_pids,
-    mark_detached, open_log, pid_file_path, probe, record_pid, rotate_log, sighup_handler,
-    shutdown_detached_session, spawn_svc, workspace_run_status,
+    mark_detached, open_log, pid_file_path, probe, read_worker_pid, record_pid, remove_worker_pid,
+    rotate_log, sighup_handler, shutdown_detached_session, spawn_svc, worker_pid_path,
+    workspace_run_status, write_worker_pid,
     Proc, WorkspaceRunStatus, SIGHUP_STOP,
 };
 

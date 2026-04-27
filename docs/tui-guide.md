@@ -152,37 +152,45 @@ Services that depend on others show `pending` in the health column until their p
 
 ## Detaching from a session
 
-Pressing `M` in Overview mode exits the TUI without stopping the stack. Host processes and Docker containers keep running in the background. A detach marker is written so that `dev-launcher` knows the session is intentional and does not kill it on the next launch.
+Pressing `m` or `M` in Overview mode detaches from the session without stopping any services. The TUI exits and control returns to the workspace selector. The session worker process pauses (via `SIGSTOP`) so it consumes no CPU while detached. All spawned processes and Docker containers keep running.
 
-The workspace selector shows a green dot next to a running detached session.
+The workspace selector shows a **cyan dot** (`●`) next to a detached session.
 
 ---
 
-## At-launch detached session check
+## Multi-session architecture
 
-When the workspace selector is shown, `dev-launcher` inspects every workspace that has a detach marker and prompts for action if needed:
+Each session runs as a separate child process (a session worker). The workspace selector is the parent process and can manage multiple paused workers simultaneously.
+
+| Selector action | Effect |
+|---|---|
+| Select a workspace with a cyan dot | Reattaches -- sends `SIGCONT` to the paused worker, which resumes its TUI |
+| Press `r` on a detached workspace | Same as selecting it (reattach) |
+| Press `s` on a detached workspace | Terminates the session worker without deleting the workspace |
+| Press `d` on any workspace | Full workspace deletion (stops the session first if detached) |
+| Press `q` / `Esc` | Offers to shut down any still-detached sessions, then exits |
+
+---
+
+## At-launch orphan check
+
+When `dev-launcher` starts fresh, it inspects every workspace that has a detach marker and prompts for action if needed:
 
 | Session state | What you see | Options |
 |---|---|---|
-| **Clean** -- all host processes still alive | `● N process(es) alive` (green) | `[r]` reattach, `[s]` stop, `Enter` ignore |
-| **Dirty** -- host processes stopped, Docker containers still running | `● host processes stopped, Docker containers still running` (yellow) | `[c]` clean up Docker, `Enter` ignore (removes stale marker) |
+| **Stopped worker** from a crashed previous selector | `[dev-launcher] Found stopped session ... Terminating.` | Terminated automatically |
+| **Dirty** -- host processes dead, Docker containers still running | `● host processes stopped, Docker containers still running` (yellow) | `[c]` clean up Docker, `Enter` ignore |
 | **Stale** -- nothing running at all | (silent) | Marker and PID file removed automatically |
 
-**Reattach** removes the detach marker so that `kill_orphaned_pids` cleanly stops the old processes before the session restarts. Docker containers are left running across the restart, so startup is fast.
-
-**Clean up** calls `docker compose -p <project> down` for all product containers associated with the workspace, then removes the marker and PID file. No compose file is required -- Docker Compose v2 locates containers by project label.
-
-If multiple sessions need attention, they are handled one by one before the workspace selector appears.
+**Clean up** calls `docker compose -p <project> down` for all product containers associated with the workspace. No compose file is required -- Docker Compose v2 locates containers by project label.
 
 ---
 
 ## Shutdown
 
-Pressing `q` in any mode stops all services and returns to the workspace/product selector so you can switch products or branches without relaunching the binary.
+Pressing `q` in any mode stops all services and returns to the workspace selector so you can switch products or branches.
 
-Pressing `Ctrl+C` performs the same graceful shutdown and then exits the process entirely.
-
-When quitting from the workspace or product selector, `dev-launcher` checks for detached sessions still running and offers to stop them before exiting.
+Pressing `Ctrl+C` performs the same graceful shutdown and exits the process.
 
 The shutdown sequence is:
 
@@ -190,6 +198,6 @@ The shutdown sequence is:
 2. A grace period allows in-flight requests to complete (5 s by default; 180 s for `opencti-graphql`).
 3. Any process that has not exited by the deadline receives `SIGKILL`.
 4. Docker Compose projects are stopped via `docker compose -p <project> down` (project-name lookup -- no dependency on temporary override files).
-5. The TUI exits or returns to the selector.
+5. The TUI exits and the session worker process terminates, returning control to the workspace selector.
 
-On the next launch, `dev-launcher` detects orphaned PIDs from the previous session and kills them before starting new processes.
+On the next launch, `dev-launcher` detects orphaned PIDs from a crashed previous session and kills them before starting new processes.

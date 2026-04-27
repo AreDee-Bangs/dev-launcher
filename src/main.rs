@@ -36,10 +36,11 @@ use services::{
     docker_down_workspace, docker_running_for_workspace, ensure_opencti_env,
     ensure_opencti_graphql_python_deps, kill_orphaned_pids, load_repo_manifest,
     mark_detached, detached_marker_path, opensearch_ready, patch_manifest_ports, pid_file_path,
-    probe, read_compose_postgres_password, record_pid, compress_rotated_logs,
-    resolve_docker_project, rotate_log, run_blocking, run_manifest_bootstrap, sighup_handler,
-    shutdown_detached_session, spawn_svc, split_health_url_parts, wait_for_opensearch,
-    wipe_opencti_es_indices_if_stale, workspace_run_status, write_compose_override, ws_docker_project,
+    probe, read_compose_postgres_password, read_worker_pid, record_pid, compress_rotated_logs,
+    remove_worker_pid, resolve_docker_project, rotate_log, run_blocking, run_manifest_bootstrap,
+    sighup_handler, shutdown_detached_session, spawn_svc, split_health_url_parts,
+    wait_for_opensearch, wipe_opencti_es_indices_if_stale, workspace_run_status,
+    write_compose_override, write_worker_pid, ws_docker_project,
     DockerProject, Health, Paths, Proc, SpawnCmd, State, WorkspaceRunStatus, SIGHUP_STOP,
 };
 use tui::{
@@ -491,95 +492,256 @@ fn build_entries_from_branches(args: &Args) -> Vec<WorkspaceEntry> {
         .collect()
 }
 
-/// At-launch check for detached sessions that need attention.
-///
-/// - Clean (host processes alive): offers reattach (removes marker → processes are
-///   killed and restarted by kill_orphaned_pids) or stop.
-/// - Dirty (host processes dead, Docker still running): offers a Docker cleanup.
-/// - Stale (nothing running): silently removes marker and PID file.
-///
-/// Returns Some((cfg, choices)) when the user chose to reattach a session.
-fn check_detached_sessions_at_launch(
-    ws_dir: &Path,
-    workspace_root: &Path,
-) -> Option<(WorkspaceConfig, Vec<ProductChoice>)> {
-    let workspaces = list_workspaces(ws_dir);
-    for w in workspaces {
-        if !detached_marker_path(&w.hash).exists() {
+// ── Subprocess session management ────────────────────────────────────────────
+
+struct StoppedSession {
+    hash: String,
+    pid: u32,
+}
+
+fn spawn_session_worker(exe: &Path, hash: &str, clean: bool) -> u32 {
+    let mut cmd = Command::new(exe);
+    cmd.arg("--session-worker").arg("--workspace").arg(hash);
+    if clean {
+        cmd.arg("--clean-start");
+    }
+    let child = cmd.spawn().expect("failed to spawn session worker");
+    let pid = child.id();
+    std::mem::forget(child);
+    pid
+}
+
+fn wait_for_session(pid: u32, hash: &str, stopped: &mut Vec<StoppedSession>) -> bool {
+    loop {
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WUNTRACED) };
+        if ret <= 0 {
+            return false;
+        }
+        if libc::WIFEXITED(status) {
+            return libc::WEXITSTATUS(status) == 0;
+        }
+        if libc::WIFSIGNALED(status) {
+            return false;
+        }
+        if libc::WIFSTOPPED(status) {
+            stopped.push(StoppedSession { hash: hash.to_string(), pid });
+            return true;
+        }
+    }
+}
+
+fn startup_orphan_check(ws_dir: &Path, _workspace_root: &Path) {
+    for ws in list_workspaces(ws_dir) {
+        if !detached_marker_path(&ws.hash).exists() {
             continue;
         }
-        match workspace_run_status(&w.hash) {
+
+        if let Some(worker_pid) = read_worker_pid(&ws.hash) {
+            let alive = unsafe { libc::kill(worker_pid as libc::pid_t, 0) } == 0;
+            if alive {
+                eprintln!(
+                    "  [dev-launcher] Stopped session {} found (previous selector exited). Terminating.",
+                    ws.hash
+                );
+                unsafe { libc::kill(worker_pid as libc::pid_t, libc::SIGTERM); }
+                thread::sleep(Duration::from_millis(300));
+                unsafe { libc::kill(worker_pid as libc::pid_t, libc::SIGKILL); }
+                remove_worker_pid(&ws.hash);
+                let _ = fs::remove_file(detached_marker_path(&ws.hash));
+                continue;
+            } else {
+                remove_worker_pid(&ws.hash);
+            }
+        }
+
+        match workspace_run_status(&ws.hash) {
             WorkspaceRunStatus::Running | WorkspaceRunStatus::Degraded => {
-                let alive = alive_pid_count(&w.hash);
+                let alive = alive_pid_count(&ws.hash);
                 println!(
                     "\n  Detached session still running: {}  {GRN}● {alive} process(es) alive{R}",
-                    w.summary()
+                    ws.summary()
                 );
-                print!("  [r] reattach   [s] stop   [Enter] ignore  ");
+                print!("  [s] stop   [Enter] ignore  ");
                 let _ = io::stdout().flush();
                 let mut answer = String::new();
                 let _ = io::stdin().read_line(&mut answer);
-                match answer.trim().to_ascii_lowercase().as_str() {
-                    "r" => {
-                        let _ = fs::remove_file(detached_marker_path(&w.hash));
-                        let choices = workspace_to_choices(&w, workspace_root);
-                        return Some((w, choices));
-                    }
-                    "s" => {
-                        shutdown_detached_session(&w.hash);
-                    }
-                    _ => {}
+                if answer.trim().eq_ignore_ascii_case("s") {
+                    shutdown_detached_session(&ws.hash);
                 }
+                let _ = fs::remove_file(detached_marker_path(&ws.hash));
             }
             WorkspaceRunStatus::Failed | WorkspaceRunStatus::NotRunning => {
-                let docker_dirty = docker_running_for_workspace(&w.hash);
-                if docker_dirty {
+                if docker_running_for_workspace(&ws.hash) {
                     println!(
                         "\n  Detached session is dirty: {}  {YLW}● host processes stopped, Docker containers still running{R}",
-                        w.summary()
+                        ws.summary()
                     );
                     print!("  [c] clean up Docker   [Enter] ignore  ");
                     let _ = io::stdout().flush();
                     let mut answer = String::new();
                     let _ = io::stdin().read_line(&mut answer);
                     if answer.trim().eq_ignore_ascii_case("c") {
-                        docker_down_workspace(&w.hash);
+                        docker_down_workspace(&ws.hash);
                     }
                 }
-                let _ = fs::remove_file(detached_marker_path(&w.hash));
-                let _ = fs::remove_file(pid_file_path(&w.hash));
+                let _ = fs::remove_file(detached_marker_path(&ws.hash));
+                let _ = fs::remove_file(pid_file_path(&ws.hash));
             }
         }
     }
-    None
 }
 
-fn prompt_detached_shutdown(ws_dir: &Path) {
-    let workspaces = list_workspaces(ws_dir);
-    let active: Vec<WorkspaceConfig> = workspaces
-        .into_iter()
-        .filter(|w| {
-            detached_marker_path(&w.hash).exists()
-                && matches!(
-                    workspace_run_status(&w.hash),
-                    WorkspaceRunStatus::Running | WorkspaceRunStatus::Degraded
-                )
-        })
-        .collect();
-    if active.is_empty() {
+fn run_as_selector(args: &Args, workspace_root: &Path, ws_dir: &Path) {
+    print!("\x1b[H\x1b[2J");
+    let _ = io::stdout().flush();
+
+    let selector_stopping = Arc::new(AtomicBool::new(false));
+    {
+        let f = Arc::clone(&selector_stopping);
+        ctrlc::set_handler(move || f.store(true, Ordering::Relaxed))
+            .expect("failed to set Ctrl+C handler");
+    }
+
+    let exe = std::env::current_exe().expect("cannot determine current executable path");
+    let mut stopped: Vec<StoppedSession> = Vec::new();
+
+    let has_direct = args.workspace.is_some()
+        || args.copilot_branch.is_some() || args.opencti_branch.is_some()
+        || args.openaev_branch.is_some() || args.connector_branch.is_some()
+        || args.copilot_commit.is_some() || args.opencti_commit.is_some()
+        || args.openaev_commit.is_some() || args.connector_commit.is_some()
+        || args.copilot_worktree.is_some() || args.opencti_worktree.is_some()
+        || args.openaev_worktree.is_some() || args.connector_worktree.is_some();
+
+    if has_direct {
+        let (cfg, _, _) = resolve_workspace(args, workspace_root, ws_dir);
+        loop {
+            if selector_stopping.load(Ordering::Relaxed) { break; }
+            let pid = spawn_session_worker(&exe, &cfg.hash, args.clean_start);
+            wait_for_session(pid, &cfg.hash, &mut stopped);
+            if selector_stopping.load(Ordering::Relaxed) { break; }
+        }
+        for s in &stopped {
+            unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+        }
         return;
     }
-    println!("\n  Detached session(s) still running:");
-    for w in &active {
-        println!("    • {}", w.summary());
-    }
-    print!("\n  Shut them down? [y/N] ");
-    let _ = io::stdout().flush();
-    let mut answer = String::new();
-    let _ = io::stdin().read_line(&mut answer);
-    if answer.trim().eq_ignore_ascii_case("y") {
-        for w in active {
-            shutdown_detached_session(&w.hash);
+
+    startup_orphan_check(ws_dir, workspace_root);
+
+    'selector: loop {
+        if selector_stopping.load(Ordering::Relaxed) {
+            for s in &stopped {
+                unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+            }
+            print!("\x1b[H\x1b[2J");
+            let _ = io::stdout().flush();
+            break;
+        }
+
+        ensure_cooked_output();
+        let stopped_hashes: HashSet<String> = stopped.iter().map(|s| s.hash.clone()).collect();
+
+        let workspaces = list_workspaces(ws_dir);
+        if workspaces.is_empty() {
+            let (cfg, _, clean) = build_new_workspace_interactive(workspace_root, ws_dir);
+            let pid = spawn_session_worker(&exe, &cfg.hash, clean);
+            wait_for_session(pid, &cfg.hash, &mut stopped);
+            continue 'selector;
+        }
+
+        drain_input_events();
+        let action = loop {
+            let workspaces = list_workspaces(ws_dir);
+            match run_workspace_selector(&workspaces, &stopped_hashes) {
+                WorkspaceAction::Delete(cfg) => {
+                    if let Some(pos) = stopped.iter().position(|s| s.hash == cfg.hash) {
+                        let s = stopped.remove(pos);
+                        unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+                        thread::sleep(Duration::from_millis(500));
+                        unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGKILL); }
+                        let _ = fs::remove_file(detached_marker_path(&s.hash));
+                        remove_worker_pid(&s.hash);
+                    }
+                    run_workspace_delete(&cfg, workspace_root, ws_dir);
+                }
+                other => break other,
+            }
+        };
+
+        match action {
+            WorkspaceAction::Reattach(cfg) => {
+                if let Some(pos) = stopped.iter().position(|s| s.hash == cfg.hash) {
+                    let s = stopped.remove(pos);
+                    unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGCONT); }
+                    wait_for_session(s.pid, &s.hash, &mut stopped);
+                }
+            }
+            WorkspaceAction::StopSession(cfg) => {
+                if let Some(pos) = stopped.iter().position(|s| s.hash == cfg.hash) {
+                    let s = stopped.remove(pos);
+                    unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+                    thread::sleep(Duration::from_millis(500));
+                    unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGKILL); }
+                    let _ = fs::remove_file(detached_marker_path(&s.hash));
+                    remove_worker_pid(&s.hash);
+                }
+            }
+            WorkspaceAction::Open(cfg) => {
+                let mut choices = workspace_to_choices(&cfg, workspace_root);
+                drain_input_events();
+                let clean = match run_product_selector(&cfg.hash, &mut choices) {
+                    LaunchMode::Quit => continue 'selector,
+                    LaunchMode::Clean => true,
+                    LaunchMode::Normal => false,
+                };
+                let updated_cfg = choices_to_workspace(&choices);
+                save_workspace(ws_dir, &updated_cfg);
+                let pid = spawn_session_worker(&exe, &updated_cfg.hash, clean);
+                wait_for_session(pid, &updated_cfg.hash, &mut stopped);
+            }
+            WorkspaceAction::CreateNew => {
+                let mut choices = default_product_choices(workspace_root);
+                drain_input_events();
+                let clean = match run_product_selector("new", &mut choices) {
+                    LaunchMode::Quit => continue 'selector,
+                    LaunchMode::Clean => true,
+                    LaunchMode::Normal => false,
+                };
+                let mut cfg = choices_to_workspace(&choices);
+                cfg.port_offset = find_free_offset(ws_dir);
+                save_workspace(ws_dir, &cfg);
+                let pid = spawn_session_worker(&exe, &cfg.hash, clean);
+                wait_for_session(pid, &cfg.hash, &mut stopped);
+            }
+            WorkspaceAction::Delete(_) => {
+                // Handled inline in the inner loop above.
+            }
+            WorkspaceAction::Quit => {
+                if !stopped.is_empty() {
+                    println!("\n  Detached session(s) still running:");
+                    for s in &stopped {
+                        println!("    {CYN}●{R}  {}", s.hash);
+                    }
+                    print!("\n  Shut them down? [y/N] ");
+                    let _ = io::stdout().flush();
+                    let mut ans = String::new();
+                    let _ = io::stdin().read_line(&mut ans);
+                    if ans.trim().eq_ignore_ascii_case("y") {
+                        for s in &stopped {
+                            unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                        for s in &stopped {
+                            unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGKILL); }
+                        }
+                    }
+                }
+                print!("\x1b[H\x1b[2J");
+                let _ = io::stdout().flush();
+                return;
+            }
         }
     }
 }
@@ -609,7 +771,7 @@ fn resolve_workspace(
         match load_workspace(ws_dir, hash) {
             Some(cfg) => {
                 let choices = workspace_to_choices(&cfg, workspace_root);
-                (cfg, choices, false)
+                (cfg, choices, args.clean_start)
             }
             None => {
                 eprintln!("Workspace '{}' not found in {}.", hash, ws_dir.display());
@@ -644,17 +806,16 @@ fn resolve_workspace(
         let choices = workspace_to_choices(&cfg, workspace_root);
         (cfg, choices, false)
     } else {
-        if let Some((cfg, choices)) = check_detached_sessions_at_launch(ws_dir, workspace_root) {
-            return (cfg, choices, false);
-        }
-
+        // Interactive path — only reached for direct-args invocations that somehow
+        // don't match any branch flag. In normal flow, run_as_selector handles the
+        // interactive workspace/product selection before spawning a session worker.
         let mut choices = 'selector: loop {
             let workspaces = list_workspaces(ws_dir);
             if workspaces.is_empty() {
                 return build_new_workspace_interactive(workspace_root, ws_dir);
             }
             drain_input_events();
-            match run_workspace_selector(&workspaces) {
+            match run_workspace_selector(&workspaces, &HashSet::new()) {
                 WorkspaceAction::Delete(cfg) => {
                     run_workspace_delete(&cfg, workspace_root, ws_dir);
                     continue 'selector;
@@ -665,8 +826,13 @@ fn resolve_workspace(
                 WorkspaceAction::CreateNew => {
                     break default_product_choices(workspace_root);
                 }
+                WorkspaceAction::Reattach(cfg) => {
+                    break workspace_to_choices(&cfg, workspace_root);
+                }
+                WorkspaceAction::StopSession(_) => {
+                    continue 'selector;
+                }
                 WorkspaceAction::Quit => {
-                    prompt_detached_shutdown(ws_dir);
                     print!("\x1b[H\x1b[2J");
                     let _ = io::stdout().flush();
                     std::process::exit(0);
@@ -676,7 +842,6 @@ fn resolve_workspace(
         drain_input_events();
         let clean = match run_product_selector("", &mut choices) {
             LaunchMode::Quit => {
-                prompt_detached_shutdown(ws_dir);
                 print!("\x1b[H\x1b[2J");
                 let _ = io::stdout().flush();
                 std::process::exit(0);
@@ -690,19 +855,12 @@ fn resolve_workspace(
     }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Session worker ────────────────────────────────────────────────────────────
 
-fn main() {
-    let args = Args::parse();
-
+fn run_session_loop(args: &Args, workspace_root: &Path, ws_dir: &Path) {
     print!("\x1b[H\x1b[2J");
     let _ = io::stdout().flush();
 
-    let workspace_root = resolve_workspace_root(&args);
-    let ws_dir = workspaces_dir(&workspace_root);
-
-    // Stopping flag and signal handlers are registered once for the entire
-    // process lifetime; the flag is reset at the top of each session.
     let stopping: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     {
         let stopping = Arc::clone(&stopping);
@@ -718,11 +876,10 @@ fn main() {
         );
     }
 
-    'session: loop {
-        stopping.store(false, Ordering::Relaxed);
-        SIGHUP_STOP.store(false, Ordering::Relaxed);
+    stopping.store(false, Ordering::Relaxed);
+    SIGHUP_STOP.store(false, Ordering::Relaxed);
 
-    let (workspace_cfg, choices, clean_start) = resolve_workspace(&args, &workspace_root, &ws_dir);
+    let (workspace_cfg, choices, clean_start) = resolve_workspace(args, workspace_root, ws_dir);
     ensure_cooked_output();
     let slug = workspace_cfg.hash.clone();
 
@@ -1879,11 +2036,8 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
     let mut mode = Mode::Overview { cursor: 0 };
     let mut creds: Vec<CredEntry> = Vec::new();
     let mut show_paths = false;
-    // Set to true when the user explicitly presses q/Esc from Overview so that
-    // we return to the workspace selector instead of exiting the process.
-    let mut want_restart = false;
     // Set to true when the user presses M from Overview to leave the TUI without
-    // stopping the stack (detach).  We skip the shutdown sequence entirely.
+    // stopping the stack (detach).  We pause the process via SIGSTOP.
     let mut want_detach = false;
 
     let (tx, rx) = mpsc::sync_channel::<InputEvent>(32);
@@ -1903,14 +2057,21 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
     loop {
         // ── Detach (M) — leave TUI without stopping the stack ─────────────────
         if want_detach {
+            want_detach = false;
             drop(raw_mode.take());
-            // Write a detach marker so kill_orphaned_pids knows these PIDs are
-            // intentional and skips them on the next invocation of this slug.
             mark_detached(&slug);
+            write_worker_pid(&slug, std::process::id());
             print!("\x1b[H\x1b[2J");
             let _ = io::stdout().flush();
             compress_rotated_logs(&logs_dir);
-            continue 'session;
+            // Pause this process — the selector resumes it via SIGCONT when the
+            // user reattaches.  Execution continues at the line below on resume.
+            unsafe { libc::kill(libc::getpid(), libc::SIGSTOP); }
+            // ── Resumed by SIGCONT ────────────────────────────────────────────
+            let _ = fs::remove_file(detached_marker_path(&slug));
+            remove_worker_pid(&slug);
+            raw_mode = TuiGuard::enter();
+            force_render = true;
         }
 
         // ── Shutdown ─────────────────────────────────────────────────────────
@@ -2008,14 +2169,11 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
             // Compress rotated log files before leaving this session.
             compress_rotated_logs(&logs_dir);
 
-            // Return to the workspace selector when the user pressed q/Esc,
-            // or exit the process for Ctrl+C / SIGHUP.
-            if want_restart {
-                print!("\x1b[H\x1b[2J");
-                let _ = io::stdout().flush();
-                continue 'session;
-            }
-            break 'session;
+            // Return to the selector process (which will decide whether to show
+            // the workspace selector again or exit).
+            print!("\x1b[H\x1b[2J");
+            let _ = io::stdout().flush();
+            return;
         }
 
         // ── Crash detection ───────────────────────────────────────────────────
@@ -2533,7 +2691,6 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                             force_render = true;
                         }
                         InputEvent::Back => {
-                            want_restart = true;
                             stopping.store(true, Ordering::Relaxed);
                         }
                         InputEvent::Detach => {
@@ -2893,5 +3050,17 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
 
         thread::sleep(Duration::from_millis(20));
     }
-    } // 'session loop
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() {
+    let args = Args::parse();
+    let workspace_root = resolve_workspace_root(&args);
+    let ws_dir = workspaces_dir(&workspace_root);
+    if args.session_worker {
+        run_session_loop(&args, &workspace_root, &ws_dir);
+    } else {
+        run_as_selector(&args, &workspace_root, &ws_dir);
+    }
 }

@@ -270,3 +270,23 @@ pub fn probe(url: &str) -> bool {
         Err(_) => false,
     }
 }
+
+// ── Session worker PID helpers ────────────────────────────────────────────────
+
+pub fn worker_pid_path(slug: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/dev-launcher-{slug}.worker"))
+}
+
+pub fn write_worker_pid(slug: &str, pid: u32) {
+    let _ = fs::write(worker_pid_path(slug), pid.to_string());
+}
+
+pub fn read_worker_pid(slug: &str) -> Option<u32> {
+    fs::read_to_string(worker_pid_path(slug))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+pub fn remove_worker_pid(slug: &str) {
+    let _ = fs::remove_file(worker_pid_path(slug));
+}

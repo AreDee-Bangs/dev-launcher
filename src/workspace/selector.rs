@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -18,10 +19,16 @@ pub enum WorkspaceAction {
     Open(WorkspaceConfig),
     Delete(WorkspaceConfig),
     CreateNew,
+    Reattach(WorkspaceConfig),
+    StopSession(WorkspaceConfig),
     Quit,
 }
 
-fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize) -> Vec<String> {
+fn build_workspace_selector_lines(
+    workspaces: &[WorkspaceConfig],
+    cursor: usize,
+    stopped_hashes: &HashSet<String>,
+) -> Vec<String> {
     let sep = "─".repeat(72);
     let mut out = Vec::new();
     out.push(format!("\n  {BOLD}{CYN}{BUILD_VERSION}{R}\n"));
@@ -51,11 +58,15 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
         } else {
             summary.clone()
         };
-        let status_dot = match workspace_run_status(&ws.hash) {
-            WorkspaceRunStatus::Running => format!(" {GRN}●{R}"),
-            WorkspaceRunStatus::Degraded => format!(" {YLW}●{R}"),
-            WorkspaceRunStatus::Failed => format!(" {RED}●{R}"),
-            WorkspaceRunStatus::NotRunning => "  ".to_string(),
+        let status_dot = if stopped_hashes.contains(&ws.hash) {
+            format!(" {CYN}●{R}")
+        } else {
+            match workspace_run_status(&ws.hash) {
+                WorkspaceRunStatus::Running => format!(" {GRN}●{R}"),
+                WorkspaceRunStatus::Degraded => format!(" {YLW}●{R}"),
+                WorkspaceRunStatus::Failed => format!(" {RED}●{R}"),
+                WorkspaceRunStatus::NotRunning => "  ".to_string(),
+            }
         };
         out.push(format!("  {marker}{hash}{status_dot}  {:<54}{date}{offset_tag}", summary_display));
     }
@@ -71,9 +82,12 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
     out.push(String::new());
     out.push(format!("  {DIM}{sep}{R}"));
     if cursor < total - 1 {
-        out.push(format!(
-            "  {DIM}↑↓ navigate   Enter open   d delete   q quit{R}"
-        ));
+        let selected_stopped = cursor < workspaces.len() && stopped_hashes.contains(&workspaces[cursor].hash);
+        if selected_stopped {
+            out.push(format!("  {DIM}↑↓ navigate   r reattach   s stop   d delete   q quit{R}"));
+        } else {
+            out.push(format!("  {DIM}↑↓ navigate   Enter open   d delete   q quit{R}"));
+        }
     } else {
         out.push(format!("  {DIM}↑↓ navigate   Enter create   q quit{R}"));
     }
@@ -81,7 +95,7 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
     out
 }
 
-pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction {
+pub fn run_workspace_selector(workspaces: &[WorkspaceConfig], stopped_hashes: &HashSet<String>) -> WorkspaceAction {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
         return WorkspaceAction::CreateNew;
     }
@@ -90,7 +104,7 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
     let mut cursor = 0usize;
     loop {
         if let Some(tui) = raw.as_mut() {
-            draw_ansi_lines(tui, &build_workspace_selector_lines(workspaces, cursor));
+            draw_ansi_lines(tui, &build_workspace_selector_lines(workspaces, cursor, stopped_hashes));
         }
         if event::poll(std::time::Duration::from_millis(20)).unwrap_or(false) {
             let Ok(Event::Key(ke)) = event::read() else {
@@ -99,6 +113,7 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
             if ke.kind != crossterm::event::KeyEventKind::Press {
                 continue;
             }
+            let selected_stopped = cursor < workspaces.len() && stopped_hashes.contains(&workspaces[cursor].hash);
             match ke.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     cursor = cursor.saturating_sub(1);
@@ -106,14 +121,26 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
                 KeyCode::Down | KeyCode::Char('j') if cursor + 1 < total => {
                     cursor += 1;
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                     drain_input_events();
                     drop(raw.take());
                     if cursor == workspaces.len() {
                         return WorkspaceAction::CreateNew;
+                    } else if selected_stopped {
+                        return WorkspaceAction::Reattach(workspaces[cursor].clone());
                     } else {
                         return WorkspaceAction::Open(workspaces[cursor].clone());
                     }
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') if selected_stopped => {
+                    drain_input_events();
+                    drop(raw.take());
+                    return WorkspaceAction::Reattach(workspaces[cursor].clone());
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') if selected_stopped => {
+                    drain_input_events();
+                    drop(raw.take());
+                    return WorkspaceAction::StopSession(workspaces[cursor].clone());
                 }
                 KeyCode::Char('d') | KeyCode::Char('D') if cursor < workspaces.len() => {
                     drain_input_events();
