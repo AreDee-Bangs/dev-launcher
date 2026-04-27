@@ -2307,14 +2307,14 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
 
         // ── Auto-spawn services waiting on requires ───────────────────────────
         #[allow(clippy::type_complexity)]
-        let (spawn_candidates, copilot_frontend_url): (
+        let (spawn_candidates, copilot_backend_url): (
             Vec<(usize, String, SpawnCmd, PathBuf)>,
             Option<String>,
         ) = {
             let svcs = state.lock().unwrap();
             let url = svcs
                 .iter()
-                .find(|s| s.name == "copilot-frontend")
+                .find(|s| s.name == "copilot-backend")
                 .and_then(|s| s.url.clone());
             let candidates = svcs
                 .iter()
@@ -2341,7 +2341,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                 svcs[idx].health = Health::Degraded("Waiting for OpenSearch/ES…".into());
                 continue;
             }
-            if let Some(ref url) = copilot_frontend_url {
+            if let Some(ref url) = copilot_backend_url {
                 match svc_name.as_str() {
                     "opencti-graphql" => {
                         wipe_opencti_es_indices_if_stale(es_port);
