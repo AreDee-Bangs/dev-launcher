@@ -2,6 +2,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use serde::Deserialize;
+
 use crate::services::docker::run_blocking;
 use crate::tui::{DIM, GRN, R, YLW};
 
@@ -74,19 +76,150 @@ pub fn parse_compose_project_name(compose_file: &Path) -> Option<String> {
     None
 }
 
+// ── YAML serde structs (parse only) ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct YamlConf {
+    python: Option<YamlPython>,
+    docker: Option<YamlDocker>,
+    services: Option<Vec<YamlService>>,
+    bootstrap: Option<Vec<YamlBootstrap>>,
+}
+
+#[derive(Deserialize)]
+struct YamlPython {
+    version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct YamlDocker {
+    compose_dev: Option<String>,
+    project: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct YamlService {
+    name: String,
+    command: Option<String>,
+    cwd: Option<String>,
+    health: Option<String>,
+    timeout: Option<u64>,
+    requires_docker: Option<bool>,
+    log: Option<String>,
+    requires: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum YamlBootstrap {
+    Check {
+        check: String,
+        missing: String,
+    },
+    SyncPip {
+        requirements: String,
+        pip: String,
+    },
+    RunIfMissing {
+        run_if_missing: String,
+        command: String,
+        cwd: Option<String>,
+    },
+}
+
+// ── Parse ─────────────────────────────────────────────────────────────────────
+
 pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
     let content = fs::read_to_string(path).ok()?;
+
+    // Detect old INI format by presence of [section] headers.
+    let is_ini = content.lines().any(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#') && t.starts_with('[') && t.ends_with(']')
+    });
+
+    if is_ini {
+        let manifest = parse_ini_content(&content)?;
+        let repo_name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("repo");
+        println!("  {YLW}Migrating .dev-launcher.conf to YAML format…{R}");
+        save_dev_launcher_conf(path, repo_name, &manifest);
+        return Some(manifest);
+    }
+
+    parse_yaml_content(&content)
+}
+
+fn parse_yaml_content(content: &str) -> Option<RepoManifest> {
+    let conf: YamlConf = serde_yaml::from_str(content).ok()?;
+
+    let docker = ManifestDocker {
+        compose_dev: conf.docker.as_ref().and_then(|d| d.compose_dev.clone()),
+        project: conf.docker.as_ref().and_then(|d| d.project.clone()),
+    };
+
+    let services = conf
+        .services
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| SvcDef {
+            name: s.name,
+            args: s
+                .command
+                .map(|c| c.split_whitespace().map(|t| t.to_string()).collect())
+                .unwrap_or_default(),
+            cwd: s.cwd.unwrap_or_default(),
+            health: s.health,
+            timeout_secs: s.timeout.unwrap_or(30),
+            requires_docker: s.requires_docker.unwrap_or(false),
+            log_name: s.log,
+            requires: s.requires.unwrap_or_default(),
+        })
+        .collect();
+
+    let bootstrap = conf
+        .bootstrap
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| match b {
+            YamlBootstrap::Check { check, missing } => BootstrapDef::Check {
+                path: check,
+                missing_hint: missing,
+            },
+            YamlBootstrap::SyncPip { requirements, pip } => {
+                BootstrapDef::SyncPip { requirements, pip }
+            }
+            YamlBootstrap::RunIfMissing {
+                run_if_missing,
+                command,
+                cwd,
+            } => BootstrapDef::RunIfMissing {
+                check: run_if_missing,
+                command: command.split_whitespace().map(|t| t.to_string()).collect(),
+                cwd,
+            },
+        })
+        .collect();
+
+    Some(RepoManifest {
+        docker,
+        services,
+        bootstrap,
+        python_version: conf.python.and_then(|p| p.version),
+    })
+}
+
+/// Parse the legacy INI-style `.dev-launcher.conf` format.
+#[allow(unused_assignments)]
+fn parse_ini_content(content: &str) -> Option<RepoManifest> {
     let mut docker = ManifestDocker::default();
     let mut services: Vec<SvcDef> = Vec::new();
     let mut bootstrap: Vec<BootstrapDef> = Vec::new();
 
-    enum Section {
-        None,
-        Docker,
-        Service,
-        Bootstrap,
-        Python,
-    }
+    enum Section { None, Docker, Service, Bootstrap, Python }
 
     let mut section = Section::None;
     let mut python_version: Option<String> = None;
@@ -106,200 +239,111 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
     let mut bs_requirements = String::new();
     let mut bs_pip = String::new();
 
-    let flush_service = |name: &str,
-                         args: &Vec<String>,
-                         cwd: &str,
-                         health: &Option<String>,
-                         timeout: u64,
-                         req_docker: bool,
-                         log: &Option<String>,
-                         requires: &Vec<String>,
-                         svcs: &mut Vec<SvcDef>| {
-        if !name.is_empty() {
-            svcs.push(SvcDef {
-                name: name.to_string(),
-                args: args.clone(),
-                cwd: cwd.to_string(),
-                health: health.clone(),
-                timeout_secs: timeout,
-                requires_docker: req_docker,
-                log_name: log.clone(),
-                requires: requires.clone(),
-            });
-        }
-    };
+    macro_rules! flush_service {
+        () => {{
+            if !svc_name.is_empty() {
+                services.push(SvcDef {
+                    name: svc_name.clone(),
+                    args: svc_args.clone(),
+                    cwd: svc_cwd.clone(),
+                    health: svc_health.clone(),
+                    timeout_secs: svc_timeout,
+                    requires_docker: svc_req_docker,
+                    log_name: svc_log.clone(),
+                    requires: svc_requires.clone(),
+                });
+                svc_name = String::new(); svc_args = Vec::new(); svc_cwd = String::new();
+                svc_health = None; svc_timeout = 30; svc_req_docker = false;
+                svc_log = None; svc_requires = Vec::new();
+            }
+        }};
+    }
 
-    let flush_bootstrap = |check: &str,
-                           missing: &str,
-                           run_if: &str,
-                           command: &Vec<String>,
-                           cwd: &Option<String>,
-                           requirements: &str,
-                           pip: &str,
-                           bootstrap: &mut Vec<BootstrapDef>| {
-        if !check.is_empty() && !missing.is_empty() {
-            bootstrap.push(BootstrapDef::Check {
-                path: check.to_string(),
-                missing_hint: missing.to_string(),
-            });
-        } else if !run_if.is_empty() && !command.is_empty() {
-            bootstrap.push(BootstrapDef::RunIfMissing {
-                check: run_if.to_string(),
-                command: command.clone(),
-                cwd: cwd.clone(),
-            });
-        } else if !requirements.is_empty() && !pip.is_empty() {
-            bootstrap.push(BootstrapDef::SyncPip {
-                requirements: requirements.to_string(),
-                pip: pip.to_string(),
-            });
-        }
-    };
+    macro_rules! flush_bootstrap {
+        () => {{
+            if !bs_check.is_empty() && !bs_missing.is_empty() {
+                bootstrap.push(BootstrapDef::Check {
+                    path: bs_check.clone(), missing_hint: bs_missing.clone(),
+                });
+            } else if !bs_run_if.is_empty() && !bs_command.is_empty() {
+                bootstrap.push(BootstrapDef::RunIfMissing {
+                    check: bs_run_if.clone(), command: bs_command.clone(), cwd: bs_cwd.clone(),
+                });
+            } else if !bs_requirements.is_empty() && !bs_pip.is_empty() {
+                bootstrap.push(BootstrapDef::SyncPip {
+                    requirements: bs_requirements.clone(), pip: bs_pip.clone(),
+                });
+            }
+            bs_check = String::new(); bs_missing = String::new(); bs_run_if = String::new();
+            bs_command = Vec::new(); bs_cwd = None;
+            bs_requirements = String::new(); bs_pip = String::new();
+        }};
+    }
 
     for raw in content.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
+        if line.is_empty() || line.starts_with('#') { continue; }
 
         if line.starts_with('[') && line.ends_with(']') {
-            match &section {
-                Section::Service => {
-                    flush_service(
-                        &svc_name,
-                        &svc_args,
-                        &svc_cwd,
-                        &svc_health,
-                        svc_timeout,
-                        svc_req_docker,
-                        &svc_log,
-                        &svc_requires,
-                        &mut services,
-                    );
-                    svc_name = String::new();
-                    svc_args = Vec::new();
-                    svc_cwd = String::new();
-                    svc_health = None;
-                    svc_timeout = 30;
-                    svc_req_docker = false;
-                    svc_log = None;
-                    svc_requires = Vec::new();
-                }
-                Section::Bootstrap => {
-                    flush_bootstrap(
-                        &bs_check,
-                        &bs_missing,
-                        &bs_run_if,
-                        &bs_command,
-                        &bs_cwd,
-                        &bs_requirements,
-                        &bs_pip,
-                        &mut bootstrap,
-                    );
-                    bs_check = String::new();
-                    bs_missing = String::new();
-                    bs_run_if = String::new();
-                    bs_command = Vec::new();
-                    bs_cwd = None;
-                    bs_requirements = String::new();
-                    bs_pip = String::new();
-                }
+            match section {
+                Section::Service   => flush_service!(),
+                Section::Bootstrap => flush_bootstrap!(),
                 _ => {}
             }
-
             let inner = line[1..line.len() - 1].trim();
-            if inner == "docker" {
-                section = Section::Docker;
-            } else if inner == "bootstrap" {
-                section = Section::Bootstrap;
-            } else if inner == "python" {
-                section = Section::Python;
-            } else if let Some(rest) = inner.strip_prefix("service ") {
-                svc_name = rest.trim().to_string();
-                section = Section::Service;
-            } else {
-                section = Section::None;
-            }
+            section = if inner == "docker" { Section::Docker }
+                else if inner == "bootstrap" { Section::Bootstrap }
+                else if inner == "python"    { Section::Python }
+                else if let Some(rest) = inner.strip_prefix("service ") {
+                    svc_name = rest.trim().to_string();
+                    Section::Service
+                } else { Section::None };
             continue;
         }
 
         if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim();
-            let v = v.trim().to_string();
-            match &section {
+            let k = k.trim(); let v = v.trim().to_string();
+            match section {
                 Section::Docker => match k {
                     "compose_dev" => docker.compose_dev = Some(v),
-                    "project" => docker.project = Some(v),
+                    "project"     => docker.project = Some(v),
                     _ => {}
                 },
                 Section::Service => match k {
-                    "command" => svc_args = v.split_whitespace().map(|s| s.to_string()).collect(),
-                    "cwd" => svc_cwd = v,
-                    "health" => svc_health = if v.is_empty() { None } else { Some(v) },
-                    "timeout" => svc_timeout = v.parse().unwrap_or(30),
-                    "requires_docker" => {
-                        svc_req_docker = matches!(v.as_str(), "true" | "1" | "yes")
-                    }
-                    "log" => svc_log = if v.is_empty() { None } else { Some(v) },
-                    "requires" => {
-                        svc_requires = v.split_whitespace().map(|s| s.to_string()).collect()
-                    }
+                    "command"        => svc_args = v.split_whitespace().map(|s| s.to_string()).collect(),
+                    "cwd"            => svc_cwd = v,
+                    "health"         => svc_health = if v.is_empty() { None } else { Some(v) },
+                    "timeout"        => svc_timeout = v.parse().unwrap_or(30),
+                    "requires_docker"=> svc_req_docker = matches!(v.as_str(), "true"|"1"|"yes"),
+                    "log"            => svc_log = if v.is_empty() { None } else { Some(v) },
+                    "requires"       => svc_requires = v.split_whitespace().map(|s| s.to_string()).collect(),
                     _ => {}
                 },
                 Section::Bootstrap => match k {
-                    "check" => bs_check = v,
-                    "missing" => bs_missing = v,
+                    "check"          => bs_check = v,
+                    "missing"        => bs_missing = v,
                     "run_if_missing" => bs_run_if = v,
-                    "command" => bs_command = v.split_whitespace().map(|s| s.to_string()).collect(),
-                    "cwd" => bs_cwd = if v.is_empty() { None } else { Some(v) },
-                    "requirements" => bs_requirements = v,
-                    "pip" => bs_pip = v,
+                    "command"        => bs_command = v.split_whitespace().map(|s| s.to_string()).collect(),
+                    "cwd"            => bs_cwd = if v.is_empty() { None } else { Some(v) },
+                    "requirements"   => bs_requirements = v,
+                    "pip"            => bs_pip = v,
                     _ => {}
                 },
-                Section::Python => match k {
-                    "version" => python_version = if v.is_empty() { None } else { Some(v) },
-                    _ => {}
+                Section::Python => if k == "version" {
+                    python_version = if v.is_empty() { None } else { Some(v) };
                 },
                 _ => {}
             }
         }
     }
 
-    match &section {
-        Section::Service => {
-            flush_service(
-                &svc_name,
-                &svc_args,
-                &svc_cwd,
-                &svc_health,
-                svc_timeout,
-                svc_req_docker,
-                &svc_log,
-                &svc_requires,
-                &mut services,
-            );
-        }
-        Section::Bootstrap => {
-            flush_bootstrap(
-                &bs_check,
-                &bs_missing,
-                &bs_run_if,
-                &bs_command,
-                &bs_cwd,
-                &bs_requirements,
-                &bs_pip,
-                &mut bootstrap,
-            );
-        }
+    match section {
+        Section::Service   => flush_service!(),
+        Section::Bootstrap => flush_bootstrap!(),
         _ => {}
     }
 
-    Some(RepoManifest {
-        docker,
-        services,
-        bootstrap,
-        python_version,
-    })
+    Some(RepoManifest { docker, services, bootstrap, python_version })
 }
 
 pub fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
@@ -450,71 +494,103 @@ fn major_minor(v: &str) -> String {
 }
 
 pub fn save_dev_launcher_conf(conf_path: &Path, repo_name: &str, manifest: &RepoManifest) {
-    let mut out = format!("# {} — dev-launcher launcher configuration\n", repo_name);
-    out.push_str("# Auto-generated. Edit to customize. Re-run dev-launcher to apply changes.\n\n");
+    let mut out = format!("# {} — dev-launcher configuration\n", repo_name);
+    out.push_str("# Auto-generated. Edit to customise. Re-run dev-launcher to apply changes.\n\n");
 
     if let Some(ref v) = manifest.python_version {
-        out.push_str("[python]\n");
-        out.push_str(&format!("version = {}\n\n", v));
+        out.push_str("python:\n");
+        out.push_str(&format!("  version: {}\n\n", ys(v)));
     }
 
-    out.push_str("[docker]\n");
-    if let Some(ref cd) = manifest.docker.compose_dev {
-        out.push_str(&format!("compose_dev = {}\n", cd));
-    }
-    if let Some(ref p) = manifest.docker.project {
-        out.push_str(&format!("project     = {}\n", p));
-    }
-    out.push('\n');
-
-    for svc in &manifest.services {
-        out.push_str(&format!("[service {}]\n", svc.name));
-        if !svc.args.is_empty() {
-            out.push_str(&format!("command         = {}\n", svc.args.join(" ")));
+    if manifest.docker.compose_dev.is_some() || manifest.docker.project.is_some() {
+        out.push_str("docker:\n");
+        if let Some(ref cd) = manifest.docker.compose_dev {
+            out.push_str(&format!("  compose_dev: {}\n", ys(cd)));
         }
-        if !svc.cwd.is_empty() {
-            out.push_str(&format!("cwd             = {}\n", svc.cwd));
-        }
-        if let Some(ref h) = svc.health {
-            out.push_str(&format!("health          = {}\n", h));
-        }
-        out.push_str(&format!("timeout         = {}\n", svc.timeout_secs));
-        if svc.requires_docker {
-            out.push_str("requires_docker = true\n");
-        }
-        if let Some(ref l) = svc.log_name {
-            out.push_str(&format!("log             = {}\n", l));
+        if let Some(ref p) = manifest.docker.project {
+            out.push_str(&format!("  project: {}\n", ys(p)));
         }
         out.push('\n');
     }
 
-    for step in &manifest.bootstrap {
-        out.push_str("[bootstrap]\n");
-        match step {
-            BootstrapDef::Check { path, missing_hint } => {
-                out.push_str(&format!("check   = {}\n", path));
-                out.push_str(&format!("missing = {}\n", missing_hint));
+    if !manifest.services.is_empty() {
+        out.push_str("services:\n");
+        for svc in &manifest.services {
+            out.push_str(&format!("  - name: {}\n", ys(&svc.name)));
+            if !svc.args.is_empty() {
+                out.push_str(&format!("    command: {}\n", ys(&svc.args.join(" "))));
             }
-            BootstrapDef::RunIfMissing {
-                check,
-                command,
-                cwd,
-            } => {
-                out.push_str(&format!("run_if_missing = {}\n", check));
-                out.push_str(&format!("command        = {}\n", command.join(" ")));
-                if let Some(ref c) = cwd {
-                    out.push_str(&format!("cwd            = {}\n", c));
+            if !svc.cwd.is_empty() {
+                out.push_str(&format!("    cwd: {}\n", ys(&svc.cwd)));
+            }
+            if let Some(ref h) = svc.health {
+                out.push_str(&format!("    health: {}\n", ys(h)));
+            }
+            out.push_str(&format!("    timeout: {}\n", svc.timeout_secs));
+            if svc.requires_docker {
+                out.push_str("    requires_docker: true\n");
+            }
+            if let Some(ref l) = svc.log_name {
+                out.push_str(&format!("    log: {}\n", ys(l)));
+            }
+            if !svc.requires.is_empty() {
+                out.push_str("    requires:\n");
+                for r in &svc.requires {
+                    out.push_str(&format!("      - {}\n", ys(r)));
                 }
             }
-            BootstrapDef::SyncPip { requirements, pip } => {
-                out.push_str(&format!("requirements = {}\n", requirements));
-                out.push_str(&format!("pip          = {}\n", pip));
+        }
+        out.push('\n');
+    }
+
+    if !manifest.bootstrap.is_empty() {
+        out.push_str("bootstrap:\n");
+        for step in &manifest.bootstrap {
+            match step {
+                BootstrapDef::Check { path, missing_hint } => {
+                    out.push_str(&format!("  - check: {}\n", ys(path)));
+                    out.push_str(&format!("    missing: {}\n", ys(missing_hint)));
+                }
+                BootstrapDef::RunIfMissing { check, command, cwd } => {
+                    out.push_str(&format!("  - run_if_missing: {}\n", ys(check)));
+                    out.push_str(&format!("    command: {}\n", ys(&command.join(" "))));
+                    if let Some(ref c) = cwd {
+                        out.push_str(&format!("    cwd: {}\n", ys(c)));
+                    }
+                }
+                BootstrapDef::SyncPip { requirements, pip } => {
+                    out.push_str(&format!("  - requirements: {}\n", ys(requirements)));
+                    out.push_str(&format!("    pip: {}\n", ys(pip)));
+                }
             }
         }
         out.push('\n');
     }
 
     let _ = fs::write(conf_path, out);
+}
+
+/// Quote a YAML scalar value when it contains characters that could be
+/// misinterpreted by a YAML parser (colons, hashes, brackets, etc.) or
+/// that look like a YAML keyword / bare number.
+fn ys(s: &str) -> String {
+    let needs_quoting = s.is_empty()
+        || s.contains(": ")
+        || s.starts_with('[')
+        || s.starts_with('{')
+        || s.starts_with('*')
+        || s.starts_with('&')
+        || s.starts_with('!')
+        || s.starts_with('"')
+        || s.starts_with('\'')
+        || s.starts_with('#')
+        || matches!(s, "true" | "false" | "null" | "yes" | "no")
+        || s.parse::<f64>().is_ok();
+    if needs_quoting {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
 }
 
 pub fn load_repo_manifest(repo_dir: &Path, repo_name: &str) -> RepoManifest {
