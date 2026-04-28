@@ -185,23 +185,30 @@ fn ensure_copilot_backend_venv(backend_dir: &Path) {
     }
 }
 
-/// Install `infinity-emb[all]` into the backend venv if the binary is absent.
-/// Returns `true` if `infinity_emb` is available after the call.
-fn ensure_infinity_emb(backend_dir: &Path) -> bool {
-    let bin = backend_dir.join(".venv/bin/infinity_emb");
+/// Ensure the infinity-emb binary exists in its own isolated venv under `infinity_dir`.
+/// The venv is fully separate from the copilot backend venv, preventing dependency conflicts
+/// (click version, optimum/bettertransformer, etc.).
+/// Returns `true` if the binary is available after the call.
+fn ensure_infinity_emb_isolated(infinity_dir: &Path) -> bool {
+    let bin = infinity_dir.join(".venv/bin/infinity_emb");
     if bin.exists() {
         return true;
     }
-    let pip = backend_dir.join(".venv/bin/pip");
+    let venv_python = infinity_dir.join(".venv/bin/python");
+    if !venv_python.exists() {
+        println!("  Creating isolated infinity-emb venv…");
+        let _ = fs::create_dir_all(infinity_dir);
+        run_blocking("python3", &["-m", "venv", ".venv"], infinity_dir);
+    }
+    let pip = infinity_dir.join(".venv/bin/pip");
     if !pip.exists() {
         return false;
     }
-    println!("  Installing infinity-emb (first run — this may take a minute)…");
-    // [all] pulls in optimum (dropped bettertransformer) and click>=8.2 (breaks typer 0.12).
+    println!("  Installing infinity-emb into isolated venv (first run — this may take a minute)…");
     run_blocking(
         pip.to_str().unwrap_or("pip"),
         &["install", "infinity-emb[fastapi,uvicorn,torch,transformers]", "click<8.2"],
-        backend_dir,
+        infinity_dir,
     );
     bin.exists()
 }
@@ -1044,6 +1051,8 @@ fn run_session_loop(args: &Args, workspace_root: &Path, ws_dir: &Path) {
             // Infra products: always use the fixed workspace_root dir (no branches/worktrees).
             grafana: workspace_root.join("grafana"),
             langfuse: workspace_root.join("langfuse"),
+            // Isolated venv for copilot-infinity, separate from the copilot backend venv.
+            infinity: ws_dir.join(&slug).join("infinity-emb"),
         }
     };
 
@@ -1860,10 +1869,12 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
         }
 
         // Infinity embedding server (copilot)
+        // Runs in its own isolated venv (paths.infinity) to avoid conflicts with
+        // the copilot backend's dependencies (click versions, optimum, etc.).
         if !no_copilot && paths.copilot.is_dir() {
             let infinity_url = format!("http://localhost:{copilot_infinity_port}");
-            let backend_dir = paths.copilot.join("backend");
-            let infinity_bin = backend_dir.join(".venv/bin/infinity_emb");
+            let infinity_dir = &paths.infinity;
+            let infinity_bin = infinity_dir.join(".venv/bin/infinity_emb");
             let infinity_model = parse_env_file(&copilot_env_path)
                 .get("INFINITY_MODEL")
                 .cloned()
@@ -1875,9 +1886,12 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                 120,
                 logs_dir.join("copilot-infinity.log"),
             );
-            if !ensure_infinity_emb(&backend_dir) {
+            if !ensure_infinity_emb_isolated(infinity_dir) {
                 svc.health = Health::Degraded(
-                    "No Python venv found — run `python -m venv .venv && .venv/bin/pip install infinity-emb[all]` in backend/".into(),
+                    format!(
+                        "python3 not found or venv creation failed — check python3 is in PATH (infinity dir: {})",
+                        infinity_dir.display()
+                    ),
                 );
                 svcs.push(svc);
             } else {
@@ -1887,7 +1901,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                     svc,
                     &bin_str,
                     &["v2", "--model-id", &infinity_model, "--port", &port_str],
-                    &backend_dir,
+                    infinity_dir,
                     &HashMap::new()
                 );
             }

@@ -43,7 +43,11 @@ pub fn diagnose_crash(log_path: &Path, llm: Option<&LlmConfig>) -> Option<String
 
 /// Analyse a service and return a list of `Finding` structs.
 pub fn diagnose_service(svc: &Svc, paths: &Paths, ws_env_dir: &Path) -> Vec<Finding> {
-    let repo_dir: &Path = if svc.name.starts_with("copilot") {
+    let repo_dir: &Path = if svc.name == "copilot-infinity" {
+        // Infinity has its own isolated directory — recipe variables like {pip} must
+        // resolve to its venv, not the copilot backend venv.
+        &paths.infinity
+    } else if svc.name.starts_with("copilot") {
         &paths.copilot
     } else if svc.name.starts_with("opencti") {
         &paths.opencti

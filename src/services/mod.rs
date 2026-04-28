@@ -173,4 +173,7 @@ pub struct Paths {
     pub openaev: PathBuf,
     pub grafana: PathBuf,
     pub langfuse: PathBuf,
+    /// Isolated directory for the copilot-infinity venv, separate from the backend venv.
+    /// Lives at ~/.dev-launcher/workspaces/{hash}/infinity-emb/
+    pub infinity: PathBuf,
 }
