@@ -960,8 +960,9 @@ fn run_session_loop(args: &Args, workspace_root: &Path, ws_dir: &Path) {
         );
     }
 
-    stopping.store(false, Ordering::Relaxed);
-    SIGHUP_STOP.store(false, Ordering::Relaxed);
+    'session: loop {
+        stopping.store(false, Ordering::Relaxed);
+        SIGHUP_STOP.store(false, Ordering::Relaxed);
 
     let (workspace_cfg, choices, clean_start) = resolve_workspace(args, workspace_root, ws_dir);
     ensure_cooked_output();
@@ -2237,6 +2238,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
     // Set to true when the user presses M from Overview to leave the TUI without
     // stopping the stack (detach).  We pause the process via SIGSTOP.
     let mut want_detach = false;
+    // Set to true when the user explicitly presses q/Esc from Overview so that
+    // we return to the workspace selector instead of exiting the process.
+    let mut want_restart = false;
 
     let (tx, rx) = mpsc::sync_channel::<InputEvent>(32);
     if has_tui {
@@ -2367,11 +2371,14 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
             // Compress rotated log files before leaving this session.
             compress_rotated_logs(&logs_dir);
 
-            // Return to the selector process (which will decide whether to show
-            // the workspace selector again or exit).
-            print!("\x1b[H\x1b[2J");
-            let _ = io::stdout().flush();
-            return;
+            // Return to the workspace selector when the user pressed q/Esc,
+            // or exit the process for Ctrl+C / SIGHUP.
+            if want_restart {
+                print!("\x1b[H\x1b[2J");
+                let _ = io::stdout().flush();
+                continue 'session;
+            }
+            break 'session;
         }
 
         // ── Crash detection ───────────────────────────────────────────────────
@@ -2909,6 +2916,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                             force_render = true;
                         }
                         InputEvent::Back => {
+                            want_restart = true;
                             stopping.store(true, Ordering::Relaxed);
                         }
                         InputEvent::Detach => {
@@ -3334,6 +3342,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
 
         thread::sleep(Duration::from_millis(20));
     }
+    } // 'session loop
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
