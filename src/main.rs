@@ -207,7 +207,9 @@ fn ensure_infinity_emb_isolated(infinity_dir: &Path) -> bool {
     println!("  Installing infinity-emb into isolated venv (first run — this may take a minute)…");
     run_blocking(
         pip.to_str().unwrap_or("pip"),
-        &["install", "infinity-emb[fastapi,uvicorn,torch,transformers]", "click<8.2"],
+        // [server] bundles fastapi+uvicorn+typer (required by the v2 CLI entrypoint).
+        // click<8.2 keeps typer 0.12 working (click>=8.2 broke the CLI bootstrap).
+        &["install", "infinity-emb[server,torch,transformers]", "click<8.2"],
         infinity_dir,
     );
     bin.exists()
