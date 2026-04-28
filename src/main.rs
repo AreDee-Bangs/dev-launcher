@@ -185,34 +185,50 @@ fn ensure_copilot_backend_venv(backend_dir: &Path) {
     }
 }
 
-/// Ensure the infinity-emb binary exists in its own isolated venv under `infinity_dir`.
-/// The venv is fully separate from the copilot backend venv, preventing dependency conflicts
-/// (click version, optimum/bettertransformer, etc.).
-/// Returns `true` if the binary is available after the call.
+/// Ensure infinity-emb is installed and healthy in its own isolated venv.
+/// Validates the install by running `infinity_emb --help` — not just checking
+/// that the binary exists. A broken install (missing typer, bad optimum, etc.)
+/// is detected here and repaired before the service ever starts.
 fn ensure_infinity_emb_isolated(infinity_dir: &Path) -> bool {
     let bin = infinity_dir.join(".venv/bin/infinity_emb");
-    if bin.exists() {
+    let pip = infinity_dir.join(".venv/bin/pip");
+
+    let is_healthy = || -> bool {
+        bin.exists()
+            && Command::new(&bin)
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+    };
+
+    if is_healthy() {
         return true;
     }
-    let venv_python = infinity_dir.join(".venv/bin/python");
-    if !venv_python.exists() {
+
+    if !pip.exists() {
         println!("  Creating isolated infinity-emb venv…");
         let _ = fs::create_dir_all(infinity_dir);
         run_blocking("python3", &["-m", "venv", ".venv"], infinity_dir);
+        if !pip.exists() {
+            return false;
+        }
+        println!("  Installing infinity-emb[server,torch,transformers] (first run — may take a minute)…");
+    } else {
+        println!("  infinity-emb install is unhealthy — repairing…");
     }
-    let pip = infinity_dir.join(".venv/bin/pip");
-    if !pip.exists() {
-        return false;
-    }
-    println!("  Installing infinity-emb into isolated venv (first run — this may take a minute)…");
+
+    // [server] includes fastapi + uvicorn + typer (required by the v2 CLI entrypoint).
+    // click<8.2 keeps typer 0.12 working (click>=8.2 broke the CLI bootstrap).
     run_blocking(
         pip.to_str().unwrap_or("pip"),
-        // [server] bundles fastapi+uvicorn+typer (required by the v2 CLI entrypoint).
-        // click<8.2 keeps typer 0.12 working (click>=8.2 broke the CLI bootstrap).
         &["install", "infinity-emb[server,torch,transformers]", "click<8.2"],
         infinity_dir,
     );
-    bin.exists()
+
+    is_healthy()
 }
 
 fn ensure_copilot_fe_deps(dir: &Path) {
