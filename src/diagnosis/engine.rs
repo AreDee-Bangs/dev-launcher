@@ -348,6 +348,26 @@ pub fn diagnose_service(svc: &Svc, paths: &Paths, ws_env_dir: &Path) -> Vec<Find
             crash_handled = true;
         }
 
+        // Recipe-driven handlers (loaded from recipes/*.toml at startup)
+        if !crash_handled {
+            let backend_dir = if repo_dir.join("backend").is_dir() {
+                repo_dir.join("backend")
+            } else {
+                repo_dir.to_path_buf()
+            };
+            let frontend_dir = if repo_dir.join("frontend").is_dir() {
+                repo_dir.join("frontend")
+            } else {
+                repo_dir.to_path_buf()
+            };
+            let recipe_findings =
+                crate::diagnosis::recipe::apply_to_crash(svc, *code, &backend_dir, &frontend_dir, repo_dir);
+            if !recipe_findings.is_empty() {
+                findings.extend(recipe_findings);
+                crash_handled = true;
+            }
+        }
+
         if !crash_handled {
             findings.push(Finding::info(
                 KIND_CRASH,
@@ -462,22 +482,22 @@ pub fn diagnose_service(svc: &Svc, paths: &Paths, ws_env_dir: &Path) -> Vec<Find
             }
         }
 
-        let mut matched: Vec<String> = Vec::new();
-        let mut seen: Vec<&str> = Vec::new();
-        for line in &log_lines {
-            let lower = line.to_lowercase();
-            for (needle, reason) in DIAG_PATTERNS {
-                if lower.contains(needle) && !seen.contains(reason) {
-                    seen.push(reason);
-                    matched.push(format!("  — {reason}"));
-                }
-            }
-        }
-        if !matched.is_empty() {
-            findings.push(Finding::info(
-                KIND_INFO_LOG_PATTERNS,
-                "Log patterns detected",
-                matched,
+        // For degraded services: run TOML recipe log-pattern analysis.
+        // For crashed services this is already handled by apply_to_crash in section 1b,
+        // which picks up both crash-specific and health="any" recipes.
+        if matches!(svc.health, Health::Degraded(_)) {
+            let bd = if repo_dir.join("backend").is_dir() {
+                repo_dir.join("backend")
+            } else {
+                repo_dir.to_path_buf()
+            };
+            let fe = if repo_dir.join("frontend").is_dir() {
+                repo_dir.join("frontend")
+            } else {
+                repo_dir.to_path_buf()
+            };
+            findings.extend(crate::diagnosis::recipe::apply_to_log_patterns(
+                svc, &bd, &fe, repo_dir,
             ));
         }
     }

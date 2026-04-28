@@ -113,6 +113,8 @@ pub const KIND_OPENCTI_ES_PARTIAL_INIT: &str = "opencti-es-partial-init";
 pub const KIND_CONNECTOR_TYPE_MISSING: &str = "connector-type-missing";
 pub const KIND_CONNECTOR_LICENCE_MISSING: &str = "connector-licence-missing";
 pub const KIND_MINIO_DOWN: &str = "docker-service-down/minio";
+pub const KIND_INFINITY_EMB_OPTIMUM: &str = "infinity-emb-optimum-broken";
+pub const KIND_INFINITY_EMB_CLICK: &str = "infinity-emb-click-typer-incompatible";
 
 pub const RECIPE_CATALOG: &[&str] = &[
     KIND_PYTHON_VENV,
@@ -122,11 +124,13 @@ pub const RECIPE_CATALOG: &[&str] = &[
     KIND_OPENCTI_ES_PARTIAL_INIT,
     KIND_CONNECTOR_TYPE_MISSING,
     KIND_CONNECTOR_LICENCE_MISSING,
+    KIND_INFINITY_EMB_OPTIMUM,
+    KIND_INFINITY_EMB_CLICK,
 ];
 
 pub fn needs_recipe(f: &Finding) -> bool {
     if f.kind.starts_with("info/") {
         return false;
     }
-    !RECIPE_CATALOG.contains(&f.kind)
+    !RECIPE_CATALOG.contains(&f.kind.as_str())
 }

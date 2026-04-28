@@ -1,0 +1,16 @@
+id       = "diag-tls-cert"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = ["certificate verify failed"]
+
+title = "TLS certificate verification failed"
+body = [
+    "  The service could not verify a TLS certificate.",
+    "  Possible causes:",
+    "    - Self-signed cert with no CA bundle configured",
+    "    - System CA store is outdated",
+    "    - Wrong HTTPS endpoint in .env",
+    "  Quick check: curl -v <endpoint-url>",
+]

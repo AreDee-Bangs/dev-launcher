@@ -246,31 +246,50 @@ pub fn docker_kill_by_name_fragment(name_fragment: &str) {
 // ── Blocking process helpers ───────────────────────────────────────────────────
 
 pub fn run_blocking(program: &str, args: &[&str], dir: &Path) -> i32 {
-    Command::new(program)
+    crate::launcher_log::log(&format!("[CMD] {} {}", program, args.join(" ")));
+    let out = Command::new(program)
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
-        .status()
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(-1)
+        .output();
+    match out {
+        Ok(o) => {
+            crate::launcher_log::log_output(&o.stdout, &o.stderr);
+            let code = o.status.code().unwrap_or(-1);
+            crate::launcher_log::log(&format!("[CMD] exit {code}"));
+            code
+        }
+        Err(e) => {
+            crate::launcher_log::log(&format!("[CMD] failed to start: {e}"));
+            -1
+        }
+    }
 }
 
 /// Like `run_blocking` but prints the full command, working directory, and exit code.
 pub fn run_blocking_logged(program: &str, args: &[&str], dir: &Path) -> i32 {
+    crate::launcher_log::log(&format!("[CMD] {} {} (cwd: {})", program, args.join(" "), dir.display()));
     println!("    {DIM}$ {program} {args}{R}", args = args.join(" "));
     println!("    {DIM}  cwd: {}{R}", dir.display());
     let _ = io::stdout().flush();
-    let code = Command::new(program)
+    let out = Command::new(program)
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
-        .status()
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(-1);
-    println!("    {DIM}  exit: {code}{R}");
-    code
+        .output();
+    match out {
+        Ok(o) => {
+            crate::launcher_log::log_output(&o.stdout, &o.stderr);
+            let code = o.status.code().unwrap_or(-1);
+            println!("    {DIM}  exit: {code}{R}");
+            crate::launcher_log::log(&format!("[CMD] exit {code}"));
+            code
+        }
+        Err(e) => {
+            crate::launcher_log::log(&format!("[CMD] failed to start: {e}"));
+            -1
+        }
+    }
 }
 
 // ── Docker availability ────────────────────────────────────────────────────────

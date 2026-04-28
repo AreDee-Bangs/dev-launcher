@@ -17,3 +17,4 @@ crossterm    = { version = "0.28", features = ["event-stream"] }
 tui-textarea = "0.7"
 serde        = { version = "1", features = ["derive"] }
 serde_yaml   = "0.9"
+toml         = "0.8"

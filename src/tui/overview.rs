@@ -100,7 +100,7 @@ pub fn build_overview_lines(
         } else {
             "p paths"
         };
-        out.push(format!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   R restart   s stop   ^R restart all   e credentials   {paths_hint}   m menu   q quit{R}"));
+        out.push(format!("  {DIM}↑↓ navigate   Enter/→ logs   d diagnose   R restart   s stop   ^R restart all   e credentials   o code   {paths_hint}   m menu   q quit{R}"));
     } else {
         out.push(format!(
             "  {DIM}Ctrl+C to stop   tail -f {}/*.log{R}",

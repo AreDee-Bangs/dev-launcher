@@ -1,0 +1,20 @@
+id       = "diag-python-module-missing"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "no module named",
+    "modulenotfounderror",
+]
+
+title = "Python module missing"
+body = [
+    "  A required Python package is not installed in the virtual environment.",
+    "  Reinstall dependencies:",
+    "    {pip} install -r requirements.txt",
+    "  Or recreate the venv:",
+    "    rm -rf {backend_dir}/.venv",
+    "    python3 -m venv {backend_dir}/.venv",
+    "    {pip} install -r requirements.txt",
+]

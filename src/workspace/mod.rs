@@ -1,5 +1,6 @@
 pub mod env;
 pub mod git;
+pub mod pem;
 pub mod repos;
 pub mod selector;
 
@@ -18,6 +19,7 @@ pub use git::{
 pub use repos::{
     clone_repos, load_repos, run_clone_selector, CloneChoice, RepoEntry, DEFAULT_REPOS_CONF,
 };
+pub use pem::{find_pem_candidates, inject_selected_pems, pem_search_dirs, run_pem_selector};
 pub use selector::{
     choices_to_workspace, default_product_choices, discover_flags_in_dir, read_active_flags,
     run_flag_selector, run_product_selector, run_workspace_delete, run_workspace_selector,

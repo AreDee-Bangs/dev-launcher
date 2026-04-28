@@ -1,0 +1,17 @@
+id       = "diag-rabbitmq"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "amqp: connection refused",
+    "connection refused to localhost:5672",
+]
+
+title = "RabbitMQ is not reachable"
+body = [
+    "  RabbitMQ (AMQP) is not accepting connections.",
+    "  Check the Docker container:",
+    "    docker ps -a | grep rabbit",
+    "    docker start <rabbitmq-container>",
+]

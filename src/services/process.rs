@@ -194,6 +194,13 @@ pub fn spawn_svc(
 ) -> io::Result<(Child, i32)> {
     use std::os::unix::process::CommandExt;
 
+    crate::launcher_log::log(&format!(
+        "[SPAWN] {} {} (cwd: {})",
+        program,
+        args.join(" "),
+        dir.display()
+    ));
+
     let log_out = open_log(log);
     let log_err = log_out.try_clone()?;
     let mut cmd = Command::new(program);
@@ -206,6 +213,7 @@ pub fn spawn_svc(
     cmd.process_group(0);
     let child = cmd.spawn()?;
     let pgid = child.id() as i32;
+    crate::launcher_log::log(&format!("[SPAWN]   pid={}", child.id()));
     Ok((child, pgid))
 }
 

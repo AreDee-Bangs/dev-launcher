@@ -1,0 +1,19 @@
+id       = "diag-elasticsearch"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "elasticsearch: no living connections",
+    "connection refused to localhost:9200",
+]
+
+title = "Elasticsearch cluster is unreachable"
+body = [
+    "  Elasticsearch is not accepting connections on port 9200.",
+    "  Check the Docker container:",
+    "    docker ps -a | grep elastic",
+    "    docker start <elasticsearch-container>",
+    "  If the container keeps restarting, check vm.max_map_count:",
+    "    sudo sysctl -w vm.max_map_count=262144",
+]

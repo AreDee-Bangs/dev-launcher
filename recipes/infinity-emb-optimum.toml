@@ -1,0 +1,27 @@
+id     = "infinity-emb-optimum-broken"
+health = "crashed"
+service = "copilot-infinity"
+log_tail = 30
+
+[[match]]
+any_of = ["optimum.bettertransformer", "BetterTransformerManager", "bettertransformer"]
+
+title = "infinity-emb crashed: optimum.bettertransformer not found"
+body = [
+    "  Exit code : {exit_code}",
+    "  `optimum-onnx` creates an `optimum/` namespace that makes",
+    "  CHECK_OPTIMUM.is_available return True, but bettertransformer",
+    "  was removed from optimum >= 1.21. Fix: remove all optimum packages.",
+]
+
+[fix]
+label        = "Remove optimum/optimum-onnx and reinstall infinity-emb (torch only)"
+restart_after = true
+
+[[fix.steps]]
+command = ["{pip}", "uninstall", "-y", "optimum", "optimum-onnx", "infinity-emb"]
+cwd     = "backend"
+
+[[fix.steps]]
+command = ["{pip}", "install", "infinity-emb[fastapi,uvicorn,torch,transformers]"]
+cwd     = "backend"

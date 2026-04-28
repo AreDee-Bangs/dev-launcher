@@ -4,6 +4,7 @@
 pub mod args;
 pub mod config;
 pub mod diagnosis;
+pub mod launcher_log;
 pub mod services;
 pub mod tui;
 pub mod workspace;
@@ -52,13 +53,15 @@ use tui::{
 use workspace::{
     apply_port_offset_to_env, branch_to_slug, choices_to_workspace, compute_workspace_hash,
     current_branch, current_commit_short, default_product_choices, deploy_workspace_env,
-    discover_flags_in_dir, ensure_worktree, extract_url_port, find_free_offset, init_workspace_env,
-    list_workspaces, load_workspace, parse_env_file, patch_url_default, port_in_use,
-    preflight_port_checks, read_active_flags, read_env_url_port, run_env_wizard, run_flag_selector,
-    run_platform_mode_selector, run_product_selector, run_workspace_delete, run_workspace_selector,
-    save_workspace, today, workspace_to_choices, workspaces_dir, write_active_flags, write_env_file,
-    ws_env_path, FlagChoice, LaunchMode, PortCheck, ProductChoice, WorkspaceAction, WorkspaceConfig,
-    WorkspaceEntry, COMMIT_PREFIX, CONNECTOR_ENV_VARS, COPILOT_ENV_VARS, OPENCTI_ENV_VARS,
+    discover_flags_in_dir, ensure_worktree, extract_url_port, find_free_offset,
+    find_pem_candidates, init_workspace_env, inject_selected_pems, list_workspaces, load_workspace,
+    parse_env_file, patch_url_default, pem_search_dirs, port_in_use, preflight_port_checks,
+    read_active_flags, read_env_url_port, run_env_wizard, run_flag_selector,
+    run_pem_selector, run_platform_mode_selector, run_product_selector, run_workspace_delete,
+    run_workspace_selector, save_workspace, today, workspace_to_choices, workspaces_dir,
+    write_active_flags, write_env_file, ws_env_path, FlagChoice, LaunchMode, PortCheck,
+    ProductChoice, WorkspaceAction, WorkspaceConfig, WorkspaceEntry, COMMIT_PREFIX,
+    CONNECTOR_ENV_VARS, COPILOT_ENV_VARS, OPENCTI_ENV_VARS,
 };
 
 // ── Per-product startup helpers ───────────────────────────────────────────────
@@ -180,6 +183,27 @@ fn ensure_copilot_backend_venv(backend_dir: &Path) {
         let _ = io::stdout().flush();
         run_blocking(&pip, &["install", "-e", "."], backend_dir);
     }
+}
+
+/// Install `infinity-emb[all]` into the backend venv if the binary is absent.
+/// Returns `true` if `infinity_emb` is available after the call.
+fn ensure_infinity_emb(backend_dir: &Path) -> bool {
+    let bin = backend_dir.join(".venv/bin/infinity_emb");
+    if bin.exists() {
+        return true;
+    }
+    let pip = backend_dir.join(".venv/bin/pip");
+    if !pip.exists() {
+        return false;
+    }
+    println!("  Installing infinity-emb (first run — this may take a minute)…");
+    // [all] pulls in optimum (dropped bettertransformer) and click>=8.2 (breaks typer 0.12).
+    run_blocking(
+        pip.to_str().unwrap_or("pip"),
+        &["install", "infinity-emb[fastapi,uvicorn,torch,transformers]", "click<8.2"],
+        backend_dir,
+    );
+    bin.exists()
 }
 
 fn ensure_copilot_fe_deps(dir: &Path) {
@@ -935,6 +959,10 @@ fn run_session_loop(args: &Args, workspace_root: &Path, ws_dir: &Path) {
         PathBuf::from(format!("{home}/.dev-launcher/logs/{slug}/{ts}"))
     });
     fs::create_dir_all(&logs_dir).expect("cannot create logs_dir");
+    launcher_log::init(&logs_dir.join("dev-launcher.log"));
+    llog!("workspace={slug}  logs={}", logs_dir.display());
+    let recipes_dir = tui::splash::run();
+    diagnosis::recipe::init(&recipes_dir);
 
     let get_worktree_override = |repo: &str| -> Option<&PathBuf> {
         match repo {
@@ -1134,6 +1162,30 @@ fn run_session_loop(args: &Args, workspace_root: &Path, ws_dir: &Path) {
         );
         patch_url_default(&env_path, "BASE_URL", 8000, 8100);
         patch_url_default(&env_path, "FRONTEND_URL", 3000, 3100);
+        // Ensure INFINITY_URL is present for new workspaces created before this feature.
+        {
+            let mut m = parse_env_file(&env_path);
+            if !m.contains_key("INFINITY_URL") {
+                m.insert("INFINITY_URL".to_string(), "http://localhost:7997".to_string());
+                write_env_file(&env_path, &m);
+            }
+            if !m.contains_key("INFINITY_MODEL") {
+                m.insert("INFINITY_MODEL".to_string(), "nomic-ai/nomic-embed-text-v1.5".to_string());
+                write_env_file(&env_path, &m);
+            }
+            if !m.contains_key("DEFAULT_EMBEDDING_PROVIDER") {
+                m.insert("DEFAULT_EMBEDDING_PROVIDER".to_string(), "custom_openai".to_string());
+                write_env_file(&env_path, &m);
+            }
+            if !m.contains_key("DEFAULT_EMBEDDING_PROVIDER_BASE_URL") {
+                m.insert("DEFAULT_EMBEDDING_PROVIDER_BASE_URL".to_string(), "http://localhost:7997/v1".to_string());
+                write_env_file(&env_path, &m);
+            }
+            if !m.contains_key("DEFAULT_EMBEDDING_MODEL") {
+                m.insert("DEFAULT_EMBEDDING_MODEL".to_string(), "text-embedding-nomic-embed-text-v1.5".to_string());
+                write_env_file(&env_path, &m);
+            }
+        }
         // Apply workspace port offset (idempotent — no-op when offset is 0)
         if port_offset > 0 {
             patch_url_default(&env_path, "BASE_URL", 8100, 8100u16.saturating_add(port_offset));
@@ -1240,6 +1292,25 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
         println!("  {DIM}Connector skipped.{R}\n");
     }
 
+    // ── License PEM injection ─────────────────────────────────────────────────
+    {
+        let search_dirs = pem_search_dirs(&workspace_root);
+        let mut enabled: std::collections::HashMap<&'static str, std::path::PathBuf> =
+            std::collections::HashMap::new();
+        if !no_copilot {
+            enabled.insert("Copilot", ws_env_path(&ws_env_dir, "copilot"));
+        }
+        if !no_opencti {
+            enabled.insert("OpenCTI", ws_env_path(&ws_env_dir, "opencti"));
+        }
+        if !no_openaev {
+            enabled.insert("OpenAEV", ws_env_path(&ws_env_dir, "openaev"));
+        }
+        let mut pem_candidates = find_pem_candidates(&search_dirs, &enabled);
+        run_pem_selector(&mut pem_candidates, &stopping);
+        inject_selected_pems(&pem_candidates, &ws_env_dir);
+    }
+
     if !no_copilot {
         deploy_workspace_env(
             &ws_env_path(&ws_env_dir, "copilot"),
@@ -1333,6 +1404,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
     let copilot_env_path = ws_env_path(&ws_env_dir, "copilot");
     let copilot_backend_port = read_env_url_port(&copilot_env_path, "BASE_URL", 8100);
     let copilot_frontend_port = read_env_url_port(&copilot_env_path, "FRONTEND_URL", 3100);
+    let copilot_infinity_port = read_env_url_port(&copilot_env_path, "INFINITY_URL", 7997);
 
     let copilot_manifest = if !no_copilot && paths.copilot.is_dir() {
         let mut m = load_repo_manifest(&paths.copilot, "Copilot");
@@ -1616,8 +1688,13 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                     };
                     let rest: Vec<&str> = def.args[1..].iter().map(|s| s.as_str()).collect();
                     let empty_env: HashMap<String, String> = HashMap::new();
+                    let mut frontend_env: HashMap<String, String> = HashMap::new();
+                    frontend_env.insert("PORT".to_string(), copilot_frontend_port.to_string());
+                    frontend_env.insert("VITE_API_URL".to_string(), format!("http://localhost:{copilot_backend_port}"));
                     let env = if def.cwd == "backend" {
                         &backend_env
+                    } else if def.cwd == "frontend" {
+                        &frontend_env
                     } else {
                         &empty_env
                     };
@@ -1768,14 +1845,51 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                 );
                 if fe_dir.is_dir() {
                     let fe_port_str = copilot_frontend_port.to_string();
+                    let mut fe_env = HashMap::new();
+                    fe_env.insert("PORT".to_string(), fe_port_str);
+                    fe_env.insert("VITE_API_URL".to_string(), format!("http://localhost:{copilot_backend_port}"));
                     try_spawn!(
                         svc,
                         "yarn",
-                        &["dev", "--port", &fe_port_str],
+                        &["dev"],
                         &fe_dir,
-                        &HashMap::new()
+                        &fe_env
                     );
                 }
+            }
+        }
+
+        // Infinity embedding server (copilot)
+        if !no_copilot && paths.copilot.is_dir() {
+            let infinity_url = format!("http://localhost:{copilot_infinity_port}");
+            let backend_dir = paths.copilot.join("backend");
+            let infinity_bin = backend_dir.join(".venv/bin/infinity_emb");
+            let infinity_model = parse_env_file(&copilot_env_path)
+                .get("INFINITY_MODEL")
+                .cloned()
+                .unwrap_or_else(|| "nomic-ai/nomic-embed-text-v1.5".to_string());
+            let mut svc = services::Svc::new(
+                "copilot-infinity",
+                Some(&infinity_url),
+                "/health",
+                120,
+                logs_dir.join("copilot-infinity.log"),
+            );
+            if !ensure_infinity_emb(&backend_dir) {
+                svc.health = Health::Degraded(
+                    "No Python venv found — run `python -m venv .venv && .venv/bin/pip install infinity-emb[all]` in backend/".into(),
+                );
+                svcs.push(svc);
+            } else {
+                let port_str = copilot_infinity_port.to_string();
+                let bin_str = infinity_bin.to_string_lossy().into_owned();
+                try_spawn!(
+                    svc,
+                    &bin_str,
+                    &["v2", "--model-id", &infinity_model, "--port", &port_str],
+                    &backend_dir,
+                    &HashMap::new()
+                );
             }
         }
 
@@ -2062,7 +2176,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                 if svcs[i].health.is_done() {
                     continue;
                 }
-                svcs[i].health = if ok {
+                let prev = svcs[i].health.label_plain();
+                let svc_name = svcs[i].name.clone();
+                let new_health = if ok {
                     Health::Up
                 } else if timed_out {
                     Health::Degraded(format!("no response after {timeout_secs}s"))
@@ -2072,6 +2188,10 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                         _ => Health::Probing(1),
                     }
                 };
+                if new_health.is_done() {
+                    llog!("[HEALTH] {svc_name}: {prev} → {}", new_health.label_plain());
+                }
+                svcs[i].health = new_health;
             }
         });
     }
@@ -2224,11 +2344,17 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
 
         // ── Crash detection ───────────────────────────────────────────────────
         let mut auto_diagnose: Option<(usize, crate::services::Svc)> = None;
+        let mut reaped_indices: Vec<usize> = Vec::new();
         {
             let mut svcs = state.lock().unwrap();
-            for p in &mut procs {
+            for (pi, p) in procs.iter_mut().enumerate() {
                 if let Some(code) = p.try_reap() {
                     let already_crashed = matches!(svcs[p.idx].health, Health::Crashed(_));
+                    if already_crashed {
+                        // Process already recorded as crashed — just remove from procs.
+                        reaped_indices.push(pi);
+                        continue;
+                    }
                     // If opencti-graphql crashes while ES is down, auto-defer so the
                     // auto-spawn loop re-launches it once ES recovers.
                     if svcs[p.idx].name == "opencti-graphql"
@@ -2239,11 +2365,13 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                             Health::Degraded("Waiting for OpenSearch/ES…".into());
                     } else {
                         svcs[p.idx].health = Health::Crashed(code);
+                        llog!("[CRASH] {}: exit {code}", svcs[p.idx].name);
                     }
                     force_render = true;
+                    reaped_indices.push(pi);
 
                     let is_real_crash = matches!(svcs[p.idx].health, Health::Crashed(_));
-                    if !already_crashed && !diagnosed.contains(&p.idx) && is_real_crash {
+                    if !diagnosed.contains(&p.idx) && is_real_crash {
                         diagnosed.insert(p.idx);
                         let log_path = svcs[p.idx].log_path.clone();
                         let svc_idx = p.idx;
@@ -2262,6 +2390,10 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                     }
                 }
             }
+        }
+        // Remove reaped procs in reverse order to preserve indices.
+        for pi in reaped_indices.into_iter().rev() {
+            procs.remove(pi);
         }
         if let Some((svc_idx, svc)) = auto_diagnose {
             let findings = diagnose_service(&svc, &paths, &ws_env_dir);
@@ -2757,6 +2889,69 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                         InputEvent::TogglePaths => {
                             show_paths = !show_paths;
                         }
+                        InputEvent::OpenInCode => {
+                            let dir: Option<std::path::PathBuf> = {
+                                let svcs = state.lock().unwrap();
+                                let visible: Vec<usize> = svcs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, s)| !matches!(s.health, Health::Pending))
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                visible.get(*cursor).and_then(|&idx| {
+                                    let name = &svcs[idx].name;
+                                    // Open the repo root, not the service subdirectory.
+                                    let repo_root = if name.starts_with("copilot") {
+                                        Some(paths.copilot.clone())
+                                    } else if name.starts_with("opencti") {
+                                        Some(paths.opencti.clone())
+                                    } else if name.starts_with("openaev") {
+                                        Some(paths.openaev.clone())
+                                    } else if name.starts_with("connector") {
+                                        Some(paths.connector.clone())
+                                    } else if name.starts_with("grafana") {
+                                        Some(paths.grafana.clone())
+                                    } else if name.starts_with("langfuse") {
+                                        Some(paths.langfuse.clone())
+                                    } else {
+                                        svcs[idx].spawn_cmd.as_ref().map(|c| c.dir.clone())
+                                    };
+                                    repo_root
+                                })
+                            };
+                            if let Some(dir) = dir {
+                                let candidates = [
+                                    "/usr/local/bin/code-insiders",
+                                    "/opt/homebrew/bin/code-insiders",
+                                    "/usr/local/bin/code",
+                                    "/opt/homebrew/bin/code",
+                                ];
+                                let launched = candidates.iter().any(|bin| {
+                                    std::path::Path::new(bin).exists()
+                                        && std::process::Command::new(bin)
+                                            .args(["--new-window", dir.to_str().unwrap_or(".")])
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                            .is_ok()
+                                });
+                                if !launched {
+                                    for app in &["Visual Studio Code - Insiders", "Visual Studio Code"] {
+                                        if std::process::Command::new("open")
+                                            .args(["-n", "-a", app, "--args", "--new-window", dir.to_str().unwrap_or(".")])
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                            .is_ok()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     },
                     Mode::LogView {
@@ -2854,7 +3049,10 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                                     let (cmd, log_path) = {
                                         let svcs = state.lock().unwrap();
                                         svcs.get(idx)
-                                            .map(|s| (s.spawn_cmd.clone(), s.log_path.clone()))
+                                            .map(|s| {
+                                                llog!("[RESTART] {} — restarting after fix", s.name);
+                                                (s.spawn_cmd.clone(), s.log_path.clone())
+                                            })
                                             .unwrap_or_default()
                                     };
                                     if let Some(cmd) = cmd {
@@ -3023,7 +3221,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                                         print!("\r\n  Creating issue…\r\n");
                                         let _ = io::stdout().flush();
                                         match create_github_issue(
-                                            f.kind, &svc_name, &f.title, &f.body, &log_tail, &ctx,
+                                            &f.kind, &svc_name, &f.title, &f.body, &log_tail, &ctx,
                                         ) {
                                             Ok(url) => {
                                                 print!("\r  {GRN}✓{R}  Issue created: {url}\r\n")

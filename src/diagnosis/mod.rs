@@ -2,6 +2,7 @@ pub mod engine;
 pub mod github;
 pub mod llm;
 pub mod patterns;
+pub mod recipe;
 
 pub use engine::{check_diag_patterns, diagnose_crash, diagnose_service};
 pub use github::{create_github_issue, venv_fix_steps, IssueContext};
@@ -83,7 +84,7 @@ impl FixAction {
 
 #[derive(Clone)]
 pub struct Finding {
-    pub kind: &'static str,
+    pub kind: String,
     pub title: String,
     pub body: Vec<String>,
     pub fix: Option<FixAction>,
@@ -91,9 +92,9 @@ pub struct Finding {
 }
 
 impl Finding {
-    pub fn info(kind: &'static str, title: impl Into<String>, body: Vec<String>) -> Self {
+    pub fn info(kind: impl Into<String>, title: impl Into<String>, body: Vec<String>) -> Self {
         Self {
-            kind,
+            kind: kind.into(),
             title: title.into(),
             body,
             fix: None,
@@ -101,13 +102,13 @@ impl Finding {
         }
     }
     pub fn fixable(
-        kind: &'static str,
+        kind: impl Into<String>,
         title: impl Into<String>,
         body: Vec<String>,
         fix: FixAction,
     ) -> Self {
         Self {
-            kind,
+            kind: kind.into(),
             title: title.into(),
             body,
             fix: Some(fix),
@@ -128,17 +129,20 @@ pub fn run_fix_action(action: &FixAction) -> bool {
     let sep = "─".repeat(56);
     match action {
         FixAction::Steps { label, steps, .. } => {
+            crate::launcher_log::log(&format!("[FIX] applying: {label}"));
             println!("\n  {BOLD}{CYN}Applying fix:{R}  {label}\n  {DIM}{sep}{R}\n");
             for step in steps {
                 println!("  {DIM}$ {}{R}", step.args.join(" "));
                 let prog = step.args[0].as_str();
                 let argv: Vec<&str> = step.args[1..].iter().map(|s| s.as_str()).collect();
-                let code = run_blocking(prog, &argv, &step.cwd);
+                let code = run_blocking(prog, &argv, &step.cwd); // run_blocking already logs
                 if code != 0 {
+                    crate::launcher_log::log(&format!("[FIX] failed (exit {code}) — remaining steps skipped"));
                     println!("\n  {RED}✗{R}  Command exited {code}. Remaining steps skipped.");
                     return false;
                 }
             }
+            crate::launcher_log::log("[FIX] applied successfully");
             println!("\n  {GRN}✓{R}  Fix applied.");
             true
         }

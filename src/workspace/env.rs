@@ -225,7 +225,34 @@ pub fn deploy_workspace_env(src: &Path, dest: &Path) {
     if let Some(parent) = dest.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::copy(src, dest);
+    // Values with \n escapes must be double-quoted so that python-dotenv expands
+    // them into actual newlines (required for PEM certificates, etc.).
+    let Ok(content) = fs::read_to_string(src) else {
+        let _ = fs::copy(src, dest);
+        return;
+    };
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            if v.contains("\\n") {
+                out_lines.push(format!("{}=\"{}\"", k.trim(), v));
+            } else {
+                out_lines.push(line.to_string());
+            }
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    let mut output = out_lines.join("\n");
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    let _ = fs::write(dest, output);
 }
 
 // ── Port helpers ──────────────────────────────────────────────────────────────
@@ -380,6 +407,9 @@ pub fn apply_port_offset_to_env(env_path: &Path, product: &str, port_offset: u16
             changed |= shift_url_port(&mut map, "REDIS_URL", 6380, port_offset);
             // MinIO: preflight_port_checks already moved 9000→9002 (compose maps 9002:9000)
             changed |= shift_url_port(&mut map, "S3_ENDPOINT", 9002, port_offset);
+            // Infinity embedding server
+            changed |= shift_url_port(&mut map, "INFINITY_URL", 7997, port_offset);
+            changed |= shift_url_port(&mut map, "DEFAULT_EMBEDDING_PROVIDER_BASE_URL", 7997, port_offset);
             // BASE_URL and FRONTEND_URL are handled by patch_url_default in main.rs
         }
         "opencti" => {

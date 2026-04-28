@@ -2,6 +2,7 @@ pub mod credentials;
 pub mod diagnose;
 pub mod logview;
 pub mod overview;
+pub mod splash;
 
 pub use credentials::{build_credentials_lines, gather_credentials, CredEntry};
 pub use diagnose::build_diagnose_lines;
@@ -131,6 +132,7 @@ pub enum InputEvent {
     TogglePaths,
     /// Leave the TUI and return to the workspace selector without stopping the stack.
     Detach,
+    OpenInCode,
 }
 
 /// Translate a crossterm `KeyEvent` into our `InputEvent` vocabulary.
@@ -162,6 +164,7 @@ pub fn map_key_event(ke: KeyEvent) -> Option<InputEvent> {
         KeyCode::Char('c') if !ke.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(InputEvent::RotateLog)
         }
+        KeyCode::Char('o') | KeyCode::Char('O') => Some(InputEvent::OpenInCode),
         _ => None,
     }
 }
