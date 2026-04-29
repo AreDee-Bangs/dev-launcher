@@ -686,14 +686,23 @@ fn run_as_selector(args: &Args, workspace_root: &Path, ws_dir: &Path) {
         let (cfg, _, _) = resolve_workspace(args, workspace_root, ws_dir);
         loop {
             if selector_stopping.load(Ordering::Relaxed) { break; }
+            let prev_stopped = stopped.len();
             let pid = spawn_session_worker(&exe, &cfg.hash, args.clean_start);
-            wait_for_session(pid, &cfg.hash, &mut stopped);
+            let clean = wait_for_session(pid, &cfg.hash, &mut stopped);
             if selector_stopping.load(Ordering::Relaxed) { break; }
+            let was_detached = stopped.len() > prev_stopped;
+            // Clean exit (q pressed) and not a detach → show workspace selector.
+            // Any other exit (crash, non-0) loops back and restarts the session.
+            if clean && !was_detached { break; }
         }
-        for s in &stopped {
-            unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+        if selector_stopping.load(Ordering::Relaxed) {
+            // Ctrl+C — terminate any detached sessions and exit.
+            for s in &stopped {
+                unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+            }
+            return;
         }
-        return;
+        // q pressed — fall through to the workspace selector below.
     }
 
     startup_orphan_check(ws_dir, workspace_root);
@@ -2402,7 +2411,10 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
             if want_restart {
                 print!("\x1b[H\x1b[2J");
                 let _ = io::stdout().flush();
-                continue 'session;
+                // Exit with 0 so the parent selector process sees a clean exit
+                // and can show the workspace picker.  `continue 'session` would
+                // relaunch the entire stack, which is not what the user wants.
+                std::process::exit(0);
             }
             break 'session;
         }
