@@ -1920,7 +1920,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
             let mut svc = services::Svc::new(
                 "copilot-infinity",
                 Some(&infinity_url),
-                "/v1/health",
+                "/health",
                 120,
                 logs_dir.join("copilot-infinity.log"),
             );
