@@ -1938,10 +1938,14 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
                 // --no-bettertransformer: the default (true) triggers a NameError in
                 // infinity-emb 0.0.76 when optimum is not installed, because
                 // acceleration.py uses BetterTransformerManager without an availability guard.
+                // --url-prefix /v1: mounts all routes under /v1/ so the server is
+                // OpenAI-compatible (/v1/models, /v1/embeddings) and can be added
+                // as a Custom OpenAI-Compatible provider in the Copilot UI.
                 try_spawn!(
                     svc,
                     &bin_str,
-                    &["v2", "--model-id", &infinity_model, "--port", &port_str, "--no-bettertransformer"],
+                    &["v2", "--model-id", &infinity_model, "--port", &port_str,
+                      "--no-bettertransformer", "--url-prefix", "/v1"],
                     infinity_dir,
                     &HashMap::new()
                 );
