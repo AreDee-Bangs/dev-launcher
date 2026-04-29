@@ -1,13 +1,15 @@
 pub mod env;
 pub mod git;
+pub mod pem;
 pub mod repos;
 pub mod selector;
 
 pub use env::{
-    deploy_workspace_env, extract_url_port, global_prefs_path, init_workspace_env, is_placeholder,
-    parse_env_file, patch_url_default, port_in_use, preflight_port_checks, read_env_url_port,
-    run_env_wizard, run_platform_mode_selector, write_env_file, ws_env_path, EnvVar, PortCheck,
-    CONNECTOR_ENV_VARS, CONNECTOR_LICENCE_VARS, COPILOT_ENV_VARS, OPENCTI_ENV_VARS,
+    apply_port_offset_to_env, deploy_workspace_env, extract_url_port, global_prefs_path,
+    init_workspace_env, is_placeholder, parse_env_file, patch_url_default, port_in_use,
+    preflight_port_checks, read_env_url_port, run_env_wizard, run_platform_mode_selector,
+    write_env_file, ws_env_path, EnvVar, PortCheck, CONNECTOR_ENV_VARS, CONNECTOR_LICENCE_VARS,
+    COPILOT_ENV_VARS, OPENCTI_ENV_VARS,
 };
 pub use git::{
     branch_to_slug, current_branch, current_commit_short, derive_branch_from_path, ensure_worktree,
@@ -17,6 +19,7 @@ pub use git::{
 pub use repos::{
     clone_repos, load_repos, run_clone_selector, CloneChoice, RepoEntry, DEFAULT_REPOS_CONF,
 };
+pub use pem::{find_pem_candidates, inject_selected_pems, pem_search_dirs, run_pem_selector};
 pub use selector::{
     choices_to_workspace, default_product_choices, discover_flags_in_dir, read_active_flags,
     run_flag_selector, run_product_selector, run_workspace_delete, run_workspace_selector,
@@ -27,6 +30,9 @@ pub use selector::{
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Port step between workspaces — each workspace gets a reserved block of 100 ports.
+pub const PORT_STEP: u16 = 100;
 
 // ── Workspace constants ───────────────────────────────────────────────────────
 
@@ -46,7 +52,24 @@ pub const PRODUCTS: &[(&str, &str, &str, &str)] = &[
         "connector",
         "import-document-ai",
     ),
+    (
+        "grafana",
+        "Grafana",
+        "grafana",
+        "grafana · loki · promtail",
+    ),
+    (
+        "langfuse",
+        "Langfuse",
+        "langfuse",
+        "tracing · observability",
+    ),
 ];
+
+/// Returns true for Docker-only infra products that have no git repo or branch concept.
+pub fn is_infra_product(key: &str) -> bool {
+    matches!(key, "grafana" | "langfuse")
+}
 
 /// Return `{workspace_root}/.dev-workspaces`.
 pub fn workspaces_dir(workspace_root: &Path) -> PathBuf {
@@ -67,6 +90,8 @@ pub struct WorkspaceConfig {
     pub hash: String,
     pub created: String,
     pub entries: Vec<WorkspaceEntry>,
+    /// Added to every default port — 0 means use defaults, 15000/30000 for extra workspaces.
+    pub port_offset: u16,
 }
 
 impl WorkspaceConfig {
@@ -141,7 +166,10 @@ pub fn save_workspace(dir: &Path, config: &WorkspaceConfig) {
     let wdir = dir.join(&config.hash);
     let _ = fs::create_dir_all(&wdir);
     let path = wdir.join("workspace.conf");
-    let mut out = format!("hash={}\ncreated={}\n", config.hash, config.created);
+    let mut out = format!(
+        "hash={}\ncreated={}\nport_offset={}\n",
+        config.hash, config.created, config.port_offset
+    );
     for (e, (_, _, key, _)) in config.entries.iter().zip(PRODUCTS.iter()) {
         out.push_str(&format!(
             "{}_enabled={}\n{}_branch={}\n",
@@ -177,6 +205,10 @@ pub fn load_workspace(dir: &Path, hash: &str) -> Option<WorkspaceConfig> {
         hash: hash.to_string(),
         created: map.get("created").cloned().unwrap_or_default(),
         entries,
+        port_offset: map
+            .get("port_offset")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
     })
 }
 
@@ -196,6 +228,24 @@ pub fn list_workspaces(dir: &Path) -> Vec<WorkspaceConfig> {
         .collect();
     configs.sort_by(|a, b| b.created.cmp(&a.created));
     configs
+}
+
+/// Return the smallest port offset (a multiple of [`PORT_STEP`]) not already
+/// claimed by any workspace in `ws_dir`.  Caps at 9 extra workspaces
+/// (offsets 0, 100, 200, … 900); falls back to 0 when the table is full.
+pub fn find_free_offset(ws_dir: &Path) -> u16 {
+    let taken: std::collections::HashSet<u16> =
+        list_workspaces(ws_dir).into_iter().map(|c| c.port_offset).collect();
+    let mut offset = 0u16;
+    loop {
+        if !taken.contains(&offset) {
+            return offset;
+        }
+        offset = offset.saturating_add(PORT_STEP);
+        if offset > 900 {
+            return 0;
+        }
+    }
 }
 
 pub fn tombstone_workspace(dir: &Path, hash: &str) {

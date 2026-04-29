@@ -4,6 +4,7 @@
 pub mod args;
 pub mod config;
 pub mod diagnosis;
+pub mod launcher_log;
 pub mod services;
 pub mod tui;
 pub mod workspace;
@@ -29,15 +30,19 @@ use crossterm::{
 // ── Public re-exports from submodules ─────────────────────────────────────────
 
 use args::Args;
-use config::{load_config, resolve_workspace_root};
+use config::{load_config, read_line_or_interrupt, resolve_workspace_root};
 use diagnosis::{create_github_issue, diagnose_service, needs_recipe, DiagEvent, IssueContext};
 use services::{
-    docker_available, docker_compose_down, docker_compose_up, ensure_opencti_env,
+    alive_pid_count, docker_available, docker_compose_down, docker_compose_up,
+    docker_down_workspace, docker_running_for_workspace, ensure_opencti_env,
     ensure_opencti_graphql_python_deps, kill_orphaned_pids, load_repo_manifest,
-    patch_manifest_ports, pid_file_path, probe, read_compose_postgres_password, record_pid,
-    resolve_docker_project, run_blocking, run_manifest_bootstrap, sighup_handler, spawn_svc,
-    split_health_url_parts, wipe_opencti_es_indices_if_stale, write_compose_override,
-    ws_docker_project, DockerProject, Health, Paths, Proc, SpawnCmd, State, SIGHUP_STOP,
+    mark_detached, detached_marker_path, opensearch_ready, patch_manifest_ports, pid_file_path,
+    probe, read_compose_postgres_password, read_worker_pid, record_pid, compress_rotated_logs,
+    remove_worker_pid, resolve_docker_project, rotate_log, run_blocking, run_manifest_bootstrap,
+    sighup_handler, shutdown_detached_session, spawn_svc, split_health_url_parts,
+    wait_for_opensearch, wipe_opencti_es_indices_if_stale, workspace_run_status,
+    write_compose_override, write_worker_pid, ws_docker_project,
+    DockerProject, Health, Paths, Proc, SpawnCmd, State, WorkspaceRunStatus, SIGHUP_STOP,
 };
 use tui::{
     build_credentials_lines, build_diagnose_lines, build_log_view_lines, build_overview_lines,
@@ -46,15 +51,17 @@ use tui::{
     BUILD_VERSION, CYN, DIM, GRN, R, RED, YLW,
 };
 use workspace::{
-    branch_to_slug, choices_to_workspace, compute_workspace_hash, current_branch,
-    current_commit_short, default_product_choices, deploy_workspace_env, discover_flags_in_dir,
-    ensure_worktree, extract_url_port, init_workspace_env, list_workspaces, load_workspace,
-    parse_env_file, patch_url_default, port_in_use, preflight_port_checks, read_active_flags,
-    read_env_url_port, run_env_wizard, run_flag_selector, run_platform_mode_selector,
-    run_product_selector, run_workspace_delete, run_workspace_selector, save_workspace, today,
-    workspace_to_choices, workspaces_dir, write_active_flags, write_env_file, ws_env_path,
-    FlagChoice, LaunchMode, PortCheck, ProductChoice, WorkspaceAction, WorkspaceConfig,
-    WorkspaceEntry, COMMIT_PREFIX, CONNECTOR_ENV_VARS, COPILOT_ENV_VARS, OPENCTI_ENV_VARS,
+    apply_port_offset_to_env, branch_to_slug, choices_to_workspace, compute_workspace_hash,
+    current_branch, current_commit_short, default_product_choices, deploy_workspace_env,
+    discover_flags_in_dir, ensure_worktree, extract_url_port, find_free_offset,
+    find_pem_candidates, init_workspace_env, inject_selected_pems, list_workspaces, load_workspace,
+    parse_env_file, patch_url_default, pem_search_dirs, port_in_use, preflight_port_checks,
+    read_active_flags, read_env_url_port, run_env_wizard, run_flag_selector,
+    run_pem_selector, run_platform_mode_selector, run_product_selector, run_workspace_delete,
+    run_workspace_selector, save_workspace, today, workspace_to_choices, workspaces_dir,
+    write_active_flags, write_env_file, ws_env_path, FlagChoice, LaunchMode, PortCheck,
+    ProductChoice, WorkspaceAction, WorkspaceConfig, WorkspaceEntry, COMMIT_PREFIX,
+    CONNECTOR_ENV_VARS, COPILOT_ENV_VARS, OPENCTI_ENV_VARS,
 };
 
 // ── Per-product startup helpers ───────────────────────────────────────────────
@@ -154,6 +161,95 @@ fn copilot_backend_env(copilot_dir: &Path) -> HashMap<String, String> {
     env
 }
 
+fn ensure_copilot_backend_venv(backend_dir: &Path) {
+    let venv = backend_dir.join(".venv");
+    if venv.join("bin/python").exists() {
+        return;
+    }
+    println!("  Creating Copilot backend Python venv…");
+    let _ = io::stdout().flush();
+    run_blocking("python3", &["-m", "venv", ".venv"], backend_dir);
+    let pip = venv.join("bin/pip").to_string_lossy().into_owned();
+    if backend_dir.join("requirements.txt").exists() {
+        println!("  Installing Python dependencies…");
+        let _ = io::stdout().flush();
+        let reqs = backend_dir
+            .join("requirements.txt")
+            .to_string_lossy()
+            .into_owned();
+        run_blocking(&pip, &["install", "-r", &reqs], backend_dir);
+    } else if backend_dir.join("pyproject.toml").exists() {
+        println!("  Installing Python dependencies…");
+        let _ = io::stdout().flush();
+        run_blocking(&pip, &["install", "-e", "."], backend_dir);
+    }
+}
+
+/// Ensure infinity-emb is installed and healthy in its own isolated venv.
+/// Validates the install by running `infinity_emb --help` — not just checking
+/// that the binary exists. A broken install (missing typer, bad optimum, etc.)
+/// is detected here and repaired before the service ever starts.
+fn ensure_infinity_emb_isolated(infinity_dir: &Path) -> bool {
+    let bin = infinity_dir.join(".venv/bin/infinity_emb");
+    let pip = infinity_dir.join(".venv/bin/pip");
+
+    let is_healthy = || -> bool {
+        // Binary must exist and respond to --help (catches typer/CLI issues).
+        // Also require einops explicitly — it's needed by nomic-embed-text-v1.5
+        // but is not pulled in transitively by infinity-emb's own extras.
+        bin.exists()
+            && Command::new(&bin)
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            && pip.exists()
+            && Command::new(&pip)
+                .args(["show", "einops"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+    };
+
+    if is_healthy() {
+        return true;
+    }
+
+    if !pip.exists() {
+        println!("  Creating isolated infinity-emb venv…");
+        let _ = fs::create_dir_all(infinity_dir);
+        run_blocking("python3", &["-m", "venv", ".venv"], infinity_dir);
+        if !pip.exists() {
+            return false;
+        }
+        println!("  Installing infinity-emb[server,torch,transformers] (first run — may take a minute)…");
+    } else {
+        println!("  infinity-emb install is unhealthy — repairing…");
+    }
+
+    // [server] includes fastapi + uvicorn + typer (required by the v2 CLI entrypoint).
+    // click<8.2 keeps typer 0.12 working (click>=8.2 broke the CLI bootstrap).
+    // einops is required by nomic-embed-text-v1.5 (dynamic module import).
+    run_blocking(
+        pip.to_str().unwrap_or("pip"),
+        &["install", "infinity-emb[server,torch,transformers]", "click<8.2", "einops"],
+        infinity_dir,
+    );
+
+    // optimum/optimum-onnx creates an `optimum/` namespace that tricks
+    // CHECK_OPTIMUM.is_available into returning True, but bettertransformer
+    // was removed from optimum >= 1.21 — causing NameError at startup.
+    // Uninstall proactively; they are not needed for torch-based inference.
+    let pip_str = pip.to_str().unwrap_or("pip");
+    run_blocking(pip_str, &["uninstall", "-y", "optimum", "optimum-onnx"], infinity_dir);
+
+    is_healthy()
+}
+
 fn ensure_copilot_fe_deps(dir: &Path) {
     if !dir.join("node_modules").is_dir() {
         println!("  Installing Copilot frontend deps…");
@@ -184,12 +280,101 @@ fn maven_cmd(openaev_root: &Path) -> String {
     }
 }
 
+fn bootstrap_infra_dir(dir: &Path, repo: &str) {
+    let is_new = !dir.is_dir();
+    if is_new {
+        println!("  Bootstrapping {repo} infra directory…");
+    }
+    match repo {
+        "grafana" => {
+            fs::create_dir_all(dir.join("provisioning/datasources"))
+                .expect("cannot create grafana dir");
+            if is_new {
+                let _ = fs::write(
+                    dir.join("docker-compose.dev.yml"),
+                    include_str!("infra/grafana/docker-compose.dev.yml"),
+                );
+                let _ = fs::write(
+                    dir.join("loki-config.yml"),
+                    include_str!("infra/grafana/loki-config.yml"),
+                );
+                let _ = fs::write(
+                    dir.join("promtail-config.yml"),
+                    include_str!("infra/grafana/promtail-config.yml"),
+                );
+                let _ = fs::write(
+                    dir.join("provisioning/datasources/loki.yml"),
+                    include_str!("infra/grafana/provisioning/datasources/loki.yml"),
+                );
+            }
+            let env_path = dir.join(".env");
+            if !env_path.exists() {
+                let _ = fs::write(
+                    &env_path,
+                    "\
+# Grafana dev environment — edit to override defaults from docker-compose.dev.yml
+# Uncomment and change any value you want to customise.
+
+#GRAFANA_PORT=3200
+#LOKI_PORT=3101
+
+# By default Grafana runs with anonymous Admin access (no login required).
+# To enable the login form, set the three variables below.
+#GF_AUTH_ANONYMOUS_ENABLED=false
+#GF_AUTH_DISABLE_LOGIN_FORM=false
+#GF_SECURITY_ADMIN_USER=admin
+#GF_SECURITY_ADMIN_PASSWORD=admin
+",
+                );
+            }
+        }
+        "langfuse" => {
+            fs::create_dir_all(dir).expect("cannot create langfuse dir");
+            if is_new {
+                let _ = fs::write(
+                    dir.join("docker-compose.dev.yml"),
+                    include_str!("infra/langfuse/docker-compose.dev.yml"),
+                );
+            }
+            let env_path = dir.join(".env");
+            if !env_path.exists() {
+                let _ = fs::write(
+                    &env_path,
+                    "\
+# Langfuse dev environment — edit to override defaults from docker-compose.dev.yml
+# Uncomment and change any value you want to customise.
+
+#LANGFUSE_PORT=3201
+#LANGFUSE_DB_PORT=5433
+#LANGFUSE_DB_PASSWORD=langfuse_dev
+
+#LANGFUSE_ADMIN_EMAIL=admin@example.com
+#LANGFUSE_ADMIN_PASSWORD=changeme
+#LANGFUSE_ADMIN_NAME=Admin
+
+#LANGFUSE_PROJECT_NAME=filigran-dev
+#LANGFUSE_PUBLIC_KEY=lf_pk_dev_changeme_publickey
+#LANGFUSE_SECRET_KEY=lf_sk_dev_changeme_secretkey
+
+# Secrets — change these if you expose this instance beyond localhost.
+#LANGFUSE_NEXTAUTH_SECRET=langfuse_dev_nextauth_secret_changeme
+#LANGFUSE_SALT=langfuse_dev_salt_changeme
+",
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn clean_docker_for_workspace(
     slug: &str,
     paths: &Paths,
     no_copilot: bool,
     no_opencti: bool,
     no_openaev: bool,
+    no_grafana: bool,
+    no_langfuse: bool,
 ) {
     use services::{resolve_product_docker_for_down, run_blocking_logged};
 
@@ -202,6 +387,8 @@ fn clean_docker_for_workspace(
         ("filigran-copilot", paths.copilot.as_path(), no_copilot),
         ("opencti", paths.opencti.as_path(), no_opencti),
         ("openaev", paths.openaev.as_path(), no_openaev),
+        ("grafana", paths.grafana.as_path(), no_grafana),
+        ("langfuse", paths.langfuse.as_path(), no_langfuse),
     ];
 
     for &(repo, dir, skip) in products {
@@ -262,7 +449,7 @@ fn clean_docker_for_workspace(
         let file_str = compose_file.to_str().unwrap_or("");
 
         println!("    {DIM}─ (a) workspace-scoped down -v{R}");
-        let ws_override = write_compose_override(&compose_file, slug);
+        let ws_override = write_compose_override(&compose_file, slug, 0);
         let mut argv: Vec<&str> = vec!["compose", "-p", &ws_proj, "-f", file_str];
         let ov_str: String;
         if let Some(ref ov) = ws_override {
@@ -373,6 +560,304 @@ fn build_entries_from_branches(args: &Args) -> Vec<WorkspaceEntry> {
         .collect()
 }
 
+// ── Subprocess session management ────────────────────────────────────────────
+
+struct StoppedSession {
+    hash: String,
+    pid: u32,
+}
+
+fn spawn_session_worker(exe: &Path, hash: &str, clean: bool) -> u32 {
+    let mut cmd = Command::new(exe);
+    cmd.arg("--session-worker").arg("--workspace").arg(hash);
+    if clean {
+        cmd.arg("--clean-start");
+    }
+    let child = cmd.spawn().expect("failed to spawn session worker");
+    let pid = child.id();
+    std::mem::forget(child);
+    pid
+}
+
+fn wait_for_session(pid: u32, hash: &str, stopped: &mut Vec<StoppedSession>) -> bool {
+    loop {
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WUNTRACED) };
+        if ret <= 0 {
+            return false;
+        }
+        if libc::WIFEXITED(status) {
+            return libc::WEXITSTATUS(status) == 0;
+        }
+        if libc::WIFSIGNALED(status) {
+            return false;
+        }
+        if libc::WIFSTOPPED(status) {
+            stopped.push(StoppedSession { hash: hash.to_string(), pid });
+            return true;
+        }
+    }
+}
+
+fn startup_orphan_check(ws_dir: &Path, _workspace_root: &Path) {
+    for ws in list_workspaces(ws_dir) {
+        if !detached_marker_path(&ws.hash).exists() {
+            continue;
+        }
+
+        if let Some(worker_pid) = read_worker_pid(&ws.hash) {
+            let alive = unsafe { libc::kill(worker_pid as libc::pid_t, 0) } == 0;
+            if alive {
+                eprintln!(
+                    "  [dev-launcher] Stopped session {} found (previous selector exited). Terminating.",
+                    ws.hash
+                );
+                unsafe { libc::kill(worker_pid as libc::pid_t, libc::SIGTERM); }
+                thread::sleep(Duration::from_millis(300));
+                unsafe { libc::kill(worker_pid as libc::pid_t, libc::SIGKILL); }
+                remove_worker_pid(&ws.hash);
+                let _ = fs::remove_file(detached_marker_path(&ws.hash));
+                continue;
+            } else {
+                remove_worker_pid(&ws.hash);
+            }
+        }
+
+        match workspace_run_status(&ws.hash) {
+            WorkspaceRunStatus::Running | WorkspaceRunStatus::Degraded => {
+                let alive = alive_pid_count(&ws.hash);
+                println!(
+                    "\n  Detached session still running: {}  {GRN}● {alive} process(es) alive{R}",
+                    ws.summary()
+                );
+                print!("  [s] stop   [Enter] ignore  ");
+                let _ = io::stdout().flush();
+                let mut answer = String::new();
+                let _ = io::stdin().read_line(&mut answer);
+                if answer.trim().eq_ignore_ascii_case("s") {
+                    shutdown_detached_session(&ws.hash);
+                }
+                let _ = fs::remove_file(detached_marker_path(&ws.hash));
+            }
+            WorkspaceRunStatus::Failed | WorkspaceRunStatus::NotRunning => {
+                if docker_running_for_workspace(&ws.hash) {
+                    println!(
+                        "\n  Detached session is dirty: {}  {YLW}● host processes stopped, Docker containers still running{R}",
+                        ws.summary()
+                    );
+                    print!("  [c] clean up Docker   [Enter] ignore  ");
+                    let _ = io::stdout().flush();
+                    let mut answer = String::new();
+                    let _ = io::stdin().read_line(&mut answer);
+                    if answer.trim().eq_ignore_ascii_case("c") {
+                        docker_down_workspace(&ws.hash);
+                    }
+                }
+                let _ = fs::remove_file(detached_marker_path(&ws.hash));
+                let _ = fs::remove_file(pid_file_path(&ws.hash));
+            }
+        }
+    }
+}
+
+fn run_as_selector(args: &Args, workspace_root: &Path, ws_dir: &Path) {
+    print!("\x1b[H\x1b[2J");
+    let _ = io::stdout().flush();
+
+    let selector_stopping = Arc::new(AtomicBool::new(false));
+    {
+        let f = Arc::clone(&selector_stopping);
+        ctrlc::set_handler(move || f.store(true, Ordering::Relaxed))
+            .expect("failed to set Ctrl+C handler");
+    }
+
+    let exe = std::env::current_exe().expect("cannot determine current executable path");
+    let mut stopped: Vec<StoppedSession> = Vec::new();
+
+    let has_direct = args.workspace.is_some()
+        || args.copilot_branch.is_some() || args.opencti_branch.is_some()
+        || args.openaev_branch.is_some() || args.connector_branch.is_some()
+        || args.copilot_commit.is_some() || args.opencti_commit.is_some()
+        || args.openaev_commit.is_some() || args.connector_commit.is_some()
+        || args.copilot_worktree.is_some() || args.opencti_worktree.is_some()
+        || args.openaev_worktree.is_some() || args.connector_worktree.is_some();
+
+    if has_direct {
+        let (cfg, _, _) = resolve_workspace(args, workspace_root, ws_dir);
+        loop {
+            if selector_stopping.load(Ordering::Relaxed) { break; }
+            let prev_stopped = stopped.len();
+            let pid = spawn_session_worker(&exe, &cfg.hash, args.clean_start);
+            let clean = wait_for_session(pid, &cfg.hash, &mut stopped);
+            if selector_stopping.load(Ordering::Relaxed) { break; }
+            let was_detached = stopped.len() > prev_stopped;
+            // Clean exit (q pressed) and not a detach → show workspace selector.
+            // Any other exit (crash, non-0) loops back and restarts the session.
+            if clean && !was_detached { break; }
+        }
+        if selector_stopping.load(Ordering::Relaxed) {
+            // Ctrl+C — terminate any detached sessions and exit.
+            for s in &stopped {
+                unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+            }
+            return;
+        }
+        // q pressed — fall through to the workspace selector below.
+    }
+
+    startup_orphan_check(ws_dir, workspace_root);
+
+    'selector: loop {
+        if selector_stopping.load(Ordering::Relaxed) {
+            for s in &stopped {
+                unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+            }
+            print!("\x1b[H\x1b[2J");
+            let _ = io::stdout().flush();
+            break;
+        }
+
+        ensure_cooked_output();
+        let stopped_hashes: HashSet<String> = stopped.iter().map(|s| s.hash.clone()).collect();
+
+        let workspaces = list_workspaces(ws_dir);
+        if workspaces.is_empty() {
+            let (cfg, _, clean) = build_new_workspace_interactive(workspace_root, ws_dir);
+            let pid = spawn_session_worker(&exe, &cfg.hash, clean);
+            wait_for_session(pid, &cfg.hash, &mut stopped);
+            continue 'selector;
+        }
+
+        drain_input_events();
+        let action = loop {
+            let workspaces = list_workspaces(ws_dir);
+            match run_workspace_selector(&workspaces, &stopped_hashes) {
+                WorkspaceAction::Delete(cfg) => {
+                    if let Some(pos) = stopped.iter().position(|s| s.hash == cfg.hash) {
+                        let s = stopped.remove(pos);
+                        unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+                        thread::sleep(Duration::from_millis(500));
+                        unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGKILL); }
+                        let _ = fs::remove_file(detached_marker_path(&s.hash));
+                        remove_worker_pid(&s.hash);
+                    }
+                    run_workspace_delete(&cfg, workspace_root, ws_dir);
+                }
+                other => break other,
+            }
+        };
+
+        match action {
+            WorkspaceAction::Reattach(cfg) => {
+                if let Some(pos) = stopped.iter().position(|s| s.hash == cfg.hash) {
+                    let s = stopped.remove(pos);
+                    unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGCONT); }
+                    wait_for_session(s.pid, &s.hash, &mut stopped);
+                }
+            }
+            WorkspaceAction::StopSession(cfg) => {
+                if let Some(pos) = stopped.iter().position(|s| s.hash == cfg.hash) {
+                    let s = stopped.remove(pos);
+                    unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+                    thread::sleep(Duration::from_millis(500));
+                    unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGKILL); }
+                    let _ = fs::remove_file(detached_marker_path(&s.hash));
+                    remove_worker_pid(&s.hash);
+                }
+            }
+            WorkspaceAction::Open(cfg) => {
+                let mut choices = workspace_to_choices(&cfg, workspace_root);
+                drain_input_events();
+                let clean = match run_product_selector(&cfg.hash, &mut choices) {
+                    LaunchMode::Quit => continue 'selector,
+                    LaunchMode::Clean => true,
+                    LaunchMode::Normal => false,
+                };
+                let updated_cfg = choices_to_workspace(&choices);
+                save_workspace(ws_dir, &updated_cfg);
+                let pid = spawn_session_worker(&exe, &updated_cfg.hash, clean);
+                wait_for_session(pid, &updated_cfg.hash, &mut stopped);
+            }
+            WorkspaceAction::CreateNew => {
+                let mut choices = default_product_choices(workspace_root);
+                drain_input_events();
+                let clean = match run_product_selector("new", &mut choices) {
+                    LaunchMode::Quit => continue 'selector,
+                    LaunchMode::Clean => true,
+                    LaunchMode::Normal => false,
+                };
+                let mut cfg = choices_to_workspace(&choices);
+                cfg.port_offset = find_free_offset(ws_dir);
+                save_workspace(ws_dir, &cfg);
+                let pid = spawn_session_worker(&exe, &cfg.hash, clean);
+                wait_for_session(pid, &cfg.hash, &mut stopped);
+            }
+            WorkspaceAction::Delete(_) => {
+                // Handled inline in the inner loop above.
+            }
+            WorkspaceAction::Quit => {
+                if !stopped.is_empty() {
+                    println!("\n  Detached session(s) still running:");
+                    for s in &stopped {
+                        println!("    {CYN}●{R}  {}", s.hash);
+                    }
+                    print!("\n  Shut them down? [y/N] ");
+                    let _ = io::stdout().flush();
+                    let mut ans = String::new();
+                    let _ = io::stdin().read_line(&mut ans);
+                    if ans.trim().eq_ignore_ascii_case("y") {
+                        for s in &stopped {
+                            unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGTERM); }
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                        for s in &stopped {
+                            unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGKILL); }
+                        }
+                    }
+                }
+                print!("\x1b[H\x1b[2J");
+                let _ = io::stdout().flush();
+                return;
+            }
+        }
+    }
+}
+
+/// Ask (once per workspace) whether OpenCTI should connect to XTM One / Copilot.
+/// Saves `XTM_ONE_ENABLED=true/false` into the opencti workspace env so the
+/// answer persists across restarts without re-prompting.
+fn prompt_xtm_one_opencti_integration(opencti_env: &Path) {
+    let mut env = parse_env_file(opencti_env);
+    if env.contains_key("XTM_ONE_ENABLED") {
+        return; // Already answered for this workspace
+    }
+    println!();
+    println!(
+        "  {BOLD}OpenCTI + XTM One (Copilot) integration{R}"
+    );
+    println!("  {DIM}When enabled, OpenCTI will connect to the running Copilot instance{R}");
+    println!("  {DIM}using its platform registration token once it has started.{R}");
+    println!();
+    print!("  Enable XTM One integration in OpenCTI? [y/N] ");
+    let _ = io::stdout().flush();
+    let enabled = match read_line_or_interrupt() {
+        Some(l) => l.trim().eq_ignore_ascii_case("y"),
+        None => false,
+    };
+    env.insert(
+        "XTM_ONE_ENABLED".to_string(),
+        if enabled { "true" } else { "false" }.to_string(),
+    );
+    write_env_file(opencti_env, &env);
+    if enabled {
+        println!(
+            "  {GRN}✓{R}  Integration enabled — XTM One token will be injected when Copilot is up.\n"
+        );
+    } else {
+        println!("  {DIM}Integration disabled for this workspace.{R}\n");
+    }
+}
+
 fn build_new_workspace_interactive(
     workspace_root: &Path,
     ws_dir: &Path,
@@ -383,7 +868,8 @@ fn build_new_workspace_interactive(
         LaunchMode::Clean => true,
         LaunchMode::Normal => false,
     };
-    let cfg = choices_to_workspace(&choices);
+    let mut cfg = choices_to_workspace(&choices);
+    cfg.port_offset = find_free_offset(ws_dir);
     save_workspace(ws_dir, &cfg);
     (cfg, choices, clean)
 }
@@ -397,7 +883,7 @@ fn resolve_workspace(
         match load_workspace(ws_dir, hash) {
             Some(cfg) => {
                 let choices = workspace_to_choices(&cfg, workspace_root);
-                (cfg, choices, false)
+                (cfg, choices, args.clean_start)
             }
             None => {
                 eprintln!("Workspace '{}' not found in {}.", hash, ws_dir.display());
@@ -424,6 +910,7 @@ fn resolve_workspace(
                 hash: hash.clone(),
                 created: today(),
                 entries,
+                port_offset: find_free_offset(ws_dir),
             };
             save_workspace(ws_dir, &c);
             c
@@ -431,13 +918,16 @@ fn resolve_workspace(
         let choices = workspace_to_choices(&cfg, workspace_root);
         (cfg, choices, false)
     } else {
+        // Interactive path — only reached for direct-args invocations that somehow
+        // don't match any branch flag. In normal flow, run_as_selector handles the
+        // interactive workspace/product selection before spawning a session worker.
         let mut choices = 'selector: loop {
             let workspaces = list_workspaces(ws_dir);
             if workspaces.is_empty() {
                 return build_new_workspace_interactive(workspace_root, ws_dir);
             }
             drain_input_events();
-            match run_workspace_selector(&workspaces) {
+            match run_workspace_selector(&workspaces, &HashSet::new()) {
                 WorkspaceAction::Delete(cfg) => {
                     run_workspace_delete(&cfg, workspace_root, ws_dir);
                     continue 'selector;
@@ -447,6 +937,12 @@ fn resolve_workspace(
                 }
                 WorkspaceAction::CreateNew => {
                     break default_product_choices(workspace_root);
+                }
+                WorkspaceAction::Reattach(cfg) => {
+                    break workspace_to_choices(&cfg, workspace_root);
+                }
+                WorkspaceAction::StopSession(_) => {
+                    continue 'selector;
                 }
                 WorkspaceAction::Quit => {
                     print!("\x1b[H\x1b[2J");
@@ -471,19 +967,12 @@ fn resolve_workspace(
     }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Session worker ────────────────────────────────────────────────────────────
 
-fn main() {
-    let args = Args::parse();
-
+fn run_session_loop(args: &Args, workspace_root: &Path, ws_dir: &Path) {
     print!("\x1b[H\x1b[2J");
     let _ = io::stdout().flush();
 
-    let workspace_root = resolve_workspace_root(&args);
-    let ws_dir = workspaces_dir(&workspace_root);
-
-    // Stopping flag and signal handlers are registered once for the entire
-    // process lifetime; the flag is reset at the top of each session.
     let stopping: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     {
         let stopping = Arc::clone(&stopping);
@@ -503,15 +992,31 @@ fn main() {
         stopping.store(false, Ordering::Relaxed);
         SIGHUP_STOP.store(false, Ordering::Relaxed);
 
-    let (workspace_cfg, choices, clean_start) = resolve_workspace(&args, &workspace_root, &ws_dir);
+    let (workspace_cfg, choices, clean_start) = resolve_workspace(args, workspace_root, ws_dir);
     ensure_cooked_output();
     let slug = workspace_cfg.hash.clone();
 
-    let logs_dir = args
-        .logs_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/dev-launcher-logs/{}", slug)));
+    let logs_dir = args.logs_dir.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let ts = std::process::Command::new("date")
+            .arg("+%Y%m%d-%H%M%S")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string())
+            });
+        PathBuf::from(format!("{home}/.dev-launcher/logs/{slug}/{ts}"))
+    });
     fs::create_dir_all(&logs_dir).expect("cannot create logs_dir");
+    launcher_log::init(&logs_dir.join("dev-launcher.log"));
+    llog!("workspace={slug}  logs={}", logs_dir.display());
+    let recipes_dir = tui::splash::run();
+    diagnosis::recipe::init(&recipes_dir);
 
     let get_worktree_override = |repo: &str| -> Option<&PathBuf> {
         match repo {
@@ -590,6 +1095,11 @@ fn main() {
                 get_worktree_override(choices[3].repo),
             )
             .join("internal-import-file/import-document-ai"),
+            // Infra products: always use the fixed workspace_root dir (no branches/worktrees).
+            grafana: workspace_root.join("grafana"),
+            langfuse: workspace_root.join("langfuse"),
+            // Isolated venv for copilot-infinity, separate from the copilot backend venv.
+            infinity: ws_dir.join(&slug).join("infinity-emb"),
         }
     };
 
@@ -597,8 +1107,25 @@ fn main() {
     let no_opencti = !(choices[1].enabled && paths.opencti.is_dir());
     let no_openaev = !(choices[2].enabled && paths.openaev.is_dir());
     let no_connector = !(choices[3].enabled && paths.connector.is_dir());
+    let no_grafana = !choices[4].enabled;
+    let no_langfuse = !choices[5].enabled;
     let no_opencti_front = no_opencti || args.no_opencti_front;
     let no_openaev_front = no_openaev || args.no_openaev_front;
+
+    // ── Port offset — derives workspace-specific ports from the stored offset ──
+    let port_offset = workspace_cfg.port_offset;
+    // Elasticsearch/OpenSearch host port (workspace-specific)
+    let es_port: u16 = 9200u16.saturating_add(port_offset);
+    // opencti-graphql GraphQL server port
+    let opencti_gql_port: u16 = 4000u16.saturating_add(port_offset);
+    // openaev Spring Boot server port
+    let openaev_be_port: u16 = 8080u16.saturating_add(port_offset);
+    if port_offset > 0 {
+        println!(
+            "  {DIM}Port offset +{port_offset}  \
+             (opencti:{opencti_gql_port}  es:{es_port}  openaev:{openaev_be_port}){R}"
+        );
+    }
 
     if !no_opencti && paths.opencti.is_dir() {
         let gql_dir = paths.opencti.join("opencti-platform/opencti-graphql");
@@ -691,6 +1218,36 @@ fn main() {
         );
         patch_url_default(&env_path, "BASE_URL", 8000, 8100);
         patch_url_default(&env_path, "FRONTEND_URL", 3000, 3100);
+        // Ensure INFINITY_URL is present for new workspaces created before this feature.
+        {
+            let mut m = parse_env_file(&env_path);
+            if !m.contains_key("INFINITY_URL") {
+                m.insert("INFINITY_URL".to_string(), "http://localhost:7997".to_string());
+                write_env_file(&env_path, &m);
+            }
+            if !m.contains_key("INFINITY_MODEL") {
+                m.insert("INFINITY_MODEL".to_string(), "nomic-ai/nomic-embed-text-v1.5".to_string());
+                write_env_file(&env_path, &m);
+            }
+            if !m.contains_key("DEFAULT_EMBEDDING_PROVIDER") {
+                m.insert("DEFAULT_EMBEDDING_PROVIDER".to_string(), "custom_openai".to_string());
+                write_env_file(&env_path, &m);
+            }
+            if !m.contains_key("DEFAULT_EMBEDDING_PROVIDER_BASE_URL") {
+                m.insert("DEFAULT_EMBEDDING_PROVIDER_BASE_URL".to_string(), "http://localhost:7997/v1".to_string());
+                write_env_file(&env_path, &m);
+            }
+            if !m.contains_key("DEFAULT_EMBEDDING_MODEL") {
+                m.insert("DEFAULT_EMBEDDING_MODEL".to_string(), "text-embedding-nomic-embed-text-v1.5".to_string());
+                write_env_file(&env_path, &m);
+            }
+        }
+        // Apply workspace port offset (idempotent — no-op when offset is 0)
+        if port_offset > 0 {
+            patch_url_default(&env_path, "BASE_URL", 8100, 8100u16.saturating_add(port_offset));
+            patch_url_default(&env_path, "FRONTEND_URL", 3100, 3100u16.saturating_add(port_offset));
+            apply_port_offset_to_env(&env_path, "copilot", port_offset);
+        }
         run_platform_mode_selector(&env_path, &stopping);
         run_env_wizard(&env_path, COPILOT_ENV_VARS, "Copilot");
     } else if no_copilot {
@@ -711,7 +1268,12 @@ APP__ADMIN__PASSWORD=ChangeMe\n\
 APP__ADMIN__TOKEN=ChangeMe\n\
 APP__ENCRYPTION_KEY=ChangeMe\n",
         );
+        apply_port_offset_to_env(&env_path, "opencti", port_offset);
         run_env_wizard(&env_path, OPENCTI_ENV_VARS, "OpenCTI");
+        // Ask once whether to activate the XTM One integration when Copilot is co-launched.
+        if !no_copilot && paths.copilot.is_dir() {
+            prompt_xtm_one_opencti_integration(&env_path);
+        }
     } else if no_opencti {
         println!("  {DIM}OpenCTI skipped.{R}\n");
     }
@@ -726,18 +1288,17 @@ APP__ENCRYPTION_KEY=ChangeMe\n",
             &templates,
             "# OpenAEV dev environment\n",
         );
+        apply_port_offset_to_env(&env_path, "openaev", port_offset);
     } else if no_openaev {
         println!("  {DIM}OpenAEV skipped.{R}\n");
     }
 
     if !no_connector && paths.connector.is_dir() {
         let env_path = ws_env_path(&ws_env_dir, "connector");
-        init_workspace_env(
-            &env_path,
-            Some(&paths.connector.join(".env.dev")),
-            &[],
+        let opencti_url_default = format!("http://localhost:{opencti_gql_port}");
+        let connector_hardcoded = format!(
             "# Connector dev environment — fill in before running\n\
-OPENCTI_URL=http://localhost:4000\n\
+OPENCTI_URL={opencti_url_default}\n\
 OPENCTI_TOKEN=ChangeMe\n\
 CONNECTOR_TYPE=INTERNAL_IMPORT_FILE\n\
 CONNECTOR_ID=54263257-26dc-4cca-8c45-deea44cdecf1\n\
@@ -748,8 +1309,15 @@ CONNECTOR_LOG_LEVEL=debug\n\
 CONNECTOR_WEB_SERVICE_URL=https://importdoc.ariane.testing.filigran.io\n\
 IMPORT_DOCUMENT_CREATE_INDICATOR=false\n\
 IMPORT_DOCUMENT_INCLUDE_RELATIONSHIPS=true\n\
-CONNECTOR_LICENCE_KEY_PEM=\n",
+CONNECTOR_LICENCE_KEY_PEM=\n"
         );
+        init_workspace_env(
+            &env_path,
+            Some(&paths.connector.join(".env.dev")),
+            &[],
+            &connector_hardcoded,
+        );
+        apply_port_offset_to_env(&env_path, "connector", port_offset);
     }
 
     if !no_opencti && !no_connector {
@@ -778,6 +1346,25 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
         );
     } else if no_connector {
         println!("  {DIM}Connector skipped.{R}\n");
+    }
+
+    // ── License PEM injection ─────────────────────────────────────────────────
+    {
+        let search_dirs = pem_search_dirs(&workspace_root);
+        let mut enabled: std::collections::HashMap<&'static str, std::path::PathBuf> =
+            std::collections::HashMap::new();
+        if !no_copilot {
+            enabled.insert("Copilot", ws_env_path(&ws_env_dir, "copilot"));
+        }
+        if !no_opencti {
+            enabled.insert("OpenCTI", ws_env_path(&ws_env_dir, "opencti"));
+        }
+        if !no_openaev {
+            enabled.insert("OpenAEV", ws_env_path(&ws_env_dir, "openaev"));
+        }
+        let mut pem_candidates = find_pem_candidates(&search_dirs, &enabled);
+        run_pem_selector(&mut pem_candidates, &stopping);
+        inject_selected_pems(&pem_candidates, &ws_env_dir);
     }
 
     if !no_copilot {
@@ -817,7 +1404,15 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
     ensure_corepack();
 
     if clean_start {
-        clean_docker_for_workspace(&slug, &paths, no_copilot, no_opencti, no_openaev);
+        clean_docker_for_workspace(
+            &slug,
+            &paths,
+            no_copilot,
+            no_opencti,
+            no_openaev,
+            no_grafana,
+            no_langfuse,
+        );
     }
 
     print!("  Checking Docker… ");
@@ -833,9 +1428,39 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
         println!("  {DIM}Services that need infrastructure containers will start in Degraded state.{R}\n");
     }
 
+    let maven_ok = if !no_openaev && paths.openaev.is_dir() {
+        let mvn = maven_cmd(&paths.openaev);
+        print!("  Checking Maven… ");
+        let _ = io::stdout().flush();
+        let available = if mvn == "mvn" {
+            Command::new("mvn")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            PathBuf::from(&mvn).exists()
+        };
+        if available {
+            println!("{GRN}ok{R}");
+        } else {
+            println!("{RED}not found{R}");
+            println!("  {YLW}Install Maven before launching the stack:{R}");
+            println!("    brew install maven");
+            println!("  {DIM}openaev-backend will start in Degraded state.{R}\n");
+        }
+        available
+    } else {
+        true
+    };
+
     let copilot_env_path = ws_env_path(&ws_env_dir, "copilot");
     let copilot_backend_port = read_env_url_port(&copilot_env_path, "BASE_URL", 8100);
     let copilot_frontend_port = read_env_url_port(&copilot_env_path, "FRONTEND_URL", 3100);
+    let copilot_infinity_port = read_env_url_port(&copilot_env_path, "INFINITY_URL", 7997);
 
     let copilot_manifest = if !no_copilot && paths.copilot.is_dir() {
         let mut m = load_repo_manifest(&paths.copilot, "Copilot");
@@ -880,7 +1505,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 (f, ws_docker_project("copilot-dev", &slug))
             };
             if dc.exists() {
-                let ov = write_compose_override(&dc, &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
                 let ov_str = ov
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -911,7 +1536,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     .and_then(|m| m.docker.project.clone())
                     .unwrap_or_else(|| "opencti-dev".to_string());
                 let project = ws_docker_project(&base, &slug);
-                let ov = write_compose_override(&dc, &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
                 let ov_str = ov
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -942,7 +1567,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     .and_then(|m| m.docker.project.clone())
                     .unwrap_or_else(|| "openaev-dev".to_string());
                 let project = ws_docker_project(&base, &slug);
-                let ov = write_compose_override(&dc, &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
                 let ov_str = ov
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -957,6 +1582,66 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     project,
                     compose_file: dc,
                     work_dir: dev_dir,
+                    override_file: ov,
+                });
+            }
+        }
+        if !no_grafana {
+            bootstrap_infra_dir(&paths.grafana, "grafana");
+            let dc = paths.grafana.join("docker-compose.dev.yml");
+            if dc.exists() {
+                let project = ws_docker_project("grafana-dev", &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
+                let ov_str = ov
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let env_file = paths.grafana.join(".env");
+                let env_file_str = env_file.to_string_lossy().into_owned();
+                let mut extra: Vec<&str> = if env_file.exists() {
+                    vec!["--env-file", &env_file_str]
+                } else {
+                    vec![]
+                };
+                if ov.is_some() {
+                    extra.extend_from_slice(&["-f", &ov_str]);
+                }
+                docker_compose_up("Grafana", &project, &dc, &paths.grafana, &extra);
+                docker_projects.push(DockerProject {
+                    label: "Grafana".into(),
+                    project,
+                    compose_file: dc,
+                    work_dir: paths.grafana.clone(),
+                    override_file: ov,
+                });
+            }
+        }
+        if !no_langfuse {
+            bootstrap_infra_dir(&paths.langfuse, "langfuse");
+            let dc = paths.langfuse.join("docker-compose.dev.yml");
+            if dc.exists() {
+                let project = ws_docker_project("langfuse-dev", &slug);
+                let ov = write_compose_override(&dc, &slug, port_offset);
+                let ov_str = ov
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let env_file = paths.langfuse.join(".env");
+                let env_file_str = env_file.to_string_lossy().into_owned();
+                let mut extra: Vec<&str> = if env_file.exists() {
+                    vec!["--env-file", &env_file_str]
+                } else {
+                    vec![]
+                };
+                if ov.is_some() {
+                    extra.extend_from_slice(&["-f", &ov_str]);
+                }
+                docker_compose_up("Langfuse", &project, &dc, &paths.langfuse, &extra);
+                docker_projects.push(DockerProject {
+                    label: "Langfuse".into(),
+                    project,
+                    compose_file: dc,
+                    work_dir: paths.langfuse.clone(),
                     override_file: ov,
                 });
             }
@@ -1057,9 +1742,28 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     } else {
                         def.args[0].clone()
                     };
+                    let rest: Vec<&str> = def.args[1..].iter().map(|s| s.as_str()).collect();
+                    let empty_env: HashMap<String, String> = HashMap::new();
+                    let mut frontend_env: HashMap<String, String> = HashMap::new();
+                    frontend_env.insert("PORT".to_string(), copilot_frontend_port.to_string());
+                    frontend_env.insert("VITE_API_URL".to_string(), format!("http://localhost:{copilot_backend_port}"));
+                    let env = if def.cwd == "backend" {
+                        &backend_env
+                    } else if def.cwd == "frontend" {
+                        &frontend_env
+                    } else {
+                        &empty_env
+                    };
                     if (prog.starts_with('/') || prog.starts_with("./") || prog.contains("/."))
                         && !PathBuf::from(&prog).exists()
                     {
+                        svc.spawn_cmd = Some(SpawnCmd {
+                            prog: prog.clone(),
+                            args: rest.iter().map(|s| s.to_string()).collect(),
+                            dir: work_dir.clone(),
+                            env: env.clone(),
+                            requires_docker: def.requires_docker,
+                        });
                         svc.health = Health::Degraded(format!(
                             "{} not found — run ./dev.sh once",
                             &def.args[0]
@@ -1067,13 +1771,6 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         svcs.push(svc);
                         continue;
                     }
-                    let rest: Vec<&str> = def.args[1..].iter().map(|s| s.as_str()).collect();
-                    let empty_env: HashMap<String, String> = HashMap::new();
-                    let env = if def.cwd == "backend" {
-                        &backend_env
-                    } else {
-                        &empty_env
-                    };
                     if !def.requires.is_empty() {
                         let unmet: Vec<&str> = def
                             .requires
@@ -1102,6 +1799,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 let backend_url = format!("http://localhost:{copilot_backend_port}");
                 let frontend_url = format!("http://localhost:{copilot_frontend_port}");
                 let backend_dir = paths.copilot.join("backend");
+                ensure_copilot_backend_venv(&backend_dir);
                 let python = backend_dir.join(".venv/bin/python");
                 let backend_env = copilot_backend_env(&paths.copilot);
                 let mut svc = services::Svc::new(
@@ -1135,6 +1833,27 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         &backend_env
                     );
                 } else {
+                    svc.spawn_cmd = Some(SpawnCmd {
+                        prog: python.to_str().unwrap().to_string(),
+                        args: [
+                            "-m",
+                            "uvicorn",
+                            "app.main:application",
+                            "--reload",
+                            "--host",
+                            "0.0.0.0",
+                            "--port",
+                            backend_port_str.as_str(),
+                            "--timeout-graceful-shutdown",
+                            "3",
+                        ]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                        dir: backend_dir.clone(),
+                        env: backend_env.clone(),
+                        requires_docker: false,
+                    });
                     svc.health =
                         Health::Degraded("venv missing — run ./dev.sh once to set up".into());
                     svcs.push(svc);
@@ -1158,6 +1877,16 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         &backend_env
                     );
                 } else {
+                    svc.spawn_cmd = Some(SpawnCmd {
+                        prog: python.to_str().unwrap().to_string(),
+                        args: ["-m", "saq", "app.worker.settings"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                        dir: backend_dir.clone(),
+                        env: backend_env.clone(),
+                        requires_docker: false,
+                    });
                     svc.health = Health::Degraded("venv missing".into());
                     svcs.push(svc);
                 }
@@ -1171,8 +1900,64 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     logs_dir.join("copilot-frontend.log"),
                 );
                 if fe_dir.is_dir() {
-                    try_spawn!(svc, "yarn", &["dev"], &fe_dir, &HashMap::new());
+                    let fe_port_str = copilot_frontend_port.to_string();
+                    let mut fe_env = HashMap::new();
+                    fe_env.insert("PORT".to_string(), fe_port_str);
+                    fe_env.insert("VITE_API_URL".to_string(), format!("http://localhost:{copilot_backend_port}"));
+                    try_spawn!(
+                        svc,
+                        "yarn",
+                        &["dev"],
+                        &fe_dir,
+                        &fe_env
+                    );
                 }
+            }
+        }
+
+        // Infinity embedding server (copilot)
+        // Runs in its own isolated venv (paths.infinity) to avoid conflicts with
+        // the copilot backend's dependencies (click versions, optimum, etc.).
+        if !no_copilot && paths.copilot.is_dir() {
+            let infinity_url = format!("http://localhost:{copilot_infinity_port}");
+            let infinity_dir = &paths.infinity;
+            let infinity_bin = infinity_dir.join(".venv/bin/infinity_emb");
+            let infinity_model = parse_env_file(&copilot_env_path)
+                .get("INFINITY_MODEL")
+                .cloned()
+                .unwrap_or_else(|| "nomic-ai/nomic-embed-text-v1.5".to_string());
+            let mut svc = services::Svc::new(
+                "copilot-infinity",
+                Some(&infinity_url),
+                "/health",
+                120,
+                logs_dir.join("copilot-infinity.log"),
+            );
+            if !ensure_infinity_emb_isolated(infinity_dir) {
+                svc.health = Health::Degraded(
+                    format!(
+                        "python3 not found or venv creation failed — check python3 is in PATH (infinity dir: {})",
+                        infinity_dir.display()
+                    ),
+                );
+                svcs.push(svc);
+            } else {
+                let port_str = copilot_infinity_port.to_string();
+                let bin_str = infinity_bin.to_string_lossy().into_owned();
+                // --no-bettertransformer: the default (true) triggers a NameError in
+                // infinity-emb 0.0.76 when optimum is not installed, because
+                // acceleration.py uses BetterTransformerManager without an availability guard.
+                // --url-prefix /v1: mounts all routes under /v1/ so the server is
+                // OpenAI-compatible (/v1/models, /v1/embeddings) and can be added
+                // as a Custom OpenAI-Compatible provider in the Copilot UI.
+                try_spawn!(
+                    svc,
+                    &bin_str,
+                    &["v2", "--model-id", &infinity_model, "--port", &port_str,
+                      "--no-bettertransformer", "--url-prefix", "/v1"],
+                    infinity_dir,
+                    &HashMap::new()
+                );
             }
         }
 
@@ -1201,7 +1986,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 .unwrap_or(false);
             let mut svc = services::Svc::new(
                 "opencti-graphql",
-                Some("http://localhost:4000"),
+                Some(format!("http://localhost:{opencti_gql_port}")),
                 "/health",
                 300,
                 logs_dir.join("opencti-graphql.log"),
@@ -1229,7 +2014,8 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     svc.health = Health::Degraded("Waiting for copilot-backend…".into());
                     svcs.push(svc);
                 } else {
-                    wipe_opencti_es_indices_if_stale(9200);
+                    wait_for_opensearch(es_port, 120);
+                    wipe_opencti_es_indices_if_stale(es_port);
                     try_spawn!(svc, "yarn", &["start"], &gql_dir, &gql_env);
                 }
             }
@@ -1239,7 +2025,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 ensure_opencti_fe_deps(&front_dir);
                 let mut svc = services::Svc::new(
                     "opencti-frontend",
-                    Some("http://localhost:3000"),
+                    Some(format!("http://localhost:{}", 3000u16.saturating_add(port_offset))),
                     "",
                     120,
                     logs_dir.join("opencti-frontend.log"),
@@ -1270,7 +2056,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
 
             let mut svc = services::Svc::new(
                 "openaev-backend",
-                Some("http://localhost:8080"),
+                Some(format!("http://localhost:{openaev_be_port}")),
                 "/api/health?health_access_key=ChangeMe",
                 180,
                 logs_dir.join("openaev-backend.log"),
@@ -1278,6 +2064,11 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
             if !openaev_docker_ok {
                 svc.health =
                     Health::Degraded("Docker deps not running — start Docker first".into());
+                svcs.push(svc);
+            } else if !maven_ok {
+                svc.health = Health::Degraded(
+                    "Maven not found — install with 'brew install maven'".into(),
+                );
                 svcs.push(svc);
             } else if api_dir.is_dir() {
                 if !no_copilot && paths.copilot.is_dir() {
@@ -1347,6 +2138,32 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     }
                 }
             }
+        }
+
+        // Grafana (Docker-only — no host process to spawn)
+        if !no_grafana {
+            let mut svc = services::Svc::new(
+                "grafana",
+                Some("http://localhost:3200"),
+                "/api/health",
+                60,
+                logs_dir.join("grafana.log"),
+            );
+            svc.health = Health::Launching;
+            svcs.push(svc);
+        }
+
+        // Langfuse (Docker-only — no host process to spawn)
+        if !no_langfuse {
+            let mut svc = services::Svc::new(
+                "langfuse",
+                Some("http://localhost:3201"),
+                "/api/public/health",
+                120,
+                logs_dir.join("langfuse.log"),
+            );
+            svc.health = Health::Launching;
+            svcs.push(svc);
         }
 
         // Connector
@@ -1427,7 +2244,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 if svcs[i].health.is_done() {
                     continue;
                 }
-                svcs[i].health = if ok {
+                let prev = svcs[i].health.label_plain();
+                let svc_name = svcs[i].name.clone();
+                let new_health = if ok {
                     Health::Up
                 } else if timed_out {
                     Health::Degraded(format!("no response after {timeout_secs}s"))
@@ -1437,6 +2256,10 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         _ => Health::Probing(1),
                     }
                 };
+                if new_health.is_done() {
+                    llog!("[HEALTH] {svc_name}: {prev} → {}", new_health.label_plain());
+                }
+                svcs[i].health = new_health;
             }
         });
     }
@@ -1447,6 +2270,9 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
     let mut mode = Mode::Overview { cursor: 0 };
     let mut creds: Vec<CredEntry> = Vec::new();
     let mut show_paths = false;
+    // Set to true when the user presses M from Overview to leave the TUI without
+    // stopping the stack (detach).  We pause the process via SIGSTOP.
+    let mut want_detach = false;
     // Set to true when the user explicitly presses q/Esc from Overview so that
     // we return to the workspace selector instead of exiting the process.
     let mut want_restart = false;
@@ -1461,8 +2287,30 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
     let render_interval = Duration::from_millis(500);
     let mut last_render = Instant::now();
     let mut force_render = true;
+    let mut last_rotation_check = Instant::now();
+    const LOG_ROTATION_INTERVAL_SECS: u64 = 30;
+    const LOG_MAX_BYTES: u64 = 3_000_000;
 
     loop {
+        // ── Detach (M) — leave TUI without stopping the stack ─────────────────
+        if want_detach {
+            want_detach = false;
+            drop(raw_mode.take());
+            mark_detached(&slug);
+            write_worker_pid(&slug, std::process::id());
+            print!("\x1b[H\x1b[2J");
+            let _ = io::stdout().flush();
+            compress_rotated_logs(&logs_dir);
+            // Pause this process — the selector resumes it via SIGCONT when the
+            // user reattaches.  Execution continues at the line below on resume.
+            unsafe { libc::kill(libc::getpid(), libc::SIGSTOP); }
+            // ── Resumed by SIGCONT ────────────────────────────────────────────
+            let _ = fs::remove_file(detached_marker_path(&slug));
+            remove_worker_pid(&slug);
+            raw_mode = TuiGuard::enter();
+            force_render = true;
+        }
+
         // ── Shutdown ─────────────────────────────────────────────────────────
         if stopping.load(Ordering::Relaxed) || SIGHUP_STOP.load(Ordering::Relaxed) {
             drop(raw_mode.take());
@@ -1541,6 +2389,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     render_shutdown(&slug, &pairs, &term_status, started.elapsed(), timed_out);
                     thread::sleep(Duration::from_millis(600));
                     let _ = fs::remove_file(pid_file_path(&slug));
+                    let _ = fs::remove_file(detached_marker_path(&slug));
                     eprintln!("[dev-launcher] All processes stopped. PID file removed.");
                     if !docker_projects.is_empty() {
                         print!("\r\n");
@@ -1554,27 +2403,52 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                 thread::sleep(Duration::from_millis(100));
             }
 
+            // Compress rotated log files before leaving this session.
+            compress_rotated_logs(&logs_dir);
+
             // Return to the workspace selector when the user pressed q/Esc,
             // or exit the process for Ctrl+C / SIGHUP.
             if want_restart {
                 print!("\x1b[H\x1b[2J");
                 let _ = io::stdout().flush();
-                continue 'session;
+                // Exit with 0 so the parent selector process sees a clean exit
+                // and can show the workspace picker.  `continue 'session` would
+                // relaunch the entire stack, which is not what the user wants.
+                std::process::exit(0);
             }
             break 'session;
         }
 
         // ── Crash detection ───────────────────────────────────────────────────
         let mut auto_diagnose: Option<(usize, crate::services::Svc)> = None;
+        let mut reaped_indices: Vec<usize> = Vec::new();
         {
             let mut svcs = state.lock().unwrap();
-            for p in &mut procs {
+            for (pi, p) in procs.iter_mut().enumerate() {
                 if let Some(code) = p.try_reap() {
                     let already_crashed = matches!(svcs[p.idx].health, Health::Crashed(_));
-                    svcs[p.idx].health = Health::Crashed(code);
+                    if already_crashed {
+                        // Process already recorded as crashed — just remove from procs.
+                        reaped_indices.push(pi);
+                        continue;
+                    }
+                    // If opencti-graphql crashes while ES is down, auto-defer so the
+                    // auto-spawn loop re-launches it once ES recovers.
+                    if svcs[p.idx].name == "opencti-graphql"
+                        && svcs[p.idx].spawn_cmd.is_some()
+                        && !opensearch_ready(es_port)
+                    {
+                        svcs[p.idx].health =
+                            Health::Degraded("Waiting for OpenSearch/ES…".into());
+                    } else {
+                        svcs[p.idx].health = Health::Crashed(code);
+                        llog!("[CRASH] {}: exit {code}", svcs[p.idx].name);
+                    }
                     force_render = true;
+                    reaped_indices.push(pi);
 
-                    if !already_crashed && !diagnosed.contains(&p.idx) {
+                    let is_real_crash = matches!(svcs[p.idx].health, Health::Crashed(_));
+                    if !diagnosed.contains(&p.idx) && is_real_crash {
                         diagnosed.insert(p.idx);
                         let log_path = svcs[p.idx].log_path.clone();
                         let svc_idx = p.idx;
@@ -1593,6 +2467,10 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                     }
                 }
             }
+        }
+        // Remove reaped procs in reverse order to preserve indices.
+        for pi in reaped_indices.into_iter().rev() {
+            procs.remove(pi);
         }
         if let Some((svc_idx, svc)) = auto_diagnose {
             let findings = diagnose_service(&svc, &paths, &ws_env_dir);
@@ -1616,16 +2494,36 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
             force_render = true;
         }
 
+        // ── Auto log rotation ─────────────────────────────────────────────────
+        if last_rotation_check.elapsed().as_secs() >= LOG_ROTATION_INTERVAL_SECS {
+            let log_paths: Vec<PathBuf> = {
+                let svcs = state.lock().unwrap();
+                svcs.iter()
+                    .filter(|s| !matches!(s.health, Health::Pending))
+                    .map(|s| s.log_path.clone())
+                    .collect()
+            };
+            for path in &log_paths {
+                if let Ok(meta) = fs::metadata(path) {
+                    if meta.len() > LOG_MAX_BYTES {
+                        let _ = rotate_log(path);
+                        force_render = true;
+                    }
+                }
+            }
+            last_rotation_check = Instant::now();
+        }
+
         // ── Auto-spawn services waiting on requires ───────────────────────────
         #[allow(clippy::type_complexity)]
-        let (spawn_candidates, copilot_frontend_url): (
+        let (spawn_candidates, copilot_backend_url): (
             Vec<(usize, String, SpawnCmd, PathBuf)>,
             Option<String>,
         ) = {
             let svcs = state.lock().unwrap();
             let url = svcs
                 .iter()
-                .find(|s| s.name == "copilot-frontend")
+                .find(|s| s.name == "copilot-backend")
                 .and_then(|s| s.url.clone());
             let candidates = svcs
                 .iter()
@@ -1645,29 +2543,44 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
             (candidates, url)
         };
         for (idx, svc_name, mut cmd, log_path) in spawn_candidates {
-            if let Some(ref url) = copilot_frontend_url {
+            // Before spawning opencti-graphql, ensure ES is accepting connections.
+            // If not ready yet, defer to the next loop tick rather than crashing.
+            if svc_name == "opencti-graphql" && !opensearch_ready(es_port) {
+                let mut svcs = state.lock().unwrap();
+                svcs[idx].health = Health::Degraded("Waiting for OpenSearch/ES…".into());
+                continue;
+            }
+            if let Some(ref url) = copilot_backend_url {
                 match svc_name.as_str() {
                     "opencti-graphql" => {
-                        wipe_opencti_es_indices_if_stale(9200);
+                        wipe_opencti_es_indices_if_stale(es_port);
                         let ws_file = ws_env_path(&ws_env_dir, "opencti");
                         let repo_file = paths
                             .opencti
                             .join("opencti-platform/opencti-graphql/.env.dev");
-                        if ws_file.exists() {
-                            let mut fenv = parse_env_file(&ws_file);
-                            fenv.insert("XTM__XTM_ONE_URL".to_string(), url.clone());
-                            fenv.insert(
-                                "XTM__XTM_ONE_TOKEN".to_string(),
-                                "xtm-default-registration-token".to_string(),
-                            );
-                            write_env_file(&ws_file, &fenv);
-                            deploy_workspace_env(&ws_file, &repo_file);
+
+                        let xtm_one_enabled = parse_env_file(&ws_file)
+                            .get("XTM_ONE_ENABLED")
+                            .is_some_and(|v| v == "true");
+
+                        if xtm_one_enabled {
+                            // Read the actual registration token from the Copilot workspace env
+                            // (falls back to the well-known dev default if not overridden).
+                            let copilot_ws = ws_env_path(&ws_env_dir, "copilot");
+                            let xtm_token = parse_env_file(&copilot_ws)
+                                .get("PLATFORM_REGISTRATION_TOKEN")
+                                .cloned()
+                                .unwrap_or_else(|| "xtm-default-registration-token".to_string());
+                            if ws_file.exists() {
+                                let mut fenv = parse_env_file(&ws_file);
+                                fenv.insert("XTM__XTM_ONE_URL".to_string(), url.clone());
+                                fenv.insert("XTM__XTM_ONE_TOKEN".to_string(), xtm_token.clone());
+                                write_env_file(&ws_file, &fenv);
+                                deploy_workspace_env(&ws_file, &repo_file);
+                            }
+                            cmd.env.insert("XTM__XTM_ONE_URL".to_string(), url.clone());
+                            cmd.env.insert("XTM__XTM_ONE_TOKEN".to_string(), xtm_token);
                         }
-                        cmd.env.insert("XTM__XTM_ONE_URL".to_string(), url.clone());
-                        cmd.env.insert(
-                            "XTM__XTM_ONE_TOKEN".to_string(),
-                            "xtm-default-registration-token".to_string(),
-                        );
                     }
                     "openaev-backend" => {
                         let ws_file = ws_env_path(&ws_env_dir, "openaev");
@@ -1802,12 +2715,23 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                         }
                                         procs.remove(pos);
                                     }
+                                    let svc_name = {
+                                        let svcs = state.lock().unwrap();
+                                        svcs.get(idx).map(|s| s.name.clone()).unwrap_or_default()
+                                    };
                                     let docker_ok = !cmd.requires_docker || docker_available();
                                     if !docker_ok {
                                         let mut svcs = state.lock().unwrap();
                                         svcs[idx].health = Health::Degraded(
                                             "Docker not running — start Docker first".into(),
                                         );
+                                    } else if svc_name == "opencti-graphql"
+                                        && !opensearch_ready(es_port)
+                                    {
+                                        // ES is still booting — defer to auto-spawn loop
+                                        let mut svcs = state.lock().unwrap();
+                                        svcs[idx].health =
+                                            Health::Degraded("Waiting for OpenSearch/ES…".into());
                                     } else {
                                         let args: Vec<&str> =
                                             cmd.args.iter().map(|s| s.as_str()).collect();
@@ -1825,6 +2749,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                                 };
                                                 svcs[idx].pid = Some(child.id());
                                                 svcs[idx].started_at = Some(Instant::now());
+                                                svcs[idx].restarted_at = Some(Instant::now());
                                                 svcs[idx].diagnosis = None;
                                                 procs.push(Proc { idx, pgid, child });
                                             }
@@ -1835,12 +2760,205 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                         }
                                     }
                                     force_render = true;
+                                } else {
+                                    force_render = true;
                                 }
                             }
+                        }
+                        InputEvent::Stop => {
+                            let visible: Vec<usize> = {
+                                let svcs = state.lock().unwrap();
+                                svcs.iter()
+                                    .enumerate()
+                                    .filter(|(_, s)| !matches!(s.health, Health::Pending))
+                                    .map(|(i, _)| i)
+                                    .collect()
+                            };
+                            if let Some(&idx) = visible.get(*cursor) {
+                                let is_stopped = {
+                                    let svcs = state.lock().unwrap();
+                                    matches!(svcs[idx].health, Health::Stopped)
+                                };
+                                if !is_stopped {
+                                    if let Some(pos) = procs.iter().position(|p| p.idx == idx) {
+                                        unsafe {
+                                            libc::kill(-procs[pos].pgid, libc::SIGKILL);
+                                        }
+                                        procs.remove(pos);
+                                    }
+                                    let mut svcs = state.lock().unwrap();
+                                    svcs[idx].health = Health::Stopped;
+                                    svcs[idx].pid = None;
+                                    svcs[idx].diagnosis = None;
+                                    force_render = true;
+                                }
+                            }
+                        }
+                        InputEvent::FullRestart => {
+                            drop(raw_mode.take());
+                            ensure_cooked_output();
+                            print!("\x1b[H\x1b[2J");
+                            let _ = io::stdout().flush();
+
+                            let svc_names: Vec<String> = {
+                                let svcs = state.lock().unwrap();
+                                svcs.iter()
+                                    .filter(|s| {
+                                        !matches!(s.health, Health::Pending)
+                                            && s.spawn_cmd.is_some()
+                                    })
+                                    .map(|s| s.name.clone())
+                                    .collect()
+                            };
+
+                            let p = |s: &str| {
+                                print!("{s}\r\n");
+                            };
+                            p(&format!(
+                                "\n  {BOLD}{YLW}⚠  Full stack restart{R}\n"
+                            ));
+                            p("  The following will be restarted:");
+                            for name in &svc_names {
+                                p(&format!("    {DIM}•{R}  {name}"));
+                            }
+                            for dp in &docker_projects {
+                                p(&format!(
+                                    "    {DIM}•{R}  Docker — {} containers",
+                                    dp.label
+                                ));
+                            }
+                            p("");
+                            p(&format!(
+                                "  {DIM}Database data and volumes are NOT wiped.{R}"
+                            ));
+                            p("");
+                            p(&format!(
+                                "  {CYN}Enter{R} confirm   {DIM}q / Esc{R} cancel"
+                            ));
+                            let _ = io::stdout().flush();
+
+                            let _ = crossterm::terminal::enable_raw_mode();
+                            let confirmed = loop {
+                                if stopping.load(Ordering::Relaxed) {
+                                    break false;
+                                }
+                                if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                                    if let Ok(Event::Key(k)) = event::read() {
+                                        match k.code {
+                                            KeyCode::Enter => break true,
+                                            KeyCode::Char('q') | KeyCode::Esc => break false,
+                                            KeyCode::Char('c')
+                                                if k.modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                break false
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            };
+                            let _ = crossterm::terminal::disable_raw_mode();
+
+                            if confirmed {
+                                ensure_cooked_output();
+                                print!("\x1b[H\x1b[2J");
+                                let p = |s: &str| {
+                                    print!("{s}\r\n");
+                                };
+                                p(&format!("\n  {BOLD}Restarting full stack…{R}\n"));
+                                let _ = io::stdout().flush();
+
+                                // Kill all processes
+                                for proc in &mut procs {
+                                    unsafe { libc::kill(-proc.pgid, libc::SIGKILL) };
+                                }
+                                procs.clear();
+                                diagnosed.clear();
+
+                                // Reset service states
+                                {
+                                    let mut svcs = state.lock().unwrap();
+                                    for svc in svcs.iter_mut() {
+                                        if !matches!(svc.health, Health::Pending) {
+                                            svc.pid = None;
+                                            svc.diagnosis = None;
+                                            if svc.spawn_cmd.is_some() {
+                                                svc.health = Health::Launching;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Restart Docker projects
+                                for dp in &docker_projects {
+                                    p(&format!(
+                                        "  {DIM}docker compose restart  {}{R}",
+                                        dp.label
+                                    ));
+                                    let _ = io::stdout().flush();
+                                    let proj = dp.project.as_str();
+                                    run_blocking(
+                                        "docker",
+                                        &["compose", "-p", proj, "restart"],
+                                        &dp.work_dir,
+                                    );
+                                }
+
+                                // Re-spawn all services
+                                let spawn_targets: Vec<(usize, SpawnCmd, PathBuf)> = {
+                                    let svcs = state.lock().unwrap();
+                                    svcs.iter()
+                                        .enumerate()
+                                        .filter_map(|(i, s)| {
+                                            s.spawn_cmd
+                                                .clone()
+                                                .map(|cmd| (i, cmd, s.log_path.clone()))
+                                        })
+                                        .collect()
+                                };
+                                for (idx, cmd, log_path) in spawn_targets {
+                                    let args: Vec<&str> =
+                                        cmd.args.iter().map(|s| s.as_str()).collect();
+                                    match spawn_svc(
+                                        &cmd.prog, &args, &cmd.dir, &cmd.env, &log_path,
+                                    ) {
+                                        Ok((child, pgid)) => {
+                                            let mut svcs = state.lock().unwrap();
+                                            let has_url = svcs[idx].url.is_some();
+                                            record_pid(&slug, child.id());
+                                            svcs[idx].health = if has_url {
+                                                Health::Launching
+                                            } else {
+                                                Health::Running
+                                            };
+                                            svcs[idx].pid = Some(child.id());
+                                            svcs[idx].started_at = Some(Instant::now());
+                                            svcs[idx].restarted_at = Some(Instant::now());
+                                            svcs[idx].diagnosis = None;
+                                            procs.push(Proc { idx, pgid, child });
+                                        }
+                                        Err(e) => {
+                                            let mut svcs = state.lock().unwrap();
+                                            svcs[idx].health = Health::Degraded(e.to_string());
+                                        }
+                                    }
+                                }
+
+                                thread::sleep(Duration::from_millis(400));
+                            }
+
+                            drain_input_events();
+                            raw_mode = TuiGuard::enter();
+                            mode = Mode::Overview { cursor: 0 };
+                            force_render = true;
                         }
                         InputEvent::Back => {
                             want_restart = true;
                             stopping.store(true, Ordering::Relaxed);
+                        }
+                        InputEvent::Detach => {
+                            want_detach = true;
                         }
                         InputEvent::Credentials => {
                             creds = gather_credentials(&ws_env_dir, &paths);
@@ -1848,6 +2966,69 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                         }
                         InputEvent::TogglePaths => {
                             show_paths = !show_paths;
+                        }
+                        InputEvent::OpenInCode => {
+                            let dir: Option<std::path::PathBuf> = {
+                                let svcs = state.lock().unwrap();
+                                let visible: Vec<usize> = svcs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, s)| !matches!(s.health, Health::Pending))
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                visible.get(*cursor).and_then(|&idx| {
+                                    let name = &svcs[idx].name;
+                                    // Open the repo root, not the service subdirectory.
+                                    let repo_root = if name.starts_with("copilot") {
+                                        Some(paths.copilot.clone())
+                                    } else if name.starts_with("opencti") {
+                                        Some(paths.opencti.clone())
+                                    } else if name.starts_with("openaev") {
+                                        Some(paths.openaev.clone())
+                                    } else if name.starts_with("connector") {
+                                        Some(paths.connector.clone())
+                                    } else if name.starts_with("grafana") {
+                                        Some(paths.grafana.clone())
+                                    } else if name.starts_with("langfuse") {
+                                        Some(paths.langfuse.clone())
+                                    } else {
+                                        svcs[idx].spawn_cmd.as_ref().map(|c| c.dir.clone())
+                                    };
+                                    repo_root
+                                })
+                            };
+                            if let Some(dir) = dir {
+                                let candidates = [
+                                    "/usr/local/bin/code-insiders",
+                                    "/opt/homebrew/bin/code-insiders",
+                                    "/usr/local/bin/code",
+                                    "/opt/homebrew/bin/code",
+                                ];
+                                let launched = candidates.iter().any(|bin| {
+                                    std::path::Path::new(bin).exists()
+                                        && std::process::Command::new(bin)
+                                            .args(["--new-window", dir.to_str().unwrap_or(".")])
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                            .is_ok()
+                                });
+                                if !launched {
+                                    for app in &["Visual Studio Code - Insiders", "Visual Studio Code"] {
+                                        if std::process::Command::new("open")
+                                            .args(["-n", "-a", app, "--args", "--new-window", dir.to_str().unwrap_or(".")])
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                            .is_ok()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     },
@@ -1902,6 +3083,18 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                 };
                             }
                         }
+                        InputEvent::RotateLog => {
+                            let log_path = {
+                                let svcs = state.lock().unwrap();
+                                svcs.get(*svc_idx).map(|s| s.log_path.clone())
+                            };
+                            if let Some(path) = log_path {
+                                let _ = rotate_log(&path);
+                                *scroll = 0;
+                                *follow = true;
+                            }
+                            force_render = true;
+                        }
                         _ => {}
                     },
                     Mode::Diagnose {
@@ -1934,7 +3127,10 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                     let (cmd, log_path) = {
                                         let svcs = state.lock().unwrap();
                                         svcs.get(idx)
-                                            .map(|s| (s.spawn_cmd.clone(), s.log_path.clone()))
+                                            .map(|s| {
+                                                llog!("[RESTART] {} — restarting after fix", s.name);
+                                                (s.spawn_cmd.clone(), s.log_path.clone())
+                                            })
                                             .unwrap_or_default()
                                     };
                                     if let Some(cmd) = cmd {
@@ -1960,6 +3156,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                                 };
                                                 svcs[idx].pid = Some(child.id());
                                                 svcs[idx].started_at = Some(Instant::now());
+                                                svcs[idx].restarted_at = Some(Instant::now());
                                                 svcs[idx].diagnosis = None;
                                                 procs.push(Proc { idx, pgid, child });
                                                 println!(
@@ -2102,7 +3299,7 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
                                         print!("\r\n  Creating issue…\r\n");
                                         let _ = io::stdout().flush();
                                         match create_github_issue(
-                                            f.kind, &svc_name, &f.title, &f.body, &log_tail, &ctx,
+                                            &f.kind, &svc_name, &f.title, &f.body, &log_tail, &ctx,
                                         ) {
                                             Ok(url) => {
                                                 print!("\r  {GRN}✓{R}  Issue created: {url}\r\n")
@@ -2184,4 +3381,17 @@ CONNECTOR_LICENCE_KEY_PEM=\n",
         thread::sleep(Duration::from_millis(20));
     }
     } // 'session loop
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() {
+    let args = Args::parse();
+    let workspace_root = resolve_workspace_root(&args);
+    let ws_dir = workspaces_dir(&workspace_root);
+    if args.session_worker {
+        run_session_loop(&args, &workspace_root, &ws_dir);
+    } else {
+        run_as_selector(&args, &workspace_root, &ws_dir);
+    }
 }

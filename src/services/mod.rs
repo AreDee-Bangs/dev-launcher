@@ -4,9 +4,11 @@ pub mod process;
 
 pub use docker::{
     compose_host_port, docker_available, docker_compose_down, docker_compose_running_count,
-    docker_compose_up, docker_kill_by_name_fragment, parse_compose_container_names,
+    docker_compose_up, docker_down_workspace, docker_kill_by_name_fragment,
+    docker_running_for_workspace, opensearch_ready, parse_compose_container_names,
     replace_port_in_value, resolve_product_docker_for_down, run_blocking, run_blocking_logged,
-    wipe_opencti_es_indices_if_stale, write_compose_override, ws_docker_project, DockerProject,
+    ensure_gitignore_entries, wait_for_opensearch, wipe_opencti_es_indices_if_stale,
+    write_compose_override, ws_docker_project, DockerProject,
 };
 pub use manifest::{
     ensure_opencti_env, ensure_opencti_graphql_python_deps, infer_repo_manifest,
@@ -16,8 +18,11 @@ pub use manifest::{
     ManifestDocker, RepoManifest, SvcDef,
 };
 pub use process::{
-    kill_orphaned_pids, open_log, pid_file_path, probe, record_pid, sighup_handler, spawn_svc,
-    Proc, SIGHUP_STOP,
+    alive_pid_count, compress_rotated_logs, detached_marker_path, kill_orphaned_pids,
+    mark_detached, open_log, pid_file_path, probe, read_worker_pid, record_pid, remove_worker_pid,
+    rotate_log, sighup_handler, shutdown_detached_session, spawn_svc, worker_pid_path,
+    workspace_run_status, write_worker_pid,
+    Proc, WorkspaceRunStatus, SIGHUP_STOP,
 };
 
 use std::collections::HashMap;
@@ -36,6 +41,7 @@ pub enum Health {
     Probing(u32),
     Up,
     Running,
+    Stopped,
     Degraded(String),
     Crashed(i32),
 }
@@ -48,6 +54,7 @@ impl Health {
             Health::Probing(n) => format!("{YLW}health probe #{n}{R}"),
             Health::Up => format!("{GRN}up{R}"),
             Health::Running => format!("{CYN}running{R}"),
+            Health::Stopped => format!("{DIM}stopped{R}"),
             Health::Degraded(msg) => format!("{RED}degraded ({msg}){R}"),
             Health::Crashed(code) => format!("{RED}crashed ({code}){R}"),
         }
@@ -60,6 +67,7 @@ impl Health {
             Health::Probing(n) => format!("health probe #{n}"),
             Health::Up => "up".into(),
             Health::Running => "running".into(),
+            Health::Stopped => "stopped".into(),
             Health::Degraded(msg) => format!("degraded ({msg})"),
             Health::Crashed(code) => format!("crashed ({code})"),
         }
@@ -68,7 +76,7 @@ impl Health {
     pub fn is_done(&self) -> bool {
         matches!(
             self,
-            Health::Up | Health::Running | Health::Degraded(_) | Health::Crashed(_)
+            Health::Up | Health::Running | Health::Stopped | Health::Degraded(_) | Health::Crashed(_)
         )
     }
 }
@@ -94,6 +102,7 @@ pub struct Svc {
     pub health: Health,
     pub pid: Option<u32>,
     pub started_at: Option<Instant>,
+    pub restarted_at: Option<Instant>,
     pub startup_timeout: Duration,
     pub log_path: PathBuf,
     pub diagnosis: Option<String>,
@@ -116,6 +125,7 @@ impl Svc {
             health: Health::Pending,
             pid: None,
             started_at: None,
+            restarted_at: None,
             startup_timeout: Duration::from_secs(timeout_secs),
             log_path,
             diagnosis: None,
@@ -138,6 +148,12 @@ impl Svc {
         matches!(self.health, Health::Up | Health::Running)
     }
 
+    pub fn recently_restarted(&self) -> bool {
+        self.restarted_at
+            .map(|t| t.elapsed().as_secs() < 5)
+            .unwrap_or(false)
+    }
+
     pub fn is_waiting_for_requires(&self) -> bool {
         matches!(&self.health, Health::Degraded(m) if m.starts_with("Waiting for "))
             && self.spawn_cmd.is_some()
@@ -155,4 +171,9 @@ pub struct Paths {
     pub opencti: PathBuf,
     pub connector: PathBuf,
     pub openaev: PathBuf,
+    pub grafana: PathBuf,
+    pub langfuse: PathBuf,
+    /// Isolated directory for the copilot-infinity venv, separate from the backend venv.
+    /// Lives at ~/.dev-launcher/workspaces/{hash}/infinity-emb/
+    pub infinity: PathBuf,
 }

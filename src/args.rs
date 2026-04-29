@@ -83,4 +83,13 @@ pub struct Args {
     /// Same effect as setting FILIGRAN_WORKSPACE_ROOT.
     #[arg(long)]
     pub workspace_root: Option<PathBuf>,
+
+    // ── Internal subprocess flags (not shown in --help) ───────────────────────
+    /// [internal] This process is a session worker — skip the workspace selector.
+    #[arg(long, hide = true)]
+    pub session_worker: bool,
+
+    /// [internal] Force a clean start for this session (wipe Docker volumes etc.).
+    #[arg(long, hide = true)]
+    pub clean_start: bool,
 }

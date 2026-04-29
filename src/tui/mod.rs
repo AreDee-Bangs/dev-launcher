@@ -2,6 +2,7 @@ pub mod credentials;
 pub mod diagnose;
 pub mod logview;
 pub mod overview;
+pub mod splash;
 
 pub use credentials::{build_credentials_lines, gather_credentials, CredEntry};
 pub use diagnose::build_diagnose_lines;
@@ -34,7 +35,12 @@ pub const RED: &str = "\x1b[31m";
 pub const CYN: &str = "\x1b[36m";
 
 // ── Build version ─────────────────────────────────────────────────────────────
-pub const BUILD_VERSION: &str = concat!("dev-launcher.", env!("BUILD_TIMESTAMP"));
+pub const BUILD_VERSION: &str = concat!(
+    "dev-launcher v",
+    env!("CARGO_PKG_VERSION"),
+    "-",
+    env!("GIT_SHA")
+);
 
 // ── Warm-gradient "Enter run fix" label ───────────────────────────────────────
 pub const ENTER_RUN_FIX: &str = concat!(
@@ -120,7 +126,13 @@ pub enum InputEvent {
     Diagnose,
     Report,
     Restart,
+    Stop,
+    FullRestart,
+    RotateLog,
     TogglePaths,
+    /// Leave the TUI and return to the workspace selector without stopping the stack.
+    Detach,
+    OpenInCode,
 }
 
 /// Translate a crossterm `KeyEvent` into our `InputEvent` vocabulary.
@@ -138,12 +150,21 @@ pub fn map_key_event(ke: KeyEvent) -> Option<InputEvent> {
         KeyCode::Char('e') => Some(InputEvent::Credentials),
         KeyCode::Char('d') => Some(InputEvent::Diagnose),
         KeyCode::Char('p') | KeyCode::Char('P') => Some(InputEvent::TogglePaths),
+        KeyCode::Char('r') if ke.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputEvent::FullRestart)
+        }
         KeyCode::Char('r') if !ke.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(InputEvent::Report)
         }
         KeyCode::Char('R') | KeyCode::Char('r') if ke.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(InputEvent::Restart)
         }
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(InputEvent::Stop),
+        KeyCode::Char('m') | KeyCode::Char('M') => Some(InputEvent::Detach),
+        KeyCode::Char('c') if !ke.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputEvent::RotateLog)
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => Some(InputEvent::OpenInCode),
         _ => None,
     }
 }

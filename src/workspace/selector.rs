@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::Path;
 
 use crossterm::event::{self, Event, KeyCode};
 
 use crate::config::read_line_or_interrupt;
+use crate::services::{workspace_run_status, WorkspaceRunStatus};
 use crate::tui::{
     drain_input_events, draw_ansi_lines, TuiGuard, BOLD, BUILD_VERSION, CYN, DIM, GRN, R, RED, YLW,
 };
@@ -11,16 +13,22 @@ use crate::workspace::env::parse_env_file;
 use crate::workspace::git::{
     branch_to_slug, parse_commit_ref, worktree_delete_blockers, worktree_dirty_reasons,
 };
-use crate::workspace::{WorkspaceConfig, PRODUCTS};
+use crate::workspace::{is_infra_product, WorkspaceConfig, PRODUCTS};
 
 pub enum WorkspaceAction {
     Open(WorkspaceConfig),
     Delete(WorkspaceConfig),
     CreateNew,
+    Reattach(WorkspaceConfig),
+    StopSession(WorkspaceConfig),
     Quit,
 }
 
-fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize) -> Vec<String> {
+fn build_workspace_selector_lines(
+    workspaces: &[WorkspaceConfig],
+    cursor: usize,
+    stopped_hashes: &HashSet<String>,
+) -> Vec<String> {
     let sep = "─".repeat(72);
     let mut out = Vec::new();
     out.push(format!("\n  {BOLD}{CYN}{BUILD_VERSION}{R}\n"));
@@ -40,12 +48,27 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
         let hash = format!("{DIM}[{}]{R}", ws.hash);
         let summary = ws.summary();
         let date = format!("{DIM}{}{R}", ws.created);
+        let offset_tag = if ws.port_offset > 0 {
+            format!("  {DIM}+{}{R}", ws.port_offset)
+        } else {
+            String::new()
+        };
         let summary_display = if summary.len() > 52 {
             format!("{}…", &summary[..51])
         } else {
             summary.clone()
         };
-        out.push(format!("  {marker}{hash}  {:<54}{date}", summary_display));
+        let status_dot = if stopped_hashes.contains(&ws.hash) {
+            format!(" {CYN}●{R}")
+        } else {
+            match workspace_run_status(&ws.hash) {
+                WorkspaceRunStatus::Running => format!(" {GRN}●{R}"),
+                WorkspaceRunStatus::Degraded => format!(" {YLW}●{R}"),
+                WorkspaceRunStatus::Failed => format!(" {RED}●{R}"),
+                WorkspaceRunStatus::NotRunning => "  ".to_string(),
+            }
+        };
+        out.push(format!("  {marker}{hash}{status_dot}  {:<54}{date}{offset_tag}", summary_display));
     }
 
     let new_idx = workspaces.len();
@@ -59,9 +82,12 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
     out.push(String::new());
     out.push(format!("  {DIM}{sep}{R}"));
     if cursor < total - 1 {
-        out.push(format!(
-            "  {DIM}↑↓ navigate   Enter open   d delete   q quit{R}"
-        ));
+        let selected_stopped = cursor < workspaces.len() && stopped_hashes.contains(&workspaces[cursor].hash);
+        if selected_stopped {
+            out.push(format!("  {DIM}↑↓ navigate   r reattach   s stop   d delete   q quit{R}"));
+        } else {
+            out.push(format!("  {DIM}↑↓ navigate   Enter open   d delete   q quit{R}"));
+        }
     } else {
         out.push(format!("  {DIM}↑↓ navigate   Enter create   q quit{R}"));
     }
@@ -69,7 +95,7 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
     out
 }
 
-pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction {
+pub fn run_workspace_selector(workspaces: &[WorkspaceConfig], stopped_hashes: &HashSet<String>) -> WorkspaceAction {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
         return WorkspaceAction::CreateNew;
     }
@@ -78,7 +104,7 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
     let mut cursor = 0usize;
     loop {
         if let Some(tui) = raw.as_mut() {
-            draw_ansi_lines(tui, &build_workspace_selector_lines(workspaces, cursor));
+            draw_ansi_lines(tui, &build_workspace_selector_lines(workspaces, cursor, stopped_hashes));
         }
         if event::poll(std::time::Duration::from_millis(20)).unwrap_or(false) {
             let Ok(Event::Key(ke)) = event::read() else {
@@ -87,6 +113,7 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
             if ke.kind != crossterm::event::KeyEventKind::Press {
                 continue;
             }
+            let selected_stopped = cursor < workspaces.len() && stopped_hashes.contains(&workspaces[cursor].hash);
             match ke.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     cursor = cursor.saturating_sub(1);
@@ -94,14 +121,26 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
                 KeyCode::Down | KeyCode::Char('j') if cursor + 1 < total => {
                     cursor += 1;
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                     drain_input_events();
                     drop(raw.take());
                     if cursor == workspaces.len() {
                         return WorkspaceAction::CreateNew;
+                    } else if selected_stopped {
+                        return WorkspaceAction::Reattach(workspaces[cursor].clone());
                     } else {
                         return WorkspaceAction::Open(workspaces[cursor].clone());
                     }
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') if selected_stopped => {
+                    drain_input_events();
+                    drop(raw.take());
+                    return WorkspaceAction::Reattach(workspaces[cursor].clone());
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') if selected_stopped => {
+                    drain_input_events();
+                    drop(raw.take());
+                    return WorkspaceAction::StopSession(workspaces[cursor].clone());
                 }
                 KeyCode::Char('d') | KeyCode::Char('D') if cursor < workspaces.len() => {
                     drain_input_events();
@@ -316,7 +355,7 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
         print!("  Stopping {} Docker containers… ", entry.repo);
         let _ = io::stdout().flush();
 
-        let ws_override = write_compose_override(&compose_file, ws_hash);
+        let ws_override = write_compose_override(&compose_file, ws_hash, 0);
         let mut argv_ws: Vec<&str> = vec!["compose", "-p", &ws_project, "-f", file_str];
         let ov_str: String;
         if let Some(ref ov) = ws_override {
@@ -527,7 +566,8 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
                 cursor += 1;
             }
             KeyCode::Char(' ') => {
-                if choices[cursor].available || !choices[cursor].branch.is_empty() {
+                let c = &choices[cursor];
+                if c.available || !c.branch.is_empty() || is_infra_product(c.repo) {
                     choices[cursor].enabled = !choices[cursor].enabled;
                 } else {
                     drop(raw.take());
@@ -545,26 +585,30 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
                 }
             }
             KeyCode::Char('b') | KeyCode::Char('B') => {
-                drop(raw.take());
-                let current = &choices[cursor].branch;
-                if current.is_empty() {
-                    print!("\n  Branch for {} : ", choices[cursor].label);
+                if is_infra_product(choices[cursor].repo) {
+                    // infra products have no branches
                 } else {
-                    print!(
-                        "\n  Branch for {} (Enter to keep {current}): ",
-                        choices[cursor].label
-                    );
-                }
-                let _ = io::stdout().flush();
-                if let Some(input) = read_line_or_interrupt() {
-                    let trimmed = input.trim().to_string();
-                    if !trimmed.is_empty() {
-                        choices[cursor].branch = trimmed;
-                        choices[cursor].enabled = true;
-                        choices[cursor].available = true;
+                    drop(raw.take());
+                    let current = &choices[cursor].branch;
+                    if current.is_empty() {
+                        print!("\n  Branch for {} : ", choices[cursor].label);
+                    } else {
+                        print!(
+                            "\n  Branch for {} (Enter to keep {current}): ",
+                            choices[cursor].label
+                        );
                     }
+                    let _ = io::stdout().flush();
+                    if let Some(input) = read_line_or_interrupt() {
+                        let trimmed = input.trim().to_string();
+                        if !trimmed.is_empty() {
+                            choices[cursor].branch = trimmed;
+                            choices[cursor].enabled = true;
+                            choices[cursor].available = true;
+                        }
+                    }
+                    raw = TuiGuard::enter();
                 }
-                raw = TuiGuard::enter();
             }
             KeyCode::Enter => {
                 return LaunchMode::Normal;
@@ -587,7 +631,7 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
 pub fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> Vec<ProductChoice> {
     PRODUCTS
         .iter()
-        .map(|(repo, label, _, desc)| {
+        .map(|(repo, label, key, desc)| {
             let saved = config.entries.iter().find(|e| e.repo.as_str() == *repo);
             let branch = saved.map(|e| e.branch.clone()).unwrap_or_default();
             let enabled = saved.map(|e| e.enabled).unwrap_or(false);
@@ -602,12 +646,15 @@ pub fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> 
                     workspace_root.join(repo)
                 }
             };
+            // Infra products are always available — directories are bootstrapped on launch.
+            let available =
+                is_infra_product(key) || path.is_dir() || workspace_root.join(repo).is_dir();
             ProductChoice {
                 label,
                 desc,
                 repo,
                 enabled,
-                available: path.is_dir() || workspace_root.join(repo).is_dir(),
+                available,
                 branch,
             }
         })
@@ -629,15 +676,17 @@ pub fn choices_to_workspace(choices: &[ProductChoice]) -> WorkspaceConfig {
         hash,
         created: today(),
         entries,
+        port_offset: 0,
     }
 }
 
 pub fn default_product_choices(workspace_root: &Path) -> Vec<ProductChoice> {
     PRODUCTS
         .iter()
-        .map(|(repo, label, _, desc)| {
+        .map(|(repo, label, key, desc)| {
             let main_dir = workspace_root.join(repo);
-            let available = main_dir.is_dir();
+            // Infra products are always available — directories are bootstrapped on launch.
+            let available = is_infra_product(key) || main_dir.is_dir();
             ProductChoice {
                 label,
                 desc,

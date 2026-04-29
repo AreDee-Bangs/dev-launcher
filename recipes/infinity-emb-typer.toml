@@ -1,0 +1,23 @@
+id      = "infinity-emb-typer-missing"
+health  = "crashed"
+service = "copilot-infinity"
+log_tail = 20
+
+[[match]]
+any_of = ["typer is not available"]
+
+title = "infinity-emb crashed: typer not installed"
+body = [
+    "  Exit code : {exit_code}",
+    "  The v2 CLI entrypoint requires typer, which is part of the [server] extra.",
+    "  Previous install used [fastapi,uvicorn,...] which no longer bundles typer.",
+    "  Fix: reinstall with infinity-emb[server,torch,transformers].",
+]
+
+[fix]
+label        = "Reinstall infinity-emb with [server] extras (adds typer)"
+restart_after = true
+
+[[fix.steps]]
+command = ["{pip}", "install", "infinity-emb[server,torch,transformers]", "click<8.2"]
+cwd     = "backend"

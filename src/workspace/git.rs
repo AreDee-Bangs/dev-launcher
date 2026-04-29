@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::tui::{GRN, R, YLW};
+use crate::tui::{CYN, DIM, GRN, R, RED, YLW};
 
 /// Sentinel prefix used to store commit-pinned branches in workspace configs.
 pub const COMMIT_PREFIX: &str = "commit:";
@@ -103,8 +103,7 @@ pub fn ensure_worktree_at_commit(workspace: &Path, repo: &str, commit: &str) -> 
     }
 
     let main_repo = workspace.join(repo);
-    if !main_repo.is_dir() {
-        println!("  {YLW}⚠{R}  {repo} repo not found locally, skipping worktree setup");
+    if !main_repo.is_dir() && !auto_clone_if_missing(workspace, repo) {
         return target;
     }
 
@@ -168,21 +167,81 @@ fn run_git_visible(dir: &Path, args: &[&str]) -> bool {
 }
 
 /// Pull fast-forward from origin in `worktree` for `branch`, if a remote tracking ref exists.
-/// Best-effort: silently skips if no remote ref or if the pull fails (e.g. diverged history).
+/// Falls back to `reset --hard origin/<branch>` when the remote has diverged (force push).
 fn pull_ff_from_origin(worktree: &Path, main_repo: &Path, branch: &str) {
     let remote_ref = format!("refs/remotes/origin/{branch}");
     if !ref_exists(main_repo, &remote_ref) {
         return;
     }
-    let ok = Command::new("git")
+    let ff_ok = Command::new("git")
         .args(["pull", "--ff-only", "origin", branch])
         .current_dir(worktree)
         .stdin(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !ok {
-        println!("  {YLW}⚠{R}  Could not fast-forward {branch} from origin (diverged or unreachable) — worktree may be behind");
+    if ff_ok {
+        return;
+    }
+    // Fast-forward failed — remote likely had a force push.  Since dev-stack
+    // worktrees hold no local work, reset hard to the remote tip.
+    let reset_ok = Command::new("git")
+        .args(["reset", "--hard", &format!("origin/{branch}")])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if reset_ok {
+        println!("  {YLW}⚡{R}  {branch} diverged from origin (force push?) — reset to remote tip");
+    } else {
+        println!("  {YLW}⚠{R}  Could not sync {branch} from origin — worktree may be behind");
+    }
+}
+
+/// Clone `repo` into `{workspace}/{repo}` using the URL from the repo registry.
+/// Returns `true` if the clone succeeded (or the directory already exists).
+fn auto_clone_if_missing(workspace: &Path, repo: &str) -> bool {
+    let main_repo = workspace.join(repo);
+    if main_repo.is_dir() {
+        return true;
+    }
+
+    let repos = super::repos::load_repos();
+    let Some(entry) = repos.iter().find(|e| e.dir == repo) else {
+        println!(
+            "  {YLW}⚠{R}  {repo}: not found locally and no clone URL registered — skipping"
+        );
+        return false;
+    };
+
+    println!(
+        "  {CYN}▶{R}  {repo} not cloned yet — cloning from {DIM}{}{R}…",
+        entry.url
+    );
+    let target = workspace.join(repo);
+    let status = Command::new("git")
+        .args(["clone", &entry.url, target.to_str().unwrap_or("")])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("  {GRN}✓{R}  {repo} cloned");
+            true
+        }
+        Ok(s) => {
+            println!(
+                "  {RED}✗{R}  Failed to clone {repo} (exit {})",
+                s.code().unwrap_or(-1)
+            );
+            false
+        }
+        Err(e) => {
+            println!("  {RED}✗{R}  Failed to clone {repo}: {e}");
+            false
+        }
     }
 }
 
@@ -194,8 +253,7 @@ pub fn ensure_worktree_branch(workspace: &Path, repo: &str, branch: &str) -> Pat
     }
 
     let main_repo = workspace.join(repo);
-    if !main_repo.is_dir() {
-        println!("  {YLW}⚠{R}  {repo} repo not found locally, skipping worktree setup");
+    if !main_repo.is_dir() && !auto_clone_if_missing(workspace, repo) {
         return target;
     }
 

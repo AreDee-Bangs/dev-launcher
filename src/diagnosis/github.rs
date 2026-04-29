@@ -18,12 +18,12 @@ pub fn venv_fix_steps(backend_dir: &std::path::Path) -> Vec<FixStep> {
     )];
     if backend_dir.join("requirements.txt").exists() {
         steps.push(FixStep::new(
-            &[".venv/bin/pip", "install", "-q", "-r", "requirements.txt"],
+            &[".venv/bin/pip", "install", "-r", "requirements.txt"],
             backend_dir,
         ));
     } else if backend_dir.join("pyproject.toml").exists() {
         steps.push(FixStep::new(
-            &[".venv/bin/pip", "install", "-q", "-e", "."],
+            &[".venv/bin/pip", "install", "-e", "."],
             backend_dir,
         ));
     }

@@ -1,0 +1,15 @@
+id       = "diag-permission-denied"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = ["permission denied"]
+
+title = "Permission denied"
+body = [
+    "  The process was denied access to a file or directory.",
+    "  Check ownership and permissions:",
+    "    ls -la <path>",
+    "    sudo chown -R $USER <path>",
+    "  Or the process may lack permission to bind to a privileged port (< 1024).",
+]

@@ -1,29 +1,30 @@
 fn main() {
-    // Use SOURCE_DATE_EPOCH (reproducible builds) if set, otherwise call the
-    // platform date command.  Falls back to an empty string so the build never
-    // fails on a platform where the command is unavailable.
-    let ts = if let Ok(epoch) = std::env::var("SOURCE_DATE_EPOCH") {
-        epoch
-    } else {
-        #[cfg(unix)]
-        {
-            std::process::Command::new("date")
-                .arg("+%m%d%Y%H%M")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .unwrap_or_default()
-        }
-        #[cfg(windows)]
-        {
-            std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", "Get-Date -Format 'MMddyyyyHHmm'"])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .unwrap_or_default()
-        }
-    };
-    println!("cargo:rustc-env=BUILD_TIMESTAMP={}", ts.trim());
+    // Short commit SHA of the current HEAD. Falls back to "unknown".
+    let git_sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=GIT_SHA={git_sha}");
+
+    // Remote origin URL — used at runtime to clone/pull the recipe store.
+    let git_origin = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=GIT_ORIGIN_URL={git_origin}");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    println!("cargo:rustc-env=RECIPES_EMBEDDED_DIR={manifest_dir}/recipes");
+
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=recipes/");
+    println!("cargo:rerun-if-changed=.git/config");
 }

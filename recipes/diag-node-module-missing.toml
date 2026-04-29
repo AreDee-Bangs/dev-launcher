@@ -1,0 +1,23 @@
+id       = "diag-node-module-missing"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "cannot find module",
+    "error: cannot find module",
+]
+
+title = "Node.js module missing"
+body = [
+    "  A required Node.js package is not installed.",
+    "  Fix: install JavaScript dependencies.",
+]
+
+[fix]
+label        = "Install JavaScript dependencies (yarn install)"
+restart_after = false
+
+[[fix.steps]]
+command = ["yarn", "install"]
+cwd     = "frontend"

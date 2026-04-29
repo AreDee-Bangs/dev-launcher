@@ -1,0 +1,19 @@
+id       = "diag-oom"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "out of memory",
+    "killed",
+]
+
+title = "Process killed — out of memory (OOM)"
+body = [
+    "  The process was killed by the OS due to memory pressure.",
+    "  Options:",
+    "    - Free RAM by stopping unused apps / Docker containers",
+    "    - Increase swap: sudo sysctl vm.swappiness=60",
+    "    - Reduce the number of enabled services in dev-launcher",
+    "    - Check for memory leaks: top / htop",
+]
