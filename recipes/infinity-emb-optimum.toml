@@ -23,5 +23,5 @@ command = ["{pip}", "uninstall", "-y", "optimum", "optimum-onnx", "infinity-emb"
 cwd     = "backend"
 
 [[fix.steps]]
-command = ["{pip}", "install", "infinity-emb[fastapi,uvicorn,torch,transformers]"]
+command = ["{pip}", "install", "infinity-emb[server,torch,transformers]", "click<8.2"]
 cwd     = "backend"

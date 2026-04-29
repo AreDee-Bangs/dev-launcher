@@ -194,9 +194,20 @@ fn ensure_infinity_emb_isolated(infinity_dir: &Path) -> bool {
     let pip = infinity_dir.join(".venv/bin/pip");
 
     let is_healthy = || -> bool {
+        // Binary must exist and respond to --help (catches typer/CLI issues).
+        // Also require einops explicitly — it's needed by nomic-embed-text-v1.5
+        // but is not pulled in transitively by infinity-emb's own extras.
         bin.exists()
             && Command::new(&bin)
                 .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            && pip.exists()
+            && Command::new(&pip)
+                .args(["show", "einops"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -222,11 +233,19 @@ fn ensure_infinity_emb_isolated(infinity_dir: &Path) -> bool {
 
     // [server] includes fastapi + uvicorn + typer (required by the v2 CLI entrypoint).
     // click<8.2 keeps typer 0.12 working (click>=8.2 broke the CLI bootstrap).
+    // einops is required by nomic-embed-text-v1.5 (dynamic module import).
     run_blocking(
         pip.to_str().unwrap_or("pip"),
-        &["install", "infinity-emb[server,torch,transformers]", "click<8.2"],
+        &["install", "infinity-emb[server,torch,transformers]", "click<8.2", "einops"],
         infinity_dir,
     );
+
+    // optimum/optimum-onnx creates an `optimum/` namespace that tricks
+    // CHECK_OPTIMUM.is_available into returning True, but bettertransformer
+    // was removed from optimum >= 1.21 — causing NameError at startup.
+    // Uninstall proactively; they are not needed for torch-based inference.
+    let pip_str = pip.to_str().unwrap_or("pip");
+    run_blocking(pip_str, &["uninstall", "-y", "optimum", "optimum-onnx"], infinity_dir);
 
     is_healthy()
 }
@@ -1916,10 +1935,13 @@ CONNECTOR_LICENCE_KEY_PEM=\n"
             } else {
                 let port_str = copilot_infinity_port.to_string();
                 let bin_str = infinity_bin.to_string_lossy().into_owned();
+                // --no-bettertransformer: the default (true) triggers a NameError in
+                // infinity-emb 0.0.76 when optimum is not installed, because
+                // acceleration.py uses BetterTransformerManager without an availability guard.
                 try_spawn!(
                     svc,
                     &bin_str,
-                    &["v2", "--model-id", &infinity_model, "--port", &port_str],
+                    &["v2", "--model-id", &infinity_model, "--port", &port_str, "--no-bettertransformer"],
                     infinity_dir,
                     &HashMap::new()
                 );

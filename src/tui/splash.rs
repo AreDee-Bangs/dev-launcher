@@ -248,7 +248,19 @@ fn do_sync(origin: &str, tx: mpsc::Sender<SyncMsg>) {
     }
 
     let _ = tx.send(SyncMsg::Step { progress: 0.90, status: "Loading recipes…" });
-    let _ = tx.send(SyncMsg::Done(recipes_dir));
+
+    // If the remote main branch doesn't have a recipes/ dir yet (e.g. they're
+    // only on a feature branch), fall back to the compile-time bundled path.
+    let dir = if recipes_dir.is_dir()
+        && std::fs::read_dir(&recipes_dir)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    {
+        recipes_dir
+    } else {
+        PathBuf::from(EMBEDDED_RECIPES)
+    };
+    let _ = tx.send(SyncMsg::Done(dir));
 }
 
 /// Git sparse-checkout clone — only fetches the `recipes/` subtree.
