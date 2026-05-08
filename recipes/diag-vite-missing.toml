@@ -1,0 +1,25 @@
+id       = "diag-vite-missing"
+health   = "crashed"
+service  = "copilot-frontend"
+log_tail = 30
+
+[[match]]
+any_of = [
+    "command not found: vite",
+    "vite: command not found",
+]
+
+title = "copilot-frontend crashed: vite is not installed"
+body = [
+    "  Exit code : {exit_code}",
+    "  `vite` is not on the path because the frontend's node_modules is missing",
+    "  or out of date. The fix is the standard one — reinstall JS dependencies.",
+]
+
+[fix]
+label         = "Install JS dependencies (yarn install)"
+restart_after = true
+
+[[fix.steps]]
+command = ["yarn", "install"]
+cwd     = "frontend"

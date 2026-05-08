@@ -1,0 +1,31 @@
+id              = "diag-spring-boot-exited-clean"
+health          = "crashed"
+service_prefix  = "openaev"
+log_tail        = 60
+
+[[match]]
+all_of = [
+    "build success",
+    "spring-boot",
+]
+
+title = "openaev-backend exited 0 after Maven BUILD SUCCESS"
+body = [
+    "  Exit code : {exit_code}",
+    "  Maven reported BUILD SUCCESS and exited cleanly, but `spring-boot:run`",
+    "  is supposed to keep the JVM alive. The forked Spring Boot process died",
+    "  silently — usually one of:",
+    "",
+    "    - Wrong JDK on PATH (OpenAEV requires JDK 21).",
+    "         /usr/libexec/java_home -v 21",
+    "    - The application bound to a port that was already taken and the",
+    "      framework swallowed the error. With dynamic port offsets (>= v0.1.4)",
+    "      this should be rare.",
+    "    - A Spring profile / @Configuration validation failed before the",
+    "      embedded server started — scroll the openaev-backend.log up past",
+    "      `BUILD SUCCESS` and look for the first `ERROR` or stack trace.",
+    "",
+    "  Quick diagnostic:",
+    "    cd {repo_dir}",
+    "    mvn -X spring-boot:run -pl openaev-api -Dspring-boot.run.profiles=dev",
+]

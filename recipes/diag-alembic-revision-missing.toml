@@ -1,0 +1,31 @@
+id              = "diag-alembic-revision-missing"
+health          = "any"
+service         = "copilot-backend"
+log_tail        = 80
+
+[[match]]
+any_of = [
+    "can't locate revision identified by",
+    "database migration failed",
+]
+
+title = "copilot-backend: alembic can't find a recorded revision"
+body = [
+    "  The `alembic_version` table in PostgreSQL points at a revision id that",
+    "  no longer exists in the source tree — usually leftover from a different",
+    "  branch you previously ran.",
+    "",
+    "  Resolve it from the backend worktree:",
+    "    cd {backend_dir}",
+    "    .venv/bin/python -m alembic -c alembic/alembic.ini current      # see what's recorded",
+    "    .venv/bin/python -m alembic -c alembic/alembic.ini heads        # see what the code expects",
+    "",
+    "  Pick one of:",
+    "    a) Stamp the DB to the current head (data preserved, schema may drift):",
+    "         .venv/bin/python -m alembic -c alembic/alembic.ini stamp head",
+    "    b) Wipe the alembic version row so migrations run from scratch:",
+    "         psql $DATABASE_URL -c 'TRUNCATE alembic_version;'",
+    "    c) Drop and recreate the database (loses all data):",
+    "         docker compose exec postgres dropdb -U copilot copilot",
+    "         docker compose exec postgres createdb -U copilot copilot",
+]

@@ -1,0 +1,35 @@
+id              = "diag-maven-dep-not-found"
+health          = "crashed"
+service_prefix  = "openaev"
+log_tail        = 80
+
+[[match]]
+all_of = [
+    "could not resolve dependencies",
+    "io.openaev:openaev-",
+]
+
+[[match]]
+any_of = [
+    "this failure was cached in the local repository",
+    "was not found in https://repo.maven.apache.org",
+    "was not found in https://repository.jboss.org",
+]
+
+title = "openaev-backend crashed: cached Maven dependency resolution failure"
+body = [
+    "  Exit code : {exit_code}",
+    "  Maven cached a `not found` for an internal openaev module (e.g. openaev-framework)",
+    "  from a previous run when the local sibling modules weren't installed yet.",
+    "  Subsequent runs reuse the cached failure even after the modules are buildable.",
+    "",
+    "  Fix: install every module locally with `-U` to force-refresh the cache.",
+]
+
+[fix]
+label         = "Install all OpenAEV modules locally (mvn install -U -DskipTests)"
+restart_after = true
+
+[[fix.steps]]
+command = ["mvn", "install", "-U", "-DskipTests", "-DskipITs"]
+cwd     = "repo"

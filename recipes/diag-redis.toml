@@ -1,18 +1,32 @@
 id       = "diag-redis"
 health   = "any"
-log_tail = 50
+log_tail = 80
 
 [[match]]
 any_of = [
     "redis: could not connect",
     "error connecting to redis",
+    # Match any host:port form, not just 6379, so dynamic offsets are covered.
     "connection refused to localhost:6379",
+    "connection refused to localhost:6380",
+    # copilot-backend's startup_checks logs this exact prefix while retrying.
+    "redis not ready",
+    "error 61 connecting to localhost:638",
+    "error 61 connecting to localhost:678",
 ]
 
 title = "Redis is not reachable"
 body = [
-    "  Redis is not accepting connections on port 6379.",
-    "  Check the Docker container:",
+    "  Redis is not accepting connections on the host port the backend expects.",
+    "",
+    "  First check the Docker container:",
     "    docker ps -a | grep redis",
     "    docker start <redis-container>",
+    "",
+    "  If the container is up but the backend still can't reach it, host port",
+    "  and env value are out of sync — usually after toggling `port_offset`.",
+    "  dev-launcher >= v0.1.4 chooses the offset dynamically per launch and",
+    "  rewrites REDIS_URL to match. Stop the workspace and relaunch:",
+    "    dev-launcher workspace stop  <hash>",
+    "    dev-launcher --workspace     <hash>",
 ]

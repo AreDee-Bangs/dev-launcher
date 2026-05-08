@@ -1,0 +1,29 @@
+id              = "diag-maven-typetag-unknown"
+health          = "crashed"
+service_prefix  = "openaev"
+log_tail        = 60
+
+[[match]]
+any_of = [
+    "com.sun.tools.javac.code.TypeTag :: UNKNOWN",
+    "fatal error compiling: java.lang.exceptionininitializererror",
+]
+
+title = "openaev-backend crashed: javac/JDK toolchain mismatch"
+body = [
+    "  Exit code : {exit_code}",
+    "  `maven-compiler-plugin` failed with `TypeTag :: UNKNOWN`, which means it",
+    "  loaded an annotation processor (typically Lombok) compiled against a",
+    "  different JDK than the one running the build.",
+    "",
+    "  Fix:",
+    "    1. Make sure JAVA_HOME points at JDK 21:",
+    "         /usr/libexec/java_home -v 21",
+    "    2. Clear the Maven Lombok cache and rebuild from scratch:",
+    "         find ~/.m2/repository/org/projectlombok -name '*.jar' -delete",
+    "         (cd {repo_dir} && mvn -U clean install -DskipTests -DskipITs)",
+    "    3. Re-launch the openaev backend.",
+    "",
+    "  If you use SDKMAN/asdf, switch the local JDK there too — Maven picks up",
+    "  whichever `java` is first on PATH, not the one mvn was launched with.",
+]
