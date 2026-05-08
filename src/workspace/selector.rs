@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::Path;
 
 use crossterm::event::{self, Event, KeyCode};
 
 use crate::config::read_line_or_interrupt;
+use crate::services::{workspace_run_status, WorkspaceRunStatus};
 use crate::tui::{
     drain_input_events, draw_ansi_lines, TuiGuard, BOLD, BUILD_VERSION, CYN, DIM, GRN, R, RED, YLW,
 };
@@ -11,16 +13,23 @@ use crate::workspace::env::parse_env_file;
 use crate::workspace::git::{
     branch_to_slug, parse_commit_ref, worktree_delete_blockers, worktree_dirty_reasons,
 };
-use crate::workspace::{WorkspaceConfig, PRODUCTS};
+use crate::workspace::{is_infra_product, WorkspaceConfig, PRODUCTS};
 
 pub enum WorkspaceAction {
     Open(WorkspaceConfig),
     Delete(WorkspaceConfig),
     CreateNew,
+    Reattach(WorkspaceConfig),
+    StopSession(WorkspaceConfig),
+    OpenInCode(WorkspaceConfig),
     Quit,
 }
 
-fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize) -> Vec<String> {
+fn build_workspace_selector_lines(
+    workspaces: &[WorkspaceConfig],
+    cursor: usize,
+    stopped_hashes: &HashSet<String>,
+) -> Vec<String> {
     let sep = "─".repeat(72);
     let mut out = Vec::new();
     out.push(format!("\n  {BOLD}{CYN}{BUILD_VERSION}{R}\n"));
@@ -40,12 +49,31 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
         let hash = format!("{DIM}[{}]{R}", ws.hash);
         let summary = ws.summary();
         let date = format!("{DIM}{}{R}", ws.created);
+        // Port offset is chosen dynamically per launch; surface it here only
+        // when a session is running (read from the runtime snapshot).
+        let offset_tag = match crate::control::read_snapshot(&ws.hash) {
+            Some(s) if s.port_offset > 0 => format!("  {DIM}+{}{R}", s.port_offset),
+            _ => String::new(),
+        };
         let summary_display = if summary.len() > 52 {
             format!("{}…", &summary[..51])
         } else {
             summary.clone()
         };
-        out.push(format!("  {marker}{hash}  {:<54}{date}", summary_display));
+        let status_dot = if stopped_hashes.contains(&ws.hash) {
+            format!(" {CYN}●{R}")
+        } else {
+            match workspace_run_status(&ws.hash) {
+                WorkspaceRunStatus::Running => format!(" {GRN}●{R}"),
+                WorkspaceRunStatus::Degraded => format!(" {YLW}●{R}"),
+                WorkspaceRunStatus::Failed => format!(" {RED}●{R}"),
+                WorkspaceRunStatus::NotRunning => "  ".to_string(),
+            }
+        };
+        out.push(format!(
+            "  {marker}{hash}{status_dot}  {:<54}{date}{offset_tag}",
+            summary_display
+        ));
     }
 
     let new_idx = workspaces.len();
@@ -59,9 +87,17 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
     out.push(String::new());
     out.push(format!("  {DIM}{sep}{R}"));
     if cursor < total - 1 {
-        out.push(format!(
-            "  {DIM}↑↓ navigate   Enter open   d delete   q quit{R}"
-        ));
+        let selected_stopped =
+            cursor < workspaces.len() && stopped_hashes.contains(&workspaces[cursor].hash);
+        if selected_stopped {
+            out.push(format!(
+                "  {DIM}↑↓ navigate   r reattach   s stop   o code   d delete   q quit{R}"
+            ));
+        } else {
+            out.push(format!(
+                "  {DIM}↑↓ navigate   Enter open   o code   d delete   q quit{R}"
+            ));
+        }
     } else {
         out.push(format!("  {DIM}↑↓ navigate   Enter create   q quit{R}"));
     }
@@ -69,7 +105,10 @@ fn build_workspace_selector_lines(workspaces: &[WorkspaceConfig], cursor: usize)
     out
 }
 
-pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction {
+pub fn run_workspace_selector(
+    workspaces: &[WorkspaceConfig],
+    stopped_hashes: &HashSet<String>,
+) -> WorkspaceAction {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
         return WorkspaceAction::CreateNew;
     }
@@ -78,7 +117,10 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
     let mut cursor = 0usize;
     loop {
         if let Some(tui) = raw.as_mut() {
-            draw_ansi_lines(tui, &build_workspace_selector_lines(workspaces, cursor));
+            draw_ansi_lines(
+                tui,
+                &build_workspace_selector_lines(workspaces, cursor, stopped_hashes),
+            );
         }
         if event::poll(std::time::Duration::from_millis(20)).unwrap_or(false) {
             let Ok(Event::Key(ke)) = event::read() else {
@@ -87,6 +129,8 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
             if ke.kind != crossterm::event::KeyEventKind::Press {
                 continue;
             }
+            let selected_stopped =
+                cursor < workspaces.len() && stopped_hashes.contains(&workspaces[cursor].hash);
             match ke.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     cursor = cursor.saturating_sub(1);
@@ -94,14 +138,31 @@ pub fn run_workspace_selector(workspaces: &[WorkspaceConfig]) -> WorkspaceAction
                 KeyCode::Down | KeyCode::Char('j') if cursor + 1 < total => {
                     cursor += 1;
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                     drain_input_events();
                     drop(raw.take());
                     if cursor == workspaces.len() {
                         return WorkspaceAction::CreateNew;
+                    } else if selected_stopped {
+                        return WorkspaceAction::Reattach(workspaces[cursor].clone());
                     } else {
                         return WorkspaceAction::Open(workspaces[cursor].clone());
                     }
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') if selected_stopped => {
+                    drain_input_events();
+                    drop(raw.take());
+                    return WorkspaceAction::Reattach(workspaces[cursor].clone());
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') if selected_stopped => {
+                    drain_input_events();
+                    drop(raw.take());
+                    return WorkspaceAction::StopSession(workspaces[cursor].clone());
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') if cursor < workspaces.len() => {
+                    drain_input_events();
+                    drop(raw.take());
+                    return WorkspaceAction::OpenInCode(workspaces[cursor].clone());
                 }
                 KeyCode::Char('d') | KeyCode::Char('D') if cursor < workspaces.len() => {
                     drain_input_events();
@@ -316,7 +377,7 @@ pub fn run_workspace_delete(config: &WorkspaceConfig, workspace_root: &Path, ws_
         print!("  Stopping {} Docker containers… ", entry.repo);
         let _ = io::stdout().flush();
 
-        let ws_override = write_compose_override(&compose_file, ws_hash);
+        let ws_override = write_compose_override(&compose_file, ws_hash, 0);
         let mut argv_ws: Vec<&str> = vec!["compose", "-p", &ws_project, "-f", file_str];
         let ov_str: String;
         if let Some(ref ov) = ws_override {
@@ -469,7 +530,13 @@ pub fn build_product_selector_lines(
         };
 
         let branch_col = if c.branch.is_empty() {
-            String::new()
+            if c.enabled && c.available && !crate::workspace::is_infra_product(c.repo) {
+                format!("  {DIM}→ main{R}")
+            } else {
+                String::new()
+            }
+        } else if crate::workspace::is_main_tracking_slug(&c.branch) {
+            format!("  {DIM}→ main{R}")
         } else if let Some(hash) = parse_commit_ref(&c.branch) {
             format!("  {DIM}@{hash} (detached){R}")
         } else {
@@ -527,7 +594,23 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
                 cursor += 1;
             }
             KeyCode::Char(' ') => {
-                if choices[cursor].available || !choices[cursor].branch.is_empty() {
+                let c = &choices[cursor];
+                if c.repo == "infinity" {
+                    if c.enabled {
+                        choices[cursor].enabled = false;
+                    } else {
+                        let current = if c.branch.is_empty() {
+                            "nomic-ai/nomic-embed-text-v1.5"
+                        } else {
+                            &c.branch
+                        };
+                        drop(raw.take());
+                        let model = run_model_selector(current);
+                        choices[cursor].branch = model;
+                        choices[cursor].enabled = true;
+                        raw = TuiGuard::enter();
+                    }
+                } else if c.available || !c.branch.is_empty() || is_infra_product(c.repo) {
                     choices[cursor].enabled = !choices[cursor].enabled;
                 } else {
                     drop(raw.take());
@@ -545,26 +628,43 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
                 }
             }
             KeyCode::Char('b') | KeyCode::Char('B') => {
-                drop(raw.take());
-                let current = &choices[cursor].branch;
-                if current.is_empty() {
-                    print!("\n  Branch for {} : ", choices[cursor].label);
-                } else {
-                    print!(
-                        "\n  Branch for {} (Enter to keep {current}): ",
-                        choices[cursor].label
-                    );
-                }
-                let _ = io::stdout().flush();
-                if let Some(input) = read_line_or_interrupt() {
-                    let trimmed = input.trim().to_string();
-                    if !trimmed.is_empty() {
-                        choices[cursor].branch = trimmed;
+                if choices[cursor].repo == "infinity" {
+                    let current = if choices[cursor].branch.is_empty() {
+                        "nomic-ai/nomic-embed-text-v1.5"
+                    } else {
+                        &choices[cursor].branch
+                    };
+                    drop(raw.take());
+                    let model = run_model_selector(current);
+                    if !model.is_empty() {
+                        choices[cursor].branch = model;
                         choices[cursor].enabled = true;
-                        choices[cursor].available = true;
                     }
+                    raw = TuiGuard::enter();
+                } else if is_infra_product(choices[cursor].repo) {
+                    // other infra products have no branches
+                } else {
+                    drop(raw.take());
+                    let current = &choices[cursor].branch;
+                    if current.is_empty() {
+                        print!("\n  Branch for {} : ", choices[cursor].label);
+                    } else {
+                        print!(
+                            "\n  Branch for {} (Enter to keep {current}): ",
+                            choices[cursor].label
+                        );
+                    }
+                    let _ = io::stdout().flush();
+                    if let Some(input) = read_line_or_interrupt() {
+                        let trimmed = input.trim().to_string();
+                        if !trimmed.is_empty() {
+                            choices[cursor].branch = trimmed;
+                            choices[cursor].enabled = true;
+                            choices[cursor].available = true;
+                        }
+                    }
+                    raw = TuiGuard::enter();
                 }
-                raw = TuiGuard::enter();
             }
             KeyCode::Enter => {
                 return LaunchMode::Normal;
@@ -587,7 +687,7 @@ pub fn run_product_selector(slug: &str, choices: &mut [ProductChoice]) -> Launch
 pub fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> Vec<ProductChoice> {
     PRODUCTS
         .iter()
-        .map(|(repo, label, _, desc)| {
+        .map(|(repo, label, key, desc)| {
             let saved = config.entries.iter().find(|e| e.repo.as_str() == *repo);
             let branch = saved.map(|e| e.branch.clone()).unwrap_or_default();
             let enabled = saved.map(|e| e.enabled).unwrap_or(false);
@@ -602,12 +702,15 @@ pub fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> 
                     workspace_root.join(repo)
                 }
             };
+            // Infra products are always available — directories are bootstrapped on launch.
+            let available =
+                is_infra_product(key) || path.is_dir() || workspace_root.join(repo).is_dir();
             ProductChoice {
                 label,
                 desc,
                 repo,
                 enabled,
-                available: path.is_dir() || workspace_root.join(repo).is_dir(),
+                available,
                 branch,
             }
         })
@@ -615,13 +718,37 @@ pub fn workspace_to_choices(config: &WorkspaceConfig, workspace_root: &Path) -> 
 }
 
 pub fn choices_to_workspace(choices: &[ProductChoice]) -> WorkspaceConfig {
-    use crate::workspace::{compute_workspace_hash, today, WorkspaceEntry};
+    use crate::workspace::{
+        compute_workspace_hash, generate_user_slug, is_infra_product, today, WorkspaceEntry,
+    };
+
+    // One slug shared across all products in this workspace session — any enabled
+    // non-infra product without an explicit branch gets this slug so each launch
+    // creates a distinct worktree that tracks origin/main.
+    let auto_slug: Option<String> = {
+        let needs_slug = choices
+            .iter()
+            .any(|c| c.enabled && c.branch.is_empty() && !is_infra_product(c.repo));
+        if needs_slug {
+            Some(generate_user_slug())
+        } else {
+            None
+        }
+    };
+
     let entries: Vec<WorkspaceEntry> = choices
         .iter()
-        .map(|c| WorkspaceEntry {
-            repo: c.repo.to_string(),
-            enabled: c.enabled,
-            branch: c.branch.clone(),
+        .map(|c| {
+            let branch = if c.branch.is_empty() && c.enabled && !is_infra_product(c.repo) {
+                auto_slug.clone().unwrap_or_default()
+            } else {
+                c.branch.clone()
+            };
+            WorkspaceEntry {
+                repo: c.repo.to_string(),
+                enabled: c.enabled,
+                branch,
+            }
         })
         .collect();
     let hash = compute_workspace_hash(&entries);
@@ -635,9 +762,10 @@ pub fn choices_to_workspace(choices: &[ProductChoice]) -> WorkspaceConfig {
 pub fn default_product_choices(workspace_root: &Path) -> Vec<ProductChoice> {
     PRODUCTS
         .iter()
-        .map(|(repo, label, _, desc)| {
+        .map(|(repo, label, key, desc)| {
             let main_dir = workspace_root.join(repo);
-            let available = main_dir.is_dir();
+            // Infra products are always available — directories are bootstrapped on launch.
+            let available = is_infra_product(key) || main_dir.is_dir();
             ProductChoice {
                 label,
                 desc,
@@ -694,7 +822,7 @@ pub fn build_flag_selector_lines(
     out.push(String::new());
     out.push(format!("  {DIM}{sep}{R}"));
     out.push(format!(
-        "  {DIM}↑↓ / j k  navigate   Space  toggle   Enter  confirm   q  skip{R}"
+        "  {DIM}↑↓ / j k  navigate   Space  toggle   Enter  confirm   q  skip   Esc back to menu{R}"
     ));
     out.push(String::new());
     out
@@ -731,8 +859,12 @@ pub fn run_flag_selector(slug: &str, product: &str, choices: &mut [FlagChoice]) 
                 KeyCode::Enter => {
                     return;
                 }
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
                     return;
+                }
+                KeyCode::Esc => {
+                    drop(raw.take());
+                    crate::tui::exit_to_selector_menu();
                 }
                 _ => {}
             }
@@ -833,4 +965,490 @@ pub fn write_active_flags(env_file: &Path, flags: &[String]) {
     };
     map.insert("APP__ENABLED_DEV_FEATURES".to_string(), val);
     write_env_file(env_file, &map);
+}
+
+// ── AutoResearch helpers ──────────────────────────────────────────────────────
+
+/// Parse the `branch` field of an autoresearch WorkspaceEntry.
+/// Format: `"{model}|{backend}"`, e.g., `"Qwen/Qwen2.5-0.5B|metal"`.
+pub fn parse_autoresearch_branch(branch: &str) -> (String, String) {
+    if let Some((model, backend)) = branch.split_once('|') {
+        (model.to_string(), backend.to_string())
+    } else if branch.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (branch.to_string(), "cpu".to_string())
+    }
+}
+
+// ── Infinity model selector ───────────────────────────────────────────────────
+
+/// Well-known embedding models compatible with infinity-emb.
+const INFINITY_MODELS: &[(&str, &str)] = &[
+    (
+        "nomic-ai/nomic-embed-text-v1.5",
+        "best quality/speed tradeoff",
+    ),
+    ("BAAI/bge-small-en-v1.5", "fast · small English"),
+    ("BAAI/bge-base-en-v1.5", "balanced English"),
+    ("BAAI/bge-large-en-v1.5", "high quality English, slower"),
+    (
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "classic general-purpose",
+    ),
+    ("intfloat/e5-small-v2", "small multilingual"),
+    ("intfloat/e5-base-v2", "base multilingual"),
+    ("intfloat/e5-large-v2", "large multilingual"),
+    ("thenlper/gte-small", "small GTE"),
+    ("thenlper/gte-base", "base GTE"),
+    ("thenlper/gte-large", "large GTE"),
+];
+
+struct ModelEntry {
+    id: String,
+    desc: &'static str,
+    cached: bool,
+}
+
+/// Scan the HuggingFace hub cache and return model IDs that are already downloaded.
+fn find_cached_hf_models() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cache = std::path::PathBuf::from(&home).join(".cache/huggingface/hub");
+    if !cache.is_dir() {
+        return vec![];
+    }
+    let mut models = Vec::new();
+    for entry in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Cache dirs are named `models--{org}--{repo}` with `--` as separator.
+        if let Some(rest) = name.strip_prefix("models--") {
+            let id = rest.replace("--", "/");
+            if !id.is_empty() {
+                models.push(id);
+            }
+        }
+    }
+    models.sort();
+    models
+}
+
+fn build_model_entries(current: &str) -> Vec<ModelEntry> {
+    let cached = find_cached_hf_models();
+    let mut entries: Vec<ModelEntry> = Vec::new();
+
+    // Cached models first (already on disk).
+    for id in &cached {
+        let desc = INFINITY_MODELS
+            .iter()
+            .find(|(m, _)| *m == id.as_str())
+            .map(|(_, d)| *d)
+            .unwrap_or("locally cached");
+        entries.push(ModelEntry {
+            id: id.clone(),
+            desc,
+            cached: true,
+        });
+    }
+    // Popular models not yet downloaded.
+    for (id, desc) in INFINITY_MODELS {
+        if !cached.iter().any(|c| c == id) {
+            entries.push(ModelEntry {
+                id: id.to_string(),
+                desc,
+                cached: false,
+            });
+        }
+    }
+    // If the current model isn't in the list at all, prepend it.
+    if !current.is_empty() && !entries.iter().any(|e| e.id == current) {
+        entries.insert(
+            0,
+            ModelEntry {
+                id: current.to_string(),
+                desc: "custom",
+                cached: false,
+            },
+        );
+    }
+    entries
+}
+
+fn build_model_selector_lines(entries: &[ModelEntry], cursor: usize, current: &str) -> Vec<String> {
+    let sep = "─".repeat(72);
+    let mut out = Vec::new();
+    out.push(format!("\n  {BOLD}{CYN}{BUILD_VERSION}{R}\n"));
+    out.push(format!("  {DIM}{sep}{R}"));
+    out.push(format!(
+        "  {BOLD}Infinity Emb — embedding model{R}  \
+         {DIM}↓ cached locally  · will download on first use{R}"
+    ));
+    out.push(format!("  {DIM}{sep}{R}\n"));
+
+    for (i, e) in entries.iter().enumerate() {
+        let marker = if i == cursor {
+            format!("{CYN}{BOLD}▶{R} ")
+        } else {
+            "  ".to_string()
+        };
+        let active = if e.id == current {
+            format!("{GRN}[{BOLD}✓{R}{GRN}]{R}")
+        } else {
+            format!("{DIM}[ ]{R}")
+        };
+        let cache_tag = if e.cached {
+            format!("  {GRN}{DIM}↓{R}")
+        } else {
+            String::new()
+        };
+        let id_col = if i == cursor {
+            format!("{BOLD}{}{R}", e.id)
+        } else {
+            e.id.clone()
+        };
+        out.push(format!(
+            "  {marker}{active}  {id_col:<54}{DIM}{}{R}{cache_tag}",
+            e.desc
+        ));
+    }
+
+    out.push(String::new());
+    out.push(format!("  {DIM}{sep}{R}"));
+    out.push(format!(
+        "  {DIM}↑↓ navigate   Enter select   m custom model ID   q cancel{R}"
+    ));
+    out.push(String::new());
+    out
+}
+
+/// Show the infinity embedding-model picker.  Returns the chosen model ID, or
+/// `current` unchanged if the user cancels.
+pub fn run_model_selector(current: &str) -> String {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+        return if current.is_empty() {
+            "nomic-ai/nomic-embed-text-v1.5".to_string()
+        } else {
+            current.to_string()
+        };
+    }
+
+    let entries = build_model_entries(current);
+    let mut cursor = entries.iter().position(|e| e.id == current).unwrap_or(0);
+    let mut raw = TuiGuard::enter();
+
+    loop {
+        if let Some(tui) = raw.as_mut() {
+            draw_ansi_lines(tui, &build_model_selector_lines(&entries, cursor, current));
+        }
+        if !event::poll(std::time::Duration::from_millis(20)).unwrap_or(false) {
+            continue;
+        }
+        let Ok(Event::Key(ke)) = event::read() else {
+            continue;
+        };
+        if ke.kind != crossterm::event::KeyEventKind::Press {
+            continue;
+        }
+        match ke.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                cursor = cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if cursor + 1 < entries.len() => {
+                cursor += 1;
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                drain_input_events();
+                drop(raw.take());
+                return entries[cursor].id.clone();
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                drain_input_events();
+                drop(raw.take());
+                print!("\n  Custom HuggingFace model ID: ");
+                let _ = io::stdout().flush();
+                let result = if let Some(input) = read_line_or_interrupt() {
+                    let t = input.trim().to_string();
+                    if t.is_empty() {
+                        current.to_string()
+                    } else {
+                        t
+                    }
+                } else {
+                    current.to_string()
+                };
+                return result;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                drain_input_events();
+                drop(raw.take());
+                return current.to_string();
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── AutoResearch SLM selector ─────────────────────────────────────────────────
+
+/// Well-known small language models suited for local autoresearch experimentation.
+const AUTORESEARCH_SLM_MODELS: &[(&str, &str)] = &[
+    ("Qwen/Qwen2.5-0.5B", "0.5 B params — fastest, least RAM"),
+    ("Qwen/Qwen2.5-1.5B", "1.5 B params — good balance"),
+    ("Qwen/Qwen2.5-3B", "3 B params — higher quality"),
+    ("Qwen/Qwen2.5-7B", "7 B params — strong reasoning"),
+    (
+        "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "1.7 B · instruction-tuned",
+    ),
+    ("microsoft/Phi-3-mini-4k-instruct", "3.8 B · Phi-3 Mini"),
+    ("google/gemma-3-1b-it", "1 B · Gemma 3 instruction"),
+    ("google/gemma-3-4b-it", "4 B · Gemma 3 instruction"),
+    (
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "1 B · Llama 3.2 instruction",
+    ),
+    (
+        "meta-llama/Llama-3.2-3B-Instruct",
+        "3 B · Llama 3.2 instruction",
+    ),
+];
+
+fn build_slm_entries(current: &str) -> Vec<ModelEntry> {
+    let cached = find_cached_hf_models();
+    let mut entries: Vec<ModelEntry> = Vec::new();
+
+    for id in &cached {
+        if AUTORESEARCH_SLM_MODELS
+            .iter()
+            .any(|(m, _)| *m == id.as_str())
+        {
+            let desc = AUTORESEARCH_SLM_MODELS
+                .iter()
+                .find(|(m, _)| *m == id.as_str())
+                .map(|(_, d)| *d)
+                .unwrap_or("locally cached");
+            entries.push(ModelEntry {
+                id: id.clone(),
+                desc,
+                cached: true,
+            });
+        }
+    }
+    for (id, desc) in AUTORESEARCH_SLM_MODELS {
+        if !cached.iter().any(|c| c == id) {
+            entries.push(ModelEntry {
+                id: id.to_string(),
+                desc,
+                cached: false,
+            });
+        }
+    }
+    if !current.is_empty() && !entries.iter().any(|e| e.id == current) {
+        entries.insert(
+            0,
+            ModelEntry {
+                id: current.to_string(),
+                desc: "custom",
+                cached: false,
+            },
+        );
+    }
+    entries
+}
+
+fn build_slm_selector_lines(entries: &[ModelEntry], cursor: usize, current: &str) -> Vec<String> {
+    let sep = "─".repeat(72);
+    let mut out = Vec::new();
+    out.push(format!("\n  {BOLD}{CYN}{BUILD_VERSION}{R}\n"));
+    out.push(format!("  {DIM}{sep}{R}"));
+    out.push(format!(
+        "  {BOLD}AutoResearch — SLM model{R}  \
+         {DIM}↓ cached locally  · will download on first use{R}"
+    ));
+    out.push(format!("  {DIM}{sep}{R}\n"));
+
+    for (i, e) in entries.iter().enumerate() {
+        let marker = if i == cursor {
+            format!("{CYN}{BOLD}▶{R} ")
+        } else {
+            "  ".to_string()
+        };
+        let active = if e.id == current {
+            format!("{GRN}[{BOLD}✓{R}{GRN}]{R}")
+        } else {
+            format!("{DIM}[ ]{R}")
+        };
+        let cache_tag = if e.cached {
+            format!("  {GRN}{DIM}↓{R}")
+        } else {
+            String::new()
+        };
+        out.push(format!(
+            "  {marker}{active}  {:<42}  {DIM}{}{R}{cache_tag}",
+            e.id, e.desc
+        ));
+    }
+
+    out.push(String::new());
+    out.push(format!("  {DIM}{sep}{R}"));
+    out.push(format!(
+        "  {DIM}↑↓ / j k  navigate   Enter select   m custom HF model id   q back{R}"
+    ));
+    out.push(String::new());
+    out
+}
+
+/// Show the SLM model picker for AutoResearch.  Returns the chosen model ID.
+pub fn run_slm_selector(current: &str) -> String {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+        return if current.is_empty() {
+            "Qwen/Qwen2.5-0.5B".to_string()
+        } else {
+            current.to_string()
+        };
+    }
+
+    let entries = build_slm_entries(current);
+    let mut cursor = entries.iter().position(|e| e.id == current).unwrap_or(0);
+    let mut raw = TuiGuard::enter();
+
+    loop {
+        if let Some(tui) = raw.as_mut() {
+            draw_ansi_lines(tui, &build_slm_selector_lines(&entries, cursor, current));
+        }
+        if !event::poll(std::time::Duration::from_millis(20)).unwrap_or(false) {
+            continue;
+        }
+        let Ok(Event::Key(ke)) = event::read() else {
+            continue;
+        };
+        if ke.kind != crossterm::event::KeyEventKind::Press {
+            continue;
+        }
+        match ke.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                cursor = cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if cursor + 1 < entries.len() => {
+                cursor += 1;
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                drain_input_events();
+                drop(raw.take());
+                return entries[cursor].id.clone();
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                drain_input_events();
+                drop(raw.take());
+                print!("\n  Custom HuggingFace model ID: ");
+                let _ = io::stdout().flush();
+                let result = if let Some(input) = read_line_or_interrupt() {
+                    let t = input.trim().to_string();
+                    if t.is_empty() {
+                        current.to_string()
+                    } else {
+                        t
+                    }
+                } else {
+                    current.to_string()
+                };
+                return result;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                drain_input_events();
+                drop(raw.take());
+                return current.to_string();
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── AutoResearch GPU backend selector ─────────────────────────────────────────
+
+const GPU_BACKENDS: &[(&str, &str)] = &[
+    ("metal", "Metal   (Apple Silicon — MPS)"),
+    ("cuda", "CUDA    (NVIDIA GPU)"),
+    ("cpu", "CPU     (fallback — slow for large models)"),
+];
+
+fn build_gpu_selector_lines(cursor: usize, current: &str) -> Vec<String> {
+    let sep = "─".repeat(72);
+    let mut out = Vec::new();
+    out.push(format!("\n  {BOLD}{CYN}{BUILD_VERSION}{R}\n"));
+    out.push(format!("  {DIM}{sep}{R}"));
+    out.push(format!("  {BOLD}AutoResearch — torch backend{R}"));
+    out.push(format!("  {DIM}{sep}{R}\n"));
+
+    for (i, (id, label)) in GPU_BACKENDS.iter().enumerate() {
+        let marker = if i == cursor {
+            format!("{CYN}{BOLD}▶{R} ")
+        } else {
+            "  ".to_string()
+        };
+        let active = if *id == current {
+            format!("{GRN}[{BOLD}✓{R}{GRN}]{R}")
+        } else {
+            format!("{DIM}[ ]{R}")
+        };
+        out.push(format!("  {marker}{active}  {}", label));
+    }
+
+    out.push(String::new());
+    out.push(format!("  {DIM}{sep}{R}"));
+    out.push(format!(
+        "  {DIM}↑↓ / j k  navigate   Enter select   q back{R}"
+    ));
+    out.push(String::new());
+    out
+}
+
+/// Show the GPU backend picker for AutoResearch.  Returns "metal", "cuda", or "cpu".
+pub fn run_gpu_backend_selector(current: &str) -> String {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+        return if current.is_empty() {
+            "cpu".to_string()
+        } else {
+            current.to_string()
+        };
+    }
+
+    let mut cursor = GPU_BACKENDS
+        .iter()
+        .position(|(id, _)| *id == current)
+        .unwrap_or(0);
+    let mut raw = TuiGuard::enter();
+
+    loop {
+        if let Some(tui) = raw.as_mut() {
+            draw_ansi_lines(tui, &build_gpu_selector_lines(cursor, current));
+        }
+        if !event::poll(std::time::Duration::from_millis(20)).unwrap_or(false) {
+            continue;
+        }
+        let Ok(Event::Key(ke)) = event::read() else {
+            continue;
+        };
+        if ke.kind != crossterm::event::KeyEventKind::Press {
+            continue;
+        }
+        match ke.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                cursor = cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if cursor + 1 < GPU_BACKENDS.len() => {
+                cursor += 1;
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                drain_input_events();
+                drop(raw.take());
+                return GPU_BACKENDS[cursor].0.to_string();
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                drain_input_events();
+                drop(raw.take());
+                return current.to_string();
+            }
+            _ => {}
+        }
+    }
 }

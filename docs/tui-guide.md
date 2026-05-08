@@ -40,7 +40,9 @@ The default mode. Shows a table of all running and ready services. Services in `
 | `p` / `P` | Toggle full worktree paths on/off in the service table |
 | `r` | Generate a report for the selected service |
 | `R` (Shift+r) | Restart the selected service (kills process, re-spawns with same args) |
-| `q` / `Ctrl+C` | Graceful shutdown (kills all services, tears down Docker Compose, exits) |
+| `m` / `M` | Detach from the session (leave TUI, stack keeps running in background) |
+| `q` / `Esc` | Return to the workspace/product selector (stops all services first) |
+| `Ctrl+C` | Graceful shutdown (kills all services, tears down Docker Compose, exits) |
 
 ---
 
@@ -148,13 +150,54 @@ Services that depend on others show `pending` in the health column until their p
 
 ---
 
+## Detaching from a session
+
+Pressing `m` or `M` in Overview mode detaches from the session without stopping any services. The TUI exits and control returns to the workspace selector. The session worker process pauses (via `SIGSTOP`) so it consumes no CPU while detached. All spawned processes and Docker containers keep running.
+
+The workspace selector shows a **cyan dot** (`●`) next to a detached session.
+
+---
+
+## Multi-session architecture
+
+Each session runs as a separate child process (a session worker). The workspace selector is the parent process and can manage multiple paused workers simultaneously.
+
+| Selector action | Effect |
+|---|---|
+| Select a workspace with a cyan dot | Reattaches -- sends `SIGCONT` to the paused worker, which resumes its TUI |
+| Press `r` on a detached workspace | Same as selecting it (reattach) |
+| Press `s` on a detached workspace | Terminates the session worker without deleting the workspace |
+| Press `d` on any workspace | Full workspace deletion (stops the session first if detached) |
+| Press `q` / `Esc` | Offers to shut down any still-detached sessions, then exits |
+
+---
+
+## At-launch orphan check
+
+When `dev-launcher` starts fresh, it inspects every workspace that has a detach marker and prompts for action if needed:
+
+| Session state | What you see | Options |
+|---|---|---|
+| **Stopped worker** from a crashed previous selector | `[dev-launcher] Found stopped session ... Terminating.` | Terminated automatically |
+| **Dirty** -- host processes dead, Docker containers still running | `● host processes stopped, Docker containers still running` (yellow) | `[c]` clean up Docker, `Enter` ignore |
+| **Stale** -- nothing running at all | (silent) | Marker and PID file removed automatically |
+
+**Clean up** calls `docker compose -p <project> down` for all product containers associated with the workspace. No compose file is required -- Docker Compose v2 locates containers by project label.
+
+---
+
 ## Shutdown
 
-Pressing `q` or `Ctrl+C` in any mode triggers a graceful shutdown sequence:
+Pressing `q` in any mode stops all services and returns to the workspace selector so you can switch products or branches.
+
+Pressing `Ctrl+C` performs the same graceful shutdown and exits the process.
+
+The shutdown sequence is:
 
 1. All spawned processes receive `SIGTERM`.
-2. A 3-second grace period allows in-flight requests to complete.
-3. Docker Compose projects are stopped (`docker compose down`).
-4. The TUI exits cleanly.
+2. A grace period allows in-flight requests to complete (5 s by default; 180 s for `opencti-graphql`).
+3. Any process that has not exited by the deadline receives `SIGKILL`.
+4. Docker Compose projects are stopped via `docker compose -p <project> down` (project-name lookup -- no dependency on temporary override files).
+5. The TUI exits and the session worker process terminates, returning control to the workspace selector.
 
-Pressing `Ctrl+C` twice (or sending `SIGKILL`) bypasses the grace period and terminates processes immediately. On the next launch, `dev-launcher` detects orphaned PIDs from the previous session and kills them before starting new processes.
+On the next launch, `dev-launcher` detects orphaned PIDs from a crashed previous session and kills them before starting new processes.

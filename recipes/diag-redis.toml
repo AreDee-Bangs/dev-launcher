@@ -1,0 +1,18 @@
+id       = "diag-redis"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "redis: could not connect",
+    "error connecting to redis",
+    "connection refused to localhost:6379",
+]
+
+title = "Redis is not reachable"
+body = [
+    "  Redis is not accepting connections on port 6379.",
+    "  Check the Docker container:",
+    "    docker ps -a | grep redis",
+    "    docker start <redis-container>",
+]

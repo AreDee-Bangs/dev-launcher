@@ -1,0 +1,13 @@
+id       = "diag-econnrefused"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = ["econnrefused"]
+
+title = "Connection refused"
+body = [
+    "  A required service is not reachable (ECONNREFUSED).",
+    "  Check that all Docker services are running: docker ps",
+    "  Run: docker compose -f docker-compose.dev.yml up -d",
+]

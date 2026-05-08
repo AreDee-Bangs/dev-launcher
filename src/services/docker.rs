@@ -56,26 +56,164 @@ pub fn parse_compose_container_names(compose_file: &Path) -> Vec<(String, String
     result
 }
 
-/// Write a compose override file to `/tmp` that appends `{ws_hash[..8]}` to every
-/// explicit `container_name:` in the given compose file.
+/// Write a compose override file next to `compose_file` that:
+/// - Appends `{ws_hash[..8]}` to every explicit `container_name:` to prevent
+///   collisions between workspaces.
+/// - When `port_offset > 0`, also remaps every host port by adding `port_offset`
+///   so that Docker services from two concurrent workspaces bind different host
+///   ports.
 ///
-/// Returns `None` if the compose file has no explicit container names.
-pub fn write_compose_override(compose_file: &Path, ws_hash: &str) -> Option<PathBuf> {
-    let mappings = parse_compose_container_names(compose_file);
-    if mappings.is_empty() {
+/// Returns `None` if there is nothing to override.
+pub fn write_compose_override(
+    compose_file: &Path,
+    ws_hash: &str,
+    port_offset: u16,
+) -> Option<PathBuf> {
+    let name_mappings = parse_compose_container_names(compose_file);
+    let port_bindings = if port_offset > 0 {
+        parse_compose_port_bindings(compose_file)
+    } else {
+        Vec::new()
+    };
+
+    if name_mappings.is_empty() && port_bindings.is_empty() {
         return None;
     }
 
     let suffix = &ws_hash[..8.min(ws_hash.len())];
-    let out_path = PathBuf::from(format!("/tmp/dev-launcher-override-{suffix}.yml"));
+    let dir = compose_file.parent().unwrap_or(Path::new("."));
+    let out_path = dir.join("docker-compose.override-devlauncher.yml");
+
+    // Collect all service names that need an entry (union of both lists).
+    let mut seen = std::collections::HashSet::new();
+    let mut all_svcs: Vec<String> = Vec::new();
+    for (s, _) in &name_mappings {
+        if seen.insert(s.clone()) {
+            all_svcs.push(s.clone());
+        }
+    }
+    for (s, _, _) in &port_bindings {
+        if seen.insert(s.clone()) {
+            all_svcs.push(s.clone());
+        }
+    }
 
     let mut lines = vec!["services:".to_string()];
-    for (svc, cn) in &mappings {
+    for svc in &all_svcs {
         lines.push(format!("  {}:", svc));
-        lines.push(format!("    container_name: {cn}-{suffix}"));
+        if let Some((_, cn)) = name_mappings.iter().find(|(s, _)| s == svc) {
+            lines.push(format!("    container_name: {cn}-{suffix}"));
+        }
+        let svc_ports: Vec<_> = port_bindings.iter().filter(|(s, _, _)| s == svc).collect();
+        if !svc_ports.is_empty() {
+            lines.push("    ports: !override".to_string());
+            for (_, host_port, cont_port) in &svc_ports {
+                let new_host = host_port.saturating_add(port_offset);
+                lines.push(format!("      - \"{new_host}:{cont_port}\""));
+            }
+        }
     }
+
     fs::write(&out_path, lines.join("\n") + "\n").ok()?;
+    ensure_gitignore_entries(dir, &["docker-compose.override-devlauncher.yml"]);
     Some(out_path)
+}
+
+/// All host-side ports declared by a docker-compose file (in declaration order,
+/// no dedup). Used by the dynamic port-offset scanner.
+pub fn compose_host_ports(compose_file: &Path) -> Vec<u16> {
+    parse_compose_port_bindings(compose_file)
+        .into_iter()
+        .map(|(_, host, _)| host)
+        .collect()
+}
+
+/// Parse every `host:container` port binding in a docker-compose YAML file.
+/// Returns `(service_name, host_port, container_port)` triples.
+fn parse_compose_port_bindings(compose_file: &Path) -> Vec<(String, u16, u16)> {
+    let content = match fs::read_to_string(compose_file) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut result = Vec::new();
+    let mut in_svcs = false;
+    let mut cur_svc = String::new();
+    let mut in_ports = false;
+
+    for line in content.lines() {
+        if line == "services:" {
+            in_svcs = true;
+            continue;
+        }
+        if !in_svcs {
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let indent = line.len() - line.trim_start().len();
+
+        // Service name at 2-space indent
+        if indent == 2 {
+            if let Some(svc) = trimmed.strip_suffix(':') {
+                if !svc.is_empty() && !svc.contains(' ') {
+                    cur_svc = svc.to_string();
+                }
+            }
+            in_ports = false;
+            continue;
+        }
+
+        // Property keys at 4-space indent
+        if indent == 4 {
+            in_ports = trimmed == "ports:";
+            continue;
+        }
+
+        // Port list entries at 6-space indent
+        if in_ports && indent == 6 && trimmed.starts_with('-') {
+            let entry = trimmed
+                .trim_start_matches('-')
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            if let Some(pos) = entry.find(':') {
+                let host_s = entry[..pos].trim();
+                let cont_s = entry[pos + 1..].trim();
+                if let (Ok(h), Ok(c)) = (host_s.parse::<u16>(), cont_s.parse::<u16>()) {
+                    result.push((cur_svc.clone(), h, c));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Append `patterns` to `<dir>/.gitignore` if not already present.
+pub fn ensure_gitignore_entries(dir: &Path, patterns: &[&str]) {
+    let gitignore = dir.join(".gitignore");
+    let existing = fs::read_to_string(&gitignore).unwrap_or_default();
+    let to_add: Vec<&&str> = patterns
+        .iter()
+        .filter(|&&p| !existing.lines().any(|l| l.trim() == p))
+        .collect();
+    if to_add.is_empty() {
+        return;
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str("\n# dev-launcher\n");
+    for &&p in &to_add {
+        content.push_str(p);
+        content.push('\n');
+    }
+    let _ = fs::write(&gitignore, content);
 }
 
 /// Stop and remove any containers whose name contains `name_fragment`.
@@ -114,31 +252,55 @@ pub fn docker_kill_by_name_fragment(name_fragment: &str) {
 // ── Blocking process helpers ───────────────────────────────────────────────────
 
 pub fn run_blocking(program: &str, args: &[&str], dir: &Path) -> i32 {
-    Command::new(program)
+    crate::launcher_log::log(&format!("[CMD] {} {}", program, args.join(" ")));
+    let out = Command::new(program)
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
-        .status()
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(-1)
+        .output();
+    match out {
+        Ok(o) => {
+            crate::launcher_log::log_output(&o.stdout, &o.stderr);
+            let code = o.status.code().unwrap_or(-1);
+            crate::launcher_log::log(&format!("[CMD] exit {code}"));
+            code
+        }
+        Err(e) => {
+            crate::launcher_log::log(&format!("[CMD] failed to start: {e}"));
+            -1
+        }
+    }
 }
 
 /// Like `run_blocking` but prints the full command, working directory, and exit code.
 pub fn run_blocking_logged(program: &str, args: &[&str], dir: &Path) -> i32 {
+    crate::launcher_log::log(&format!(
+        "[CMD] {} {} (cwd: {})",
+        program,
+        args.join(" "),
+        dir.display()
+    ));
     println!("    {DIM}$ {program} {args}{R}", args = args.join(" "));
     println!("    {DIM}  cwd: {}{R}", dir.display());
     let _ = io::stdout().flush();
-    let code = Command::new(program)
+    let out = Command::new(program)
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
-        .status()
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(-1);
-    println!("    {DIM}  exit: {code}{R}");
-    code
+        .output();
+    match out {
+        Ok(o) => {
+            crate::launcher_log::log_output(&o.stdout, &o.stderr);
+            let code = o.status.code().unwrap_or(-1);
+            println!("    {DIM}  exit: {code}{R}");
+            crate::launcher_log::log(&format!("[CMD] exit {code}"));
+            code
+        }
+        Err(e) => {
+            crate::launcher_log::log(&format!("[CMD] failed to start: {e}"));
+            -1
+        }
+    }
 }
 
 // ── Docker availability ────────────────────────────────────────────────────────
@@ -176,6 +338,55 @@ pub fn docker_compose_running_count(project: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Check whether any Docker containers for a workspace are still running.
+/// Probes the five well-known base project names derived from the workspace hash.
+pub fn docker_running_for_workspace(hash: &str) -> bool {
+    let suffix = &hash[..8.min(hash.len())];
+    for base in &[
+        "copilot-dev",
+        "opencti-dev",
+        "openaev-dev",
+        "grafana-dev",
+        "langfuse-dev",
+    ] {
+        if docker_compose_running_count(&format!("{base}-{suffix}")) > 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Stop all Docker containers for a workspace using only the project label.
+/// Docker Compose v2 finds containers via the label, so no compose file is required.
+pub fn docker_down_workspace(hash: &str) {
+    let suffix = &hash[..8.min(hash.len())];
+    for base in &[
+        "copilot-dev",
+        "opencti-dev",
+        "openaev-dev",
+        "grafana-dev",
+        "langfuse-dev",
+    ] {
+        let project = format!("{base}-{suffix}");
+        if docker_compose_running_count(&project) == 0 {
+            continue;
+        }
+        print!("  Stopping {base} containers…\r\n");
+        let _ = io::stdout().flush();
+        let code = run_blocking(
+            "docker",
+            &["compose", "-p", &project, "down"],
+            Path::new("/tmp"),
+        );
+        if code == 0 {
+            print!("  {GRN}✓{R}  {base} containers stopped.\r\n");
+        } else {
+            print!("  {RED}✗{R}  docker down for {base} failed (exit {code}).\r\n");
+        }
+        let _ = io::stdout().flush();
+    }
+}
+
 // ── DockerProject ─────────────────────────────────────────────────────────────
 
 /// A Docker Compose project that was brought up by this session.
@@ -188,21 +399,17 @@ pub struct DockerProject {
     pub override_file: Option<PathBuf>,
 }
 
-/// Run `docker compose -p <project> -f <file> [-f <override>] down`.
+/// Run `docker compose -p <project> down`.
+///
+/// We intentionally omit `-f` here: Docker Compose v2 locates containers via
+/// the `com.docker.compose.project` label, so the project name alone is
+/// sufficient.  Passing `-f` would require the override file (written to /tmp
+/// at startup) to still exist, which is not guaranteed across reboots or
+/// session restarts.
 pub fn docker_compose_down(dp: &DockerProject) {
     print!("  Stopping {} containers…\r\n", dp.label);
     let _ = io::stdout().flush();
-    let file_str = dp.compose_file.to_str().unwrap_or("");
-    let ov_str = dp
-        .override_file
-        .as_ref()
-        .and_then(|p| p.to_str())
-        .unwrap_or("");
-    let mut argv: Vec<&str> = vec!["compose", "-p", &dp.project, "-f", file_str];
-    if !ov_str.is_empty() {
-        argv.extend_from_slice(&["-f", ov_str]);
-    }
-    argv.push("down");
+    let argv: Vec<&str> = vec!["compose", "-p", &dp.project, "down"];
     let code = run_blocking("docker", &argv, &dp.work_dir);
     if code == 0 {
         print!("  {GRN}✓{R}  {} containers stopped.\r\n", dp.label);
@@ -323,6 +530,57 @@ pub fn resolve_product_docker_for_down(
     Some((ws_proj, base, compose_file))
 }
 
+// ── OpenSearch / Elasticsearch readiness ─────────────────────────────────────
+
+/// Return `true` if Elasticsearch/OpenSearch at `port` is accepting HTTP
+/// connections (any response code counts — even a 503 "red" cluster is ready
+/// enough for opencti-graphql to start).  Uses a short 500 ms connect timeout
+/// so callers in the TUI event loop are not blocked for long.
+pub fn opensearch_ready(port: u16) -> bool {
+    let url = format!("http://localhost:{port}/_cluster/health");
+    match ureq::get(&url).timeout(Duration::from_millis(500)).call() {
+        Ok(_) | Err(ureq::Error::Status(_, _)) => true,
+        Err(_) => false,
+    }
+}
+
+/// Block until Elasticsearch/OpenSearch at `port` responds, or `max_secs` have
+/// elapsed.  Prints a one-time "waiting…" line while polling.  Returns `true`
+/// if ES became reachable before the timeout.
+///
+/// Safe to call from the main thread before the TUI starts (no lock held by
+/// other threads at that point).
+pub fn wait_for_opensearch(port: u16, max_secs: u64) -> bool {
+    use crate::tui::YLW;
+
+    let url = format!("http://localhost:{port}/_cluster/health");
+    let deadline = std::time::Instant::now() + Duration::from_secs(max_secs);
+    let mut ticks: u32 = 0;
+    loop {
+        match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
+            Ok(_) | Err(ureq::Error::Status(_, _)) => {
+                if ticks > 0 {
+                    println!("  {GRN}✓{R}  OpenSearch/ES ready on :{port}");
+                }
+                return true;
+            }
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        if ticks == 0 {
+            println!("  {DIM}Waiting for OpenSearch/ES on :{port}…{R}");
+        }
+        ticks += 1;
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    println!(
+        "  {YLW}⚠{R}  OpenSearch/ES did not respond within {max_secs}s — opencti-graphql may fail on startup"
+    );
+    false
+}
+
 // ── Elasticsearch index wipe ───────────────────────────────────────────────────
 
 /// Before spawning opencti-graphql, delete any stale `opencti*` Elasticsearch
@@ -427,5 +685,51 @@ pub fn replace_port_in_value(value: &str, new_port: u16) -> String {
         format!("{}:{}{}", base, new_port, &after_colon[port_end..])
     } else {
         format!("{}:{}", value, new_port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_compose_override;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "dev-launcher-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn write_compose_override_replaces_ports_instead_of_appending() {
+        let dir = temp_test_dir("compose-override");
+        fs::create_dir_all(&dir).unwrap();
+        let compose = dir.join("docker-compose.yml");
+        fs::write(
+            &compose,
+            r#"services:
+  rabbitmq:
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+"#,
+        )
+        .unwrap();
+
+        let override_path = write_compose_override(&compose, "b7193cc5", 400).unwrap();
+        let override_body = fs::read_to_string(&override_path).unwrap();
+
+        assert!(override_body.contains("ports: !override"));
+        assert!(override_body.contains("\"6072:5672\""));
+        assert!(override_body.contains("\"16072:15672\""));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
