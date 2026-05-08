@@ -1,19 +1,31 @@
 id       = "diag-minio"
 health   = "any"
-log_tail = 50
+log_tail = 80
 
 [[match]]
 any_of = [
     "minio: connection refused",
     "connection refused to localhost:9000",
     "connection refused to localhost:9002",
+    "connection refused to localhost:9402",
+    # copilot-backend's startup_checks pattern.
+    "minio not ready",
+    "all connection attempts failed",
 ]
 
 title = "MinIO / S3 is not reachable"
 body = [
     "  MinIO (S3-compatible storage) is not accepting connections.",
-    "  Check the Docker container:",
+    "",
+    "  First check the Docker container:",
     "    docker ps -a | grep minio",
     "    docker start <minio-container>",
     "  Also verify S3_ENDPOINT / MINIO_ENDPOINT in your .env.",
+    "",
+    "  If MinIO is up but the backend still can't reach it, host port and env",
+    "  value are out of sync — usually after toggling `port_offset`. dev-launcher",
+    "  >= v0.1.4 chooses the offset dynamically per launch and rewrites",
+    "  S3_ENDPOINT to match. Stop the workspace and relaunch:",
+    "    dev-launcher workspace stop  <hash>",
+    "    dev-launcher --workspace     <hash>",
 ]
