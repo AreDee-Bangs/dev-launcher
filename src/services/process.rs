@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +22,88 @@ pub fn pid_file_path(slug: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/dev-launcher-{slug}.pids"))
 }
 
+/// Path of the detach marker file for a given slug.
+pub fn detached_marker_path(slug: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/dev-launcher-{slug}.detached"))
+}
+
+/// Write the detach marker so kill_orphaned_pids knows these PIDs are intentional.
+pub fn mark_detached(slug: &str) {
+    let _ = fs::write(detached_marker_path(slug), "");
+}
+
+/// Forcibly shut down a detached session: send SIGTERM to all recorded PIDs,
+/// wait up to 3 s, SIGKILL stragglers, then remove the PID file and marker.
+pub fn shutdown_detached_session(slug: &str) {
+    let path = pid_file_path(slug);
+    let pids: Vec<i32> = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    eprintln!("  [dev-launcher] Stopping detached session {slug}…");
+    for &pid in &pids {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    for &pid in &pids {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(detached_marker_path(slug));
+    eprintln!("  [dev-launcher] Session {slug} stopped.");
+}
+
+/// Running status of a workspace derived from its PID file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceRunStatus {
+    NotRunning,
+    Running,
+    Degraded,
+    Failed,
+}
+
+/// Check how many recorded PIDs are still alive and return a status.
+pub fn workspace_run_status(slug: &str) -> WorkspaceRunStatus {
+    let Ok(content) = fs::read_to_string(pid_file_path(slug)) else {
+        return WorkspaceRunStatus::NotRunning;
+    };
+    let pids: Vec<i32> = content
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    if pids.is_empty() {
+        return WorkspaceRunStatus::NotRunning;
+    }
+    let alive = pids
+        .iter()
+        .filter(|&&pid| unsafe { libc::kill(pid, 0) == 0 })
+        .count();
+    match alive {
+        0 => WorkspaceRunStatus::Failed,
+        n if n == pids.len() => WorkspaceRunStatus::Running,
+        _ => WorkspaceRunStatus::Degraded,
+    }
+}
+
+/// Count how many PIDs recorded in the session PID file are still alive.
+pub fn alive_pid_count(slug: &str) -> usize {
+    fs::read_to_string(pid_file_path(slug))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .filter(|&pid| unsafe { libc::kill(pid, 0) } == 0)
+        .count()
+}
+
 /// Kill any PIDs recorded in a leftover PID file from a crashed previous session.
+/// Skips killing if a detach marker exists and processes are still alive (intentional detach).
 pub fn kill_orphaned_pids(slug: &str) {
     let path = pid_file_path(slug);
     let Ok(content) = fs::read_to_string(&path) else {
@@ -34,6 +116,18 @@ pub fn kill_orphaned_pids(slug: &str) {
     if pids.is_empty() {
         return;
     }
+
+    let marker = detached_marker_path(slug);
+    if marker.exists() {
+        let any_alive = pids.iter().any(|&pid| unsafe { libc::kill(pid, 0) == 0 });
+        if any_alive {
+            // Intentionally detached — leave them running.
+            return;
+        }
+        // All dead — clean up the stale marker.
+        let _ = fs::remove_file(&marker);
+    }
+
     eprintln!("  [dev-launcher] Found orphaned PIDs from a previous session: {pids:?}");
     eprintln!("  [dev-launcher] Sending SIGTERM…");
     for &pid in &pids {
@@ -105,6 +199,13 @@ pub fn spawn_svc(
 ) -> io::Result<(Child, i32)> {
     use std::os::unix::process::CommandExt;
 
+    crate::launcher_log::log(&format!(
+        "[SPAWN] {} {} (cwd: {})",
+        program,
+        args.join(" "),
+        dir.display()
+    ));
+
     let log_out = open_log(log);
     let log_err = log_out.try_clone()?;
     let mut cmd = Command::new(program);
@@ -117,15 +218,114 @@ pub fn spawn_svc(
     cmd.process_group(0);
     let child = cmd.spawn()?;
     let pgid = child.id() as i32;
+    crate::launcher_log::log(&format!("[SPAWN]   pid={}", child.id()));
     Ok((child, pgid))
+}
+
+// ── Log rotation ─────────────────────────────────────────────────────────────
+
+/// Copy current log → .log.1 (shift older rotations up to 5), then truncate.
+///
+/// Child processes keep their O_APPEND fd open; after truncation the kernel
+/// appends from offset 0, so writes continue seamlessly without changing the fd.
+pub fn rotate_log(log_path: &Path) -> io::Result<()> {
+    const MAX_ROTATIONS: usize = 5;
+
+    for n in (1..MAX_ROTATIONS).rev() {
+        let src = PathBuf::from(format!("{}.{n}", log_path.display()));
+        let dst = PathBuf::from(format!("{}.{}", log_path.display(), n + 1));
+        if src.exists() {
+            let _ = fs::rename(&src, &dst);
+        }
+    }
+    let overflow = PathBuf::from(format!("{}.{}", log_path.display(), MAX_ROTATIONS + 1));
+    let _ = fs::remove_file(&overflow);
+
+    if log_path.exists() && log_path.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        let rotated = PathBuf::from(format!("{}.1", log_path.display()));
+        fs::copy(log_path, &rotated)?;
+    }
+
+    let _ = OpenOptions::new().write(true).truncate(true).open(log_path);
+    Ok(())
+}
+
+/// gzip-compress all rotated log files (*.log.N) in the session directory.
+/// Leaves *.log (current active files) uncompressed.
+pub fn compress_rotated_logs(logs_dir: &Path) {
+    let Ok(entries) = fs::read_dir(logs_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".gz") {
+            continue;
+        }
+        // Match *.log.<number>  e.g. copilot-worker.log.1
+        let mut parts = name.rsplitn(2, '.');
+        let ext = parts.next().unwrap_or("");
+        let stem = parts.next().unwrap_or("");
+        if ext.parse::<u32>().is_ok() && stem.contains(".log") {
+            let _ = Command::new("gzip").arg("-f").arg(&path).status();
+        }
+    }
 }
 
 // ── Health probe ──────────────────────────────────────────────────────────────
 
 pub fn probe(url: &str) -> bool {
+    if let Some(ok) = tcp_probe(url) {
+        return ok;
+    }
     match ureq::get(url).timeout(Duration::from_secs(2)).call() {
         Ok(r) => r.status() < 500,
         Err(ureq::Error::Status(code, _)) => code < 500,
         Err(_) => false,
     }
+}
+
+fn tcp_probe(url: &str) -> Option<bool> {
+    let after_scheme = url.split_once("://")?.1;
+    let (authority, path) = after_scheme
+        .split_once('/')
+        .map_or((after_scheme, ""), |(auth, path)| (auth, path));
+    if !path.is_empty() {
+        return None;
+    }
+
+    let mut saw_addr = false;
+    for addr in authority.to_socket_addrs().ok()? {
+        saw_addr = true;
+        if TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok() {
+            return Some(true);
+        }
+    }
+    if saw_addr {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+// ── Session worker PID helpers ────────────────────────────────────────────────
+
+pub fn worker_pid_path(slug: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/dev-launcher-{slug}.worker"))
+}
+
+pub fn write_worker_pid(slug: &str, pid: u32) {
+    let _ = fs::write(worker_pid_path(slug), pid.to_string());
+}
+
+pub fn read_worker_pid(slug: &str) -> Option<u32> {
+    fs::read_to_string(worker_pid_path(slug))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+pub fn remove_worker_pid(slug: &str) {
+    let _ = fs::remove_file(worker_pid_path(slug));
 }

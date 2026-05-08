@@ -1,0 +1,13 @@
+id       = "diag-invalid-pem"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = ["invalid pem"]
+
+title = "Invalid PEM certificate"
+body = [
+    "  CONNECTOR_LICENCE_KEY_PEM contains an invalid or malformed certificate.",
+    "  Paste the full PEM block (including -----BEGIN CERTIFICATE----- header).",
+    "  Press 'e' in the TUI to re-enter the licence key via the credentials wizard.",
+]

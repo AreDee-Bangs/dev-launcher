@@ -1,0 +1,19 @@
+id       = "diag-minio"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "minio: connection refused",
+    "connection refused to localhost:9000",
+    "connection refused to localhost:9002",
+]
+
+title = "MinIO / S3 is not reachable"
+body = [
+    "  MinIO (S3-compatible storage) is not accepting connections.",
+    "  Check the Docker container:",
+    "    docker ps -a | grep minio",
+    "    docker start <minio-container>",
+    "  Also verify S3_ENDPOINT / MINIO_ENDPOINT in your .env.",
+]

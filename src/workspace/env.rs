@@ -225,17 +225,55 @@ pub fn deploy_workspace_env(src: &Path, dest: &Path) {
     if let Some(parent) = dest.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::copy(src, dest);
+    // Values with \n escapes must be double-quoted so that python-dotenv expands
+    // them into actual newlines (required for PEM certificates, etc.).
+    let Ok(content) = fs::read_to_string(src) else {
+        let _ = fs::copy(src, dest);
+        return;
+    };
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            if v.contains("\\n") {
+                out_lines.push(format!("{}=\"{}\"", k.trim(), v));
+            } else {
+                out_lines.push(line.to_string());
+            }
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    let mut output = out_lines.join("\n");
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    let _ = fs::write(dest, output);
 }
 
 // ── Port helpers ──────────────────────────────────────────────────────────────
 
 /// Parse the port number out of a URL like "http://localhost:4000/health".
 pub fn extract_url_port(url: &str) -> Option<u16> {
-    let after_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let host_port = after_scheme.split('/').next()?;
+    let authority = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()?;
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let after_bracket = &rest[end + 1..];
+        let port = after_bracket.strip_prefix(':')?;
+        return port.parse().ok();
+    }
+
     let port_str = host_port.rsplit(':').next()?;
     port_str.parse().ok()
 }
@@ -360,6 +398,250 @@ pub fn preflight_port_checks(env_path: &Path, compose_file: &Path, checks: &[Por
     }
 }
 
+// ── Port offset application ───────────────────────────────────────────────────
+
+/// Legacy marker from the now-removed delta-based migration. We strip it on
+/// rewrite to keep env files clean.
+const LEGACY_OFFSET_MARKER: &str = "_DEVLAUNCHER_PORT_OFFSET";
+
+#[derive(Copy, Clone)]
+enum PortKind {
+    /// Plain integer port: `KEY=4000`.
+    Plain,
+    /// URL value with an embedded port: `KEY=redis://localhost:6379`. The
+    /// port portion is rewritten in place; the rest of the URL is preserved
+    /// (so e.g. credentials in `redis://:pw@host:6379` are kept).
+    Url,
+    /// URL value that should be injected when absent. Used for keys whose
+    /// service falls back to a JSON default (e.g. `APP__ELASTICSEARCH__URL`).
+    UrlInject(&'static str),
+}
+
+struct PortKey {
+    key: &'static str,
+    base_port: u16,
+    kind: PortKind,
+}
+
+const COPILOT_PORT_KEYS: &[PortKey] = &[
+    PortKey {
+        key: "DATABASE_URL",
+        base_port: 5432,
+        kind: PortKind::Url,
+    },
+    // Redis dev compose remaps 6379→6380, MinIO remaps 9000→9002, so the
+    // base-port-with-offset-zero is already the post-remap value.
+    PortKey {
+        key: "REDIS_URL",
+        base_port: 6380,
+        kind: PortKind::Url,
+    },
+    PortKey {
+        key: "S3_ENDPOINT",
+        base_port: 9002,
+        kind: PortKind::Url,
+    },
+    PortKey {
+        key: "INFINITY_URL",
+        base_port: 7997,
+        kind: PortKind::Url,
+    },
+    PortKey {
+        key: "DEFAULT_EMBEDDING_PROVIDER_BASE_URL",
+        base_port: 7997,
+        kind: PortKind::Url,
+    },
+    PortKey {
+        key: "AUTORESEARCH_URL",
+        base_port: 8400,
+        kind: PortKind::Url,
+    },
+    PortKey {
+        key: "BASE_URL",
+        base_port: 8100,
+        kind: PortKind::Url,
+    },
+    PortKey {
+        key: "FRONTEND_URL",
+        base_port: 3100,
+        kind: PortKind::Url,
+    },
+];
+
+const OPENCTI_PORT_KEYS: &[PortKey] = &[
+    PortKey {
+        key: "APP__PORT",
+        base_port: 4000,
+        kind: PortKind::Plain,
+    },
+    PortKey {
+        key: "APP__ELASTICSEARCH__URL",
+        base_port: 9200,
+        kind: PortKind::UrlInject("http://localhost"),
+    },
+    PortKey {
+        key: "APP__REDIS__PORT",
+        base_port: 6379,
+        kind: PortKind::Plain,
+    },
+    PortKey {
+        key: "APP__RABBITMQ__PORT",
+        base_port: 5672,
+        kind: PortKind::Plain,
+    },
+    PortKey {
+        key: "APP__MINIO__PORT",
+        base_port: 9000,
+        kind: PortKind::Plain,
+    },
+];
+
+const OPENAEV_PORT_KEYS: &[PortKey] = &[PortKey {
+    key: "SERVER_PORT",
+    base_port: 8080,
+    kind: PortKind::Plain,
+}];
+
+const CONNECTOR_PORT_KEYS: &[PortKey] = &[PortKey {
+    key: "OPENCTI_URL",
+    base_port: 4000,
+    kind: PortKind::Url,
+}];
+
+fn port_keys_for(product: &str) -> &'static [PortKey] {
+    match product {
+        "copilot" => COPILOT_PORT_KEYS,
+        "opencti" => OPENCTI_PORT_KEYS,
+        "openaev" => OPENAEV_PORT_KEYS,
+        "connector" => CONNECTOR_PORT_KEYS,
+        _ => &[],
+    }
+}
+
+/// Idempotently set every port-bearing key in the workspace `.env` to
+/// `base_port + port_offset`. Designed for the dynamic-offset model: each
+/// launch recomputes the offset from current host port availability, then
+/// rewrites the env from scratch — no marker, no migration, no delta logic.
+///
+/// For URL keys the existing value's port portion is replaced (preserving
+/// credentials, query strings, etc.). Absent URL keys with `UrlInject` get
+/// a freshly composed `{prefix}:{port}`. Plain-number keys are simply set.
+pub fn apply_port_offset_to_env(env_path: &Path, product: &str, port_offset: u16) {
+    if !env_path.exists() {
+        return;
+    }
+    let mut map = parse_env_file(env_path);
+    let mut changed = false;
+
+    for spec in port_keys_for(product) {
+        let target = spec.base_port.saturating_add(port_offset);
+        let new_val = match spec.kind {
+            PortKind::Plain => Some(target.to_string()),
+            PortKind::Url => match map.get(spec.key) {
+                Some(v) if !v.is_empty() => Some(replace_port_in_value(v, target)),
+                _ => None,
+            },
+            PortKind::UrlInject(prefix) => match map.get(spec.key) {
+                Some(v) if !v.is_empty() => Some(replace_port_in_value(v, target)),
+                _ => Some(format!("{prefix}:{target}")),
+            },
+        };
+        if let Some(v) = new_val {
+            if map.get(spec.key) != Some(&v) {
+                map.insert(spec.key.to_string(), v);
+                changed = true;
+            }
+        }
+    }
+
+    let had_marker = map.remove(LEGACY_OFFSET_MARKER).is_some();
+    if had_marker {
+        changed = true;
+    }
+
+    if changed {
+        write_env_file(env_path, &map);
+    }
+    if had_marker {
+        // write_env_file preserves the original line for keys not in `map`,
+        // which would leave the marker behind. Strip it explicitly.
+        strip_env_keys(env_path, &[LEGACY_OFFSET_MARKER]);
+    }
+}
+
+/// Remove every line in `path` whose key matches one of `keys`. Used to drop
+/// keys that are no longer managed (e.g. the legacy offset marker).
+fn strip_env_keys(path: &Path, keys: &[&str]) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let mut changed = false;
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            if let Some((k, _)) = trimmed.split_once('=') {
+                if keys.contains(&k.trim()) {
+                    changed = true;
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    if !changed {
+        return;
+    }
+    let mut out = kept.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let _ = fs::write(path, out);
+}
+
+/// All host-side base ports the workspace will try to bind for this product
+/// (compose mappings + app-level ports). Used by `find_free_port_offset`.
+pub fn base_ports_for(product: &str, compose_file: Option<&Path>) -> Vec<u16> {
+    let mut bases: Vec<u16> = Vec::new();
+    if let Some(path) = compose_file {
+        if path.exists() {
+            bases.extend(crate::services::compose_host_ports(path));
+        }
+    }
+    for spec in port_keys_for(product) {
+        bases.push(spec.base_port);
+    }
+    bases
+}
+
+/// Scan offsets in steps of 10 starting at 0 and return the smallest one for
+/// which every `base + offset` is currently free on the host. Returns 0 (and
+/// logs a warning) if no offset within 1000 works — at that point the user
+/// has bigger problems than this picker.
+pub fn find_free_port_offset(bases: &[u16]) -> u16 {
+    const STEP: u16 = 10;
+    const MAX: u16 = 1000;
+    let mut bases = bases.to_vec();
+    bases.sort();
+    bases.dedup();
+
+    let mut offset: u16 = 0;
+    while offset <= MAX {
+        if bases.iter().all(|b| is_port_free(b.saturating_add(offset))) {
+            return offset;
+        }
+        offset = offset.saturating_add(STEP);
+    }
+    eprintln!(
+        "  [dev-launcher] could not find a free port offset within +{MAX}; falling back to 0"
+    );
+    0
+}
+
+fn is_port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
 // ── Platform mode selector ────────────────────────────────────────────────────
 
 /// Interactive platform-mode selector shown when Copilot runs standalone (no OpenCTI).
@@ -397,7 +679,7 @@ pub fn run_platform_mode_selector(env_path: &Path, stopping: &Arc<AtomicBool>) {
     let block_lines = options.len() + 3;
 
     let render_raw = |cur: usize| {
-        print!("  {BOLD}Platform mode{R}  {DIM}↑↓  Enter to confirm  Esc to cancel{R}\r\n\r\n");
+        print!("  {BOLD}Platform mode{R}  {DIM}↑↓  Enter to confirm  Esc back to menu{R}\r\n\r\n");
         for (i, (val, name, desc)) in options.iter().enumerate() {
             let (arrow, name_fmt) = if i == cur {
                 (format!("{CYN}▸{R}"), format!("{BOLD}{CYN}{name}{R}"))
@@ -415,7 +697,7 @@ pub fn run_platform_mode_selector(env_path: &Path, stopping: &Arc<AtomicBool>) {
         let _ = io::stdout().flush();
     };
 
-    println!("  {BOLD}Platform mode{R}  {DIM}↑↓  Enter to confirm  Esc to cancel{R}");
+    println!("  {BOLD}Platform mode{R}  {DIM}↑↓  Enter to confirm  Esc back to menu{R}");
     println!();
     for (i, (val, name, desc)) in options.iter().enumerate() {
         let (arrow, name_fmt) = if i == cursor {
@@ -456,7 +738,10 @@ pub fn run_platform_mode_selector(env_path: &Path, stopping: &Arc<AtomicBool>) {
                     render_raw(cursor);
                 }
                 KeyCode::Enter => break true,
-                KeyCode::Esc => break false,
+                KeyCode::Esc => {
+                    let _ = disable_raw_mode();
+                    crate::tui::exit_to_selector_menu();
+                }
                 KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     stopping.store(true, Ordering::Relaxed);
                     break false;
@@ -474,8 +759,6 @@ pub fn run_platform_mode_selector(env_path: &Path, stopping: &Arc<AtomicBool>) {
         println!("  {GRN}✓{R}  PLATFORM_MODE → {BOLD}{selected}{R}  {DIM}({name}){R}");
         map.insert("PLATFORM_MODE".to_string(), selected.to_string());
         write_env_file(env_path, &map);
-    } else if !confirmed {
-        println!("  {DIM}Cancelled — keeping {current}{R}");
     } else {
         println!("  {DIM}Unchanged — {current}{R}");
     }
@@ -555,6 +838,32 @@ fn gen_password() -> String {
         .iter()
         .map(|b| CHARS[(b % CHARS.len() as u8) as usize] as char)
         .collect()
+}
+
+/// Generate a random 32-hex-char API token prefixed with `ar_`.
+/// Used to auto-provision AUTORESEARCH_API_KEY on first launch.
+pub fn gen_api_token() -> String {
+    let b = rand_bytes(16);
+    format!(
+        "ar_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\
+         {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15],
+    )
 }
 
 fn auto_generate_value(v: &EnvVar, prefs: &mut HashMap<String, String>) -> String {
@@ -638,7 +947,7 @@ fn read_value_tui(v: &EnvVar, step: usize, total: usize) -> Option<String> {
         ta.set_hard_tab_indent(false);
     }
 
-    let abort_hint = "  Esc / Ctrl+C  abort";
+    let abort_hint = "  Esc / Ctrl+C  back to menu";
     let footer_style = Style::default().fg(Color::DarkGray);
 
     loop {
@@ -810,11 +1119,10 @@ pub fn run_env_wizard(env_path: &Path, vars: &[EnvVar], service_label: &str) {
         let raw_value = match read_value_tui(v, step + 1, total) {
             None => {
                 crate::tui::ensure_cooked_output();
-                println!("  {YLW}Wizard aborted.{R}\n");
                 if changed {
                     write_env_file(env_path, &env);
                 }
-                return;
+                crate::tui::exit_to_selector_menu();
             }
             Some(s) => s,
         };
@@ -849,4 +1157,125 @@ pub fn run_env_wizard(env_path: &Path, vars: &[EnvVar], service_label: &str) {
         println!("  {YLW}Nothing changed.{R}");
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_port_offset_to_env, extract_url_port, find_free_port_offset, parse_env_file,
+        replace_port_in_value, write_env_file, LEGACY_OFFSET_MARKER,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn extracts_port_from_http_urls() {
+        assert_eq!(
+            extract_url_port("http://localhost:8500/api/health"),
+            Some(8500)
+        );
+        assert_eq!(extract_url_port("https://example.com:443/path"), Some(443));
+    }
+
+    #[test]
+    fn extracts_port_from_service_connection_strings() {
+        assert_eq!(
+            extract_url_port("postgresql+asyncpg://copilot:secret@localhost:5432/copilot"),
+            Some(5432)
+        );
+        assert_eq!(extract_url_port("redis://localhost:6380"), Some(6380));
+        assert_eq!(extract_url_port("localhost:9002"), Some(9002));
+    }
+
+    #[test]
+    fn replaces_port_in_service_connection_strings() {
+        assert_eq!(
+            replace_port_in_value(
+                "postgresql+asyncpg://copilot:secret@localhost:5432/copilot",
+                5832
+            ),
+            "postgresql+asyncpg://copilot:secret@localhost:5832/copilot"
+        );
+        assert_eq!(
+            replace_port_in_value("redis://localhost:6380", 6780),
+            "redis://localhost:6780"
+        );
+        assert_eq!(
+            replace_port_in_value("localhost:9002", 9402),
+            "localhost:9402"
+        );
+    }
+
+    #[test]
+    fn apply_port_offset_to_env_is_idempotent_and_strips_legacy_marker() {
+        // Mixed legacy state: some keys at +400, some stuck at default,
+        // plus the old `_DEVLAUNCHER_PORT_OFFSET` marker. After one apply
+        // every known port-bearing key is at base+offset and the marker is
+        // gone — no migration logic, no inference, just a clean rewrite.
+        let dir =
+            std::env::temp_dir().join(format!("devlauncher-idempotent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("copilot.env");
+
+        let mut map: HashMap<String, String> = HashMap::new();
+        map.insert(
+            "DATABASE_URL".to_string(),
+            "postgresql+asyncpg://copilot:secret@localhost:5832/copilot".to_string(),
+        );
+        map.insert(
+            "REDIS_URL".to_string(),
+            "redis://localhost:6380".to_string(),
+        );
+        map.insert("S3_ENDPOINT".to_string(), "localhost:9002".to_string());
+        map.insert("BASE_URL".to_string(), "http://localhost:8500".to_string());
+        map.insert(LEGACY_OFFSET_MARKER.to_string(), "400".to_string());
+        write_env_file(&path, &map);
+
+        apply_port_offset_to_env(&path, "copilot", 20);
+        let after = parse_env_file(&path);
+        assert_eq!(extract_url_port(&after["DATABASE_URL"]), Some(5452));
+        assert_eq!(extract_url_port(&after["REDIS_URL"]), Some(6400));
+        assert_eq!(extract_url_port(&after["S3_ENDPOINT"]), Some(9022));
+        assert_eq!(extract_url_port(&after["BASE_URL"]), Some(8120));
+        assert!(!after.contains_key(LEGACY_OFFSET_MARKER));
+
+        // Calling again with the same offset is a no-op.
+        let before_second = std::fs::read_to_string(&path).unwrap();
+        apply_port_offset_to_env(&path, "copilot", 20);
+        let after_second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before_second, after_second);
+
+        // Offset 0 brings everything back to the defaults.
+        apply_port_offset_to_env(&path, "copilot", 0);
+        let after_zero = parse_env_file(&path);
+        assert_eq!(extract_url_port(&after_zero["DATABASE_URL"]), Some(5432));
+        assert_eq!(extract_url_port(&after_zero["REDIS_URL"]), Some(6380));
+        assert_eq!(extract_url_port(&after_zero["S3_ENDPOINT"]), Some(9002));
+        assert_eq!(extract_url_port(&after_zero["BASE_URL"]), Some(8100));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_free_port_offset_picks_zero_when_bases_are_free() {
+        // Pick port numbers high enough that nothing ought to be bound on
+        // them in CI / dev machines.
+        let bases = vec![54000u16, 54001, 54002];
+        assert_eq!(find_free_port_offset(&bases), 0);
+    }
+
+    #[test]
+    fn find_free_port_offset_skips_offset_when_a_base_is_busy() {
+        use std::net::TcpListener;
+        // Bind one of the bases so offset 0 fails; offset 10 should succeed.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy_port = listener.local_addr().unwrap().port();
+        // Pick a base such that base + 10 is unlikely to collide. We use the
+        // busy port itself as the base: offset=0 collides, offset=10 is free
+        // (assuming nothing on busy_port+10).
+        let bases = vec![busy_port];
+        let offset = find_free_port_offset(&bases);
+        assert_ne!(offset, 0);
+        assert_eq!(offset % 10, 0);
+        drop(listener);
+    }
 }

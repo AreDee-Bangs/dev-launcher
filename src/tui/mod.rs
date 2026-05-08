@@ -2,6 +2,7 @@ pub mod credentials;
 pub mod diagnose;
 pub mod logview;
 pub mod overview;
+pub mod splash;
 
 pub use credentials::{build_credentials_lines, gather_credentials, CredEntry};
 pub use diagnose::build_diagnose_lines;
@@ -34,7 +35,12 @@ pub const RED: &str = "\x1b[31m";
 pub const CYN: &str = "\x1b[36m";
 
 // ── Build version ─────────────────────────────────────────────────────────────
-pub const BUILD_VERSION: &str = concat!("dev-launcher.", env!("BUILD_TIMESTAMP"));
+pub const BUILD_VERSION: &str = concat!(
+    "dev-launcher v",
+    env!("CARGO_PKG_VERSION"),
+    "-",
+    env!("GIT_SHA")
+);
 
 // ── Warm-gradient "Enter run fix" label ───────────────────────────────────────
 pub const ENTER_RUN_FIX: &str = concat!(
@@ -120,7 +126,13 @@ pub enum InputEvent {
     Diagnose,
     Report,
     Restart,
+    Stop,
+    FullRestart,
+    RotateLog,
     TogglePaths,
+    /// Leave the TUI and return to the workspace selector without stopping the stack.
+    Detach,
+    OpenInCode,
 }
 
 /// Translate a crossterm `KeyEvent` into our `InputEvent` vocabulary.
@@ -138,22 +150,46 @@ pub fn map_key_event(ke: KeyEvent) -> Option<InputEvent> {
         KeyCode::Char('e') => Some(InputEvent::Credentials),
         KeyCode::Char('d') => Some(InputEvent::Diagnose),
         KeyCode::Char('p') | KeyCode::Char('P') => Some(InputEvent::TogglePaths),
+        KeyCode::Char('r') if ke.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputEvent::FullRestart)
+        }
         KeyCode::Char('r') if !ke.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(InputEvent::Report)
         }
         KeyCode::Char('R') | KeyCode::Char('r') if ke.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(InputEvent::Restart)
         }
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(InputEvent::Stop),
+        KeyCode::Char('m') | KeyCode::Char('M') => Some(InputEvent::Detach),
+        KeyCode::Char('c') if !ke.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputEvent::RotateLog)
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => Some(InputEvent::OpenInCode),
         _ => None,
     }
 }
 
-pub fn spawn_input_thread(tx: mpsc::SyncSender<InputEvent>, stopping: Arc<AtomicBool>) {
+pub fn spawn_input_thread(
+    tx: mpsc::SyncSender<InputEvent>,
+    stopping: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+) {
     thread::spawn(move || loop {
         if stopping.load(Ordering::Relaxed) {
             return;
         }
+        // While paused, the main thread drives event::read() directly (inline
+        // confirm prompts). If we kept polling here, we'd race with it and
+        // about half the keypresses would land in the mpsc channel and get
+        // silently dropped — that's the "double-tap" bug.
+        if paused.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         if let Ok(true) = event::poll(Duration::from_millis(20)) {
+            if paused.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Ok(Event::Key(ke)) = event::read() {
                 if let Some(e) = map_key_event(ke) {
                     let _ = tx.try_send(e);
@@ -161,6 +197,31 @@ pub fn spawn_input_thread(tx: mpsc::SyncSender<InputEvent>, stopping: Arc<Atomic
             }
         }
     });
+}
+
+/// RAII guard that pauses the input thread for the lifetime of the guard so
+/// the holder can call `event::read()` directly without racing.
+pub struct InputPauseGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl InputPauseGuard {
+    pub fn new(flag: &Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        // Wait long enough for the input thread to observe the flag — its
+        // poll timeout is 20 ms, so 40 ms covers any in-flight read.
+        thread::sleep(Duration::from_millis(40));
+        drain_input_events();
+        Self {
+            flag: Arc::clone(flag),
+        }
+    }
+}
+
+impl Drop for InputPauseGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
+    }
 }
 
 // ── Render helpers ─────────────────────────────────────────────────────────────
@@ -223,6 +284,18 @@ pub enum TermStatus {
     Terminating,
     Stopped(i32),
     Killed,
+}
+
+/// Abort the current session worker and let the parent selector redraw the
+/// workspace menu. Restores cooked mode so the picker renders correctly, then
+/// exits with status 0 — `wait_for_session` treats that as a clean exit.
+pub fn exit_to_selector_menu() -> ! {
+    let _ = disable_raw_mode();
+    ensure_cooked_output();
+    print!("\x1b[H\x1b[2J");
+    println!("  {YLW}Wizard aborted — returning to workspace menu.{R}");
+    let _ = io::stdout().flush();
+    std::process::exit(0);
 }
 
 /// Restore terminal to cooked mode via direct tcsetattr.

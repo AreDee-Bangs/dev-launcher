@@ -1,0 +1,17 @@
+id       = "diag-postgres"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "could not connect to server: connection refused",
+    "connection refused to localhost:5432",
+]
+
+title = "PostgreSQL is not reachable"
+body = [
+    "  PostgreSQL is not accepting connections on port 5432.",
+    "  Check the Docker container:",
+    "    docker ps -a | grep postgres",
+    "    docker start <postgres-container>",
+]

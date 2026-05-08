@@ -1,0 +1,22 @@
+id      = "infinity-emb-click-typer-incompatible"
+health  = "crashed"
+service = "copilot-infinity"
+log_tail = 30
+
+[[match]]
+any_of = ["secondary flag is not valid"]
+
+title = "infinity-emb crashed: click/typer version incompatibility"
+body = [
+    "  Exit code : {exit_code}",
+    "  click >= 8.2 broke the typer 0.12 CLI bootstrap.",
+    "  Fix: downgrade click to < 8.2.",
+]
+
+[fix]
+label        = "Pin click<8.2 to fix typer incompatibility"
+restart_after = true
+
+[[fix.steps]]
+command = ["{pip}", "install", "click<8.2"]
+cwd     = "backend"

@@ -2,8 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use crate::services::docker::run_blocking;
-use crate::tui::{DIM, R, YLW};
+use serde::Deserialize;
+
+use crate::services::docker::{ensure_gitignore_entries, run_blocking};
+use crate::tui::{DIM, GRN, R, YLW};
 
 // ── Manifest data types ───────────────────────────────────────────────────────
 
@@ -34,6 +36,22 @@ pub enum BootstrapDef {
         command: Vec<String>,
         cwd: Option<String>,
     },
+    /// Keep a venv in sync with a requirements file.
+    /// Computes SHA-256 of `requirements`, compares to `.launcher-reqs-hash`
+    /// inside the venv directory, and runs `pip install -r <requirements>` when
+    /// the hash differs or the sentinel is missing.
+    SyncPip {
+        requirements: String,
+        pip: String,
+    },
+    /// Keep a yarn workspace in sync with its lockfile.
+    /// Computes SHA-256 of `yarn_lock`, compares to `.yarn/.launcher-yarn-hash`
+    /// inside the workspace directory, and runs `yarn install` when the hash
+    /// differs, is missing, or `.yarn/install-state.gz` doesn't exist.
+    SyncYarn {
+        yarn_lock: String,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Default)]
@@ -41,6 +59,9 @@ pub struct RepoManifest {
     pub docker: ManifestDocker,
     pub services: Vec<SvcDef>,
     pub bootstrap: Vec<BootstrapDef>,
+    /// Required Python major.minor (e.g. "3.13"). When set, the launcher
+    /// checks any venv Python binary against this before starting services.
+    pub python_version: Option<String>,
 }
 
 // ── Manifest loading ──────────────────────────────────────────────────────────
@@ -63,8 +84,150 @@ pub fn parse_compose_project_name(compose_file: &Path) -> Option<String> {
     None
 }
 
+// ── YAML serde structs (parse only) ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct YamlConf {
+    python: Option<YamlPython>,
+    docker: Option<YamlDocker>,
+    services: Option<Vec<YamlService>>,
+    bootstrap: Option<Vec<YamlBootstrap>>,
+}
+
+#[derive(Deserialize)]
+struct YamlPython {
+    version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct YamlDocker {
+    compose_dev: Option<String>,
+    project: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct YamlService {
+    name: String,
+    command: Option<String>,
+    cwd: Option<String>,
+    health: Option<String>,
+    timeout: Option<u64>,
+    requires_docker: Option<bool>,
+    log: Option<String>,
+    requires: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum YamlBootstrap {
+    Check {
+        check: String,
+        missing: String,
+    },
+    SyncPip {
+        requirements: String,
+        pip: String,
+    },
+    SyncYarn {
+        yarn_lock: String,
+        cwd: Option<String>,
+    },
+    RunIfMissing {
+        run_if_missing: String,
+        command: String,
+        cwd: Option<String>,
+    },
+}
+
+// ── Parse ─────────────────────────────────────────────────────────────────────
+
 pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
     let content = fs::read_to_string(path).ok()?;
+
+    // Detect old INI format by presence of [section] headers.
+    let is_ini = content.lines().any(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#') && t.starts_with('[') && t.ends_with(']')
+    });
+
+    if is_ini {
+        let manifest = parse_ini_content(&content)?;
+        let repo_name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("repo");
+        println!("  {YLW}Migrating .dev-launcher.conf to YAML format…{R}");
+        save_dev_launcher_conf(path, repo_name, &manifest);
+        return Some(manifest);
+    }
+
+    parse_yaml_content(&content)
+}
+
+fn parse_yaml_content(content: &str) -> Option<RepoManifest> {
+    let conf: YamlConf = serde_yaml::from_str(content).ok()?;
+
+    let docker = ManifestDocker {
+        compose_dev: conf.docker.as_ref().and_then(|d| d.compose_dev.clone()),
+        project: conf.docker.as_ref().and_then(|d| d.project.clone()),
+    };
+
+    let services = conf
+        .services
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| SvcDef {
+            name: s.name,
+            args: s
+                .command
+                .map(|c| c.split_whitespace().map(|t| t.to_string()).collect())
+                .unwrap_or_default(),
+            cwd: s.cwd.unwrap_or_default(),
+            health: s.health,
+            timeout_secs: s.timeout.unwrap_or(30),
+            requires_docker: s.requires_docker.unwrap_or(false),
+            log_name: s.log,
+            requires: s.requires.unwrap_or_default(),
+        })
+        .collect();
+
+    let bootstrap = conf
+        .bootstrap
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| match b {
+            YamlBootstrap::Check { check, missing } => BootstrapDef::Check {
+                path: check,
+                missing_hint: missing,
+            },
+            YamlBootstrap::SyncPip { requirements, pip } => {
+                BootstrapDef::SyncPip { requirements, pip }
+            }
+            YamlBootstrap::SyncYarn { yarn_lock, cwd } => BootstrapDef::SyncYarn { yarn_lock, cwd },
+            YamlBootstrap::RunIfMissing {
+                run_if_missing,
+                command,
+                cwd,
+            } => BootstrapDef::RunIfMissing {
+                check: run_if_missing,
+                command: command.split_whitespace().map(|t| t.to_string()).collect(),
+                cwd,
+            },
+        })
+        .collect();
+
+    Some(RepoManifest {
+        docker,
+        services,
+        bootstrap,
+        python_version: conf.python.and_then(|p| p.version),
+    })
+}
+
+/// Parse the legacy INI-style `.dev-launcher.conf` format.
+#[allow(unused_assignments)]
+fn parse_ini_content(content: &str) -> Option<RepoManifest> {
     let mut docker = ManifestDocker::default();
     let mut services: Vec<SvcDef> = Vec::new();
     let mut bootstrap: Vec<BootstrapDef> = Vec::new();
@@ -74,9 +237,11 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
         Docker,
         Service,
         Bootstrap,
+        Python,
     }
 
     let mut section = Section::None;
+    let mut python_version: Option<String> = None;
     let mut svc_name = String::new();
     let mut svc_args: Vec<String> = Vec::new();
     let mut svc_cwd = String::new();
@@ -90,49 +255,62 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
     let mut bs_run_if = String::new();
     let mut bs_command: Vec<String> = Vec::new();
     let mut bs_cwd: Option<String> = None;
+    let mut bs_requirements = String::new();
+    let mut bs_pip = String::new();
 
-    let flush_service = |name: &str,
-                         args: &Vec<String>,
-                         cwd: &str,
-                         health: &Option<String>,
-                         timeout: u64,
-                         req_docker: bool,
-                         log: &Option<String>,
-                         requires: &Vec<String>,
-                         svcs: &mut Vec<SvcDef>| {
-        if !name.is_empty() {
-            svcs.push(SvcDef {
-                name: name.to_string(),
-                args: args.clone(),
-                cwd: cwd.to_string(),
-                health: health.clone(),
-                timeout_secs: timeout,
-                requires_docker: req_docker,
-                log_name: log.clone(),
-                requires: requires.clone(),
-            });
-        }
-    };
+    macro_rules! flush_service {
+        () => {{
+            if !svc_name.is_empty() {
+                services.push(SvcDef {
+                    name: svc_name.clone(),
+                    args: svc_args.clone(),
+                    cwd: svc_cwd.clone(),
+                    health: svc_health.clone(),
+                    timeout_secs: svc_timeout,
+                    requires_docker: svc_req_docker,
+                    log_name: svc_log.clone(),
+                    requires: svc_requires.clone(),
+                });
+                svc_name = String::new();
+                svc_args = Vec::new();
+                svc_cwd = String::new();
+                svc_health = None;
+                svc_timeout = 30;
+                svc_req_docker = false;
+                svc_log = None;
+                svc_requires = Vec::new();
+            }
+        }};
+    }
 
-    let flush_bootstrap = |check: &str,
-                           missing: &str,
-                           run_if: &str,
-                           command: &Vec<String>,
-                           cwd: &Option<String>,
-                           bootstrap: &mut Vec<BootstrapDef>| {
-        if !check.is_empty() && !missing.is_empty() {
-            bootstrap.push(BootstrapDef::Check {
-                path: check.to_string(),
-                missing_hint: missing.to_string(),
-            });
-        } else if !run_if.is_empty() && !command.is_empty() {
-            bootstrap.push(BootstrapDef::RunIfMissing {
-                check: run_if.to_string(),
-                command: command.clone(),
-                cwd: cwd.clone(),
-            });
-        }
-    };
+    macro_rules! flush_bootstrap {
+        () => {{
+            if !bs_check.is_empty() && !bs_missing.is_empty() {
+                bootstrap.push(BootstrapDef::Check {
+                    path: bs_check.clone(),
+                    missing_hint: bs_missing.clone(),
+                });
+            } else if !bs_run_if.is_empty() && !bs_command.is_empty() {
+                bootstrap.push(BootstrapDef::RunIfMissing {
+                    check: bs_run_if.clone(),
+                    command: bs_command.clone(),
+                    cwd: bs_cwd.clone(),
+                });
+            } else if !bs_requirements.is_empty() && !bs_pip.is_empty() {
+                bootstrap.push(BootstrapDef::SyncPip {
+                    requirements: bs_requirements.clone(),
+                    pip: bs_pip.clone(),
+                });
+            }
+            bs_check = String::new();
+            bs_missing = String::new();
+            bs_run_if = String::new();
+            bs_command = Vec::new();
+            bs_cwd = None;
+            bs_requirements = String::new();
+            bs_pip = String::new();
+        }};
+    }
 
     for raw in content.lines() {
         let line = raw.trim();
@@ -141,64 +319,31 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
         }
 
         if line.starts_with('[') && line.ends_with(']') {
-            match &section {
-                Section::Service => {
-                    flush_service(
-                        &svc_name,
-                        &svc_args,
-                        &svc_cwd,
-                        &svc_health,
-                        svc_timeout,
-                        svc_req_docker,
-                        &svc_log,
-                        &svc_requires,
-                        &mut services,
-                    );
-                    svc_name = String::new();
-                    svc_args = Vec::new();
-                    svc_cwd = String::new();
-                    svc_health = None;
-                    svc_timeout = 30;
-                    svc_req_docker = false;
-                    svc_log = None;
-                    svc_requires = Vec::new();
-                }
-                Section::Bootstrap => {
-                    flush_bootstrap(
-                        &bs_check,
-                        &bs_missing,
-                        &bs_run_if,
-                        &bs_command,
-                        &bs_cwd,
-                        &mut bootstrap,
-                    );
-                    bs_check = String::new();
-                    bs_missing = String::new();
-                    bs_run_if = String::new();
-                    bs_command = Vec::new();
-                    bs_cwd = None;
-                }
+            match section {
+                Section::Service => flush_service!(),
+                Section::Bootstrap => flush_bootstrap!(),
                 _ => {}
             }
-
             let inner = line[1..line.len() - 1].trim();
-            if inner == "docker" {
-                section = Section::Docker;
+            section = if inner == "docker" {
+                Section::Docker
             } else if inner == "bootstrap" {
-                section = Section::Bootstrap;
+                Section::Bootstrap
+            } else if inner == "python" {
+                Section::Python
             } else if let Some(rest) = inner.strip_prefix("service ") {
                 svc_name = rest.trim().to_string();
-                section = Section::Service;
+                Section::Service
             } else {
-                section = Section::None;
-            }
+                Section::None
+            };
             continue;
         }
 
         if let Some((k, v)) = line.split_once('=') {
             let k = k.trim();
             let v = v.trim().to_string();
-            match &section {
+            match section {
                 Section::Docker => match k {
                     "compose_dev" => docker.compose_dev = Some(v),
                     "project" => docker.project = Some(v),
@@ -224,37 +369,21 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
                     "run_if_missing" => bs_run_if = v,
                     "command" => bs_command = v.split_whitespace().map(|s| s.to_string()).collect(),
                     "cwd" => bs_cwd = if v.is_empty() { None } else { Some(v) },
+                    "requirements" => bs_requirements = v,
+                    "pip" => bs_pip = v,
                     _ => {}
                 },
+                Section::Python if k == "version" => {
+                    python_version = if v.is_empty() { None } else { Some(v) };
+                }
                 _ => {}
             }
         }
     }
 
-    match &section {
-        Section::Service => {
-            flush_service(
-                &svc_name,
-                &svc_args,
-                &svc_cwd,
-                &svc_health,
-                svc_timeout,
-                svc_req_docker,
-                &svc_log,
-                &svc_requires,
-                &mut services,
-            );
-        }
-        Section::Bootstrap => {
-            flush_bootstrap(
-                &bs_check,
-                &bs_missing,
-                &bs_run_if,
-                &bs_command,
-                &bs_cwd,
-                &mut bootstrap,
-            );
-        }
+    match section {
+        Section::Service => flush_service!(),
+        Section::Bootstrap => flush_bootstrap!(),
         _ => {}
     }
 
@@ -262,6 +391,7 @@ pub fn parse_dev_launcher_conf(path: &Path) -> Option<RepoManifest> {
         docker,
         services,
         bootstrap,
+        python_version,
     })
 }
 
@@ -325,6 +455,14 @@ pub fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
             path: "backend/.venv/bin/python".to_string(),
             missing_hint: "Run ./dev.sh once to create the Python venv".to_string(),
         });
+        // Keep the venv in sync with requirements.txt automatically.
+        let reqs = backend_dir.join("requirements.txt");
+        if reqs.exists() {
+            bootstrap.push(BootstrapDef::SyncPip {
+                requirements: "backend/requirements.txt".to_string(),
+                pip: "backend/.venv/bin/pip".to_string(),
+            });
+        }
         let _ = python;
     }
 
@@ -340,77 +478,190 @@ pub fn infer_repo_manifest(repo_dir: &Path) -> RepoManifest {
             log_name: None,
             requires: Vec::new(),
         });
-        bootstrap.push(BootstrapDef::RunIfMissing {
-            check: "frontend/node_modules".to_string(),
-            command: vec!["yarn".to_string(), "install".to_string()],
-            cwd: Some("frontend".to_string()),
-        });
+        let yarn_lock = frontend_dir.join("yarn.lock");
+        if yarn_lock.exists() {
+            bootstrap.push(BootstrapDef::SyncYarn {
+                yarn_lock: "frontend/yarn.lock".to_string(),
+                cwd: Some("frontend".to_string()),
+            });
+        } else {
+            bootstrap.push(BootstrapDef::RunIfMissing {
+                check: "frontend/node_modules".to_string(),
+                command: vec!["yarn".to_string(), "install".to_string()],
+                cwd: Some("frontend".to_string()),
+            });
+        }
     }
 
     RepoManifest {
         docker,
         services,
         bootstrap,
+        python_version: detect_python_version(repo_dir),
+    }
+}
+
+/// Detect the required Python major.minor for a repo by inspecting:
+/// 1. `.python-version` file (pyenv / mise convention)
+/// 2. `backend/pyproject.toml` — `requires-python` or ruff `target-version`
+fn detect_python_version(repo_dir: &Path) -> Option<String> {
+    // .python-version: first line is e.g. "3.13.2" or "3.13"
+    if let Ok(content) = fs::read_to_string(repo_dir.join(".python-version")) {
+        let line = content.lines().next().unwrap_or("").trim().to_string();
+        if !line.is_empty() {
+            return Some(major_minor(&line));
+        }
+    }
+    // backend/pyproject.toml
+    let ppt = repo_dir.join("backend/pyproject.toml");
+    if let Ok(content) = fs::read_to_string(&ppt) {
+        for line in content.lines() {
+            let t = line.trim();
+            // requires-python = ">=3.13" or "==3.13.*"
+            if let Some(rest) = t.strip_prefix("requires-python") {
+                let v = rest.trim_start_matches([' ', '=', '"', '\'', '>', '<', '~', '^', '!']);
+                let v = v.trim_matches(['"', '\'', ' ']);
+                if !v.is_empty() {
+                    return Some(major_minor(v));
+                }
+            }
+            // ruff target-version = "py313"
+            if let Some(rest) = t.strip_prefix("target-version") {
+                let v = rest
+                    .trim_start_matches([' ', '=', '"', '\''])
+                    .trim_matches(['"', '\'', ' ']);
+                if let Some(pyver) = v.strip_prefix("py") {
+                    if pyver.len() >= 3 {
+                        let (major, minor) = pyver.split_at(1);
+                        return Some(format!("{}.{}", major, minor));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn major_minor(v: &str) -> String {
+    let parts: Vec<&str> = v.splitn(3, '.').collect();
+    match parts.as_slice() {
+        [major, minor, ..] => format!("{}.{}", major, minor),
+        [major] => major.to_string(),
+        _ => v.to_string(),
     }
 }
 
 pub fn save_dev_launcher_conf(conf_path: &Path, repo_name: &str, manifest: &RepoManifest) {
-    let mut out = format!("# {} — dev-launcher launcher configuration\n", repo_name);
-    out.push_str("# Auto-generated. Edit to customize. Re-run dev-launcher to apply changes.\n\n");
+    let mut out = format!("# {} — dev-launcher configuration\n", repo_name);
+    out.push_str("# Auto-generated. Edit to customise. Re-run dev-launcher to apply changes.\n\n");
 
-    out.push_str("[docker]\n");
-    if let Some(ref cd) = manifest.docker.compose_dev {
-        out.push_str(&format!("compose_dev = {}\n", cd));
+    if let Some(ref v) = manifest.python_version {
+        out.push_str("python:\n");
+        out.push_str(&format!("  version: {}\n\n", ys(v)));
     }
-    if let Some(ref p) = manifest.docker.project {
-        out.push_str(&format!("project     = {}\n", p));
-    }
-    out.push('\n');
 
-    for svc in &manifest.services {
-        out.push_str(&format!("[service {}]\n", svc.name));
-        if !svc.args.is_empty() {
-            out.push_str(&format!("command         = {}\n", svc.args.join(" ")));
+    if manifest.docker.compose_dev.is_some() || manifest.docker.project.is_some() {
+        out.push_str("docker:\n");
+        if let Some(ref cd) = manifest.docker.compose_dev {
+            out.push_str(&format!("  compose_dev: {}\n", ys(cd)));
         }
-        if !svc.cwd.is_empty() {
-            out.push_str(&format!("cwd             = {}\n", svc.cwd));
-        }
-        if let Some(ref h) = svc.health {
-            out.push_str(&format!("health          = {}\n", h));
-        }
-        out.push_str(&format!("timeout         = {}\n", svc.timeout_secs));
-        if svc.requires_docker {
-            out.push_str("requires_docker = true\n");
-        }
-        if let Some(ref l) = svc.log_name {
-            out.push_str(&format!("log             = {}\n", l));
+        if let Some(ref p) = manifest.docker.project {
+            out.push_str(&format!("  project: {}\n", ys(p)));
         }
         out.push('\n');
     }
 
-    for step in &manifest.bootstrap {
-        out.push_str("[bootstrap]\n");
-        match step {
-            BootstrapDef::Check { path, missing_hint } => {
-                out.push_str(&format!("check   = {}\n", path));
-                out.push_str(&format!("missing = {}\n", missing_hint));
+    if !manifest.services.is_empty() {
+        out.push_str("services:\n");
+        for svc in &manifest.services {
+            out.push_str(&format!("  - name: {}\n", ys(&svc.name)));
+            if !svc.args.is_empty() {
+                out.push_str(&format!("    command: {}\n", ys(&svc.args.join(" "))));
             }
-            BootstrapDef::RunIfMissing {
-                check,
-                command,
-                cwd,
-            } => {
-                out.push_str(&format!("run_if_missing = {}\n", check));
-                out.push_str(&format!("command        = {}\n", command.join(" ")));
-                if let Some(ref c) = cwd {
-                    out.push_str(&format!("cwd            = {}\n", c));
+            if !svc.cwd.is_empty() {
+                out.push_str(&format!("    cwd: {}\n", ys(&svc.cwd)));
+            }
+            if let Some(ref h) = svc.health {
+                out.push_str(&format!("    health: {}\n", ys(h)));
+            }
+            out.push_str(&format!("    timeout: {}\n", svc.timeout_secs));
+            if svc.requires_docker {
+                out.push_str("    requires_docker: true\n");
+            }
+            if let Some(ref l) = svc.log_name {
+                out.push_str(&format!("    log: {}\n", ys(l)));
+            }
+            if !svc.requires.is_empty() {
+                out.push_str("    requires:\n");
+                for r in &svc.requires {
+                    out.push_str(&format!("      - {}\n", ys(r)));
                 }
             }
         }
         out.push('\n');
     }
 
-    let _ = fs::write(conf_path, out);
+    if !manifest.bootstrap.is_empty() {
+        out.push_str("bootstrap:\n");
+        for step in &manifest.bootstrap {
+            match step {
+                BootstrapDef::Check { path, missing_hint } => {
+                    out.push_str(&format!("  - check: {}\n", ys(path)));
+                    out.push_str(&format!("    missing: {}\n", ys(missing_hint)));
+                }
+                BootstrapDef::RunIfMissing {
+                    check,
+                    command,
+                    cwd,
+                } => {
+                    out.push_str(&format!("  - run_if_missing: {}\n", ys(check)));
+                    out.push_str(&format!("    command: {}\n", ys(&command.join(" "))));
+                    if let Some(ref c) = cwd {
+                        out.push_str(&format!("    cwd: {}\n", ys(c)));
+                    }
+                }
+                BootstrapDef::SyncPip { requirements, pip } => {
+                    out.push_str(&format!("  - requirements: {}\n", ys(requirements)));
+                    out.push_str(&format!("    pip: {}\n", ys(pip)));
+                }
+                BootstrapDef::SyncYarn { yarn_lock, cwd } => {
+                    out.push_str(&format!("  - yarn_lock: {}\n", ys(yarn_lock)));
+                    if let Some(ref c) = cwd {
+                        out.push_str(&format!("    cwd: {}\n", ys(c)));
+                    }
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    let _ = fs::write(conf_path, &out);
+    if let Some(repo_dir) = conf_path.parent() {
+        ensure_gitignore_entries(repo_dir, &[".dev-launcher.conf"]);
+    }
+}
+
+/// Quote a YAML scalar value when it contains characters that could be
+/// misinterpreted by a YAML parser (colons, hashes, brackets, etc.) or
+/// that look like a YAML keyword / bare number.
+fn ys(s: &str) -> String {
+    let needs_quoting = s.is_empty()
+        || s.contains(": ")
+        || s.starts_with('[')
+        || s.starts_with('{')
+        || s.starts_with('*')
+        || s.starts_with('&')
+        || s.starts_with('!')
+        || s.starts_with('"')
+        || s.starts_with('\'')
+        || s.starts_with('#')
+        || matches!(s, "true" | "false" | "null" | "yes" | "no")
+        || s.parse::<f64>().is_ok();
+    if needs_quoting {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
 }
 
 pub fn load_repo_manifest(repo_dir: &Path, repo_name: &str) -> RepoManifest {
@@ -452,14 +703,83 @@ pub fn patch_manifest_ports(manifest: &mut RepoManifest, backend_port: u16, fron
     }
 }
 
+/// Compute a simple SHA-256 hex digest of a file's contents.
+fn file_sha256(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    // FNV-1a — stable across Rust versions, collision-resistant enough for
+    // drift detection (not cryptographic, but sufficient here).
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in &data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(format!("{:016x}-{}", hash, data.len()))
+}
+
+/// Run `python --version` and return the major.minor string (e.g. "3.14").
+fn venv_python_version(python_bin: &Path) -> Option<String> {
+    let out = Command::new(python_bin).arg("--version").output().ok()?;
+    // output is on stdout for Python 3, e.g. "Python 3.14.2\n"
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let version_str = raw.trim().strip_prefix("Python ")?;
+    Some(major_minor(version_str))
+}
+
 pub fn run_manifest_bootstrap(repo_dir: &Path, manifest: &RepoManifest) -> bool {
     let mut ok = true;
     for step in &manifest.bootstrap {
         match step {
             BootstrapDef::Check { path, missing_hint } => {
-                if !repo_dir.join(path).exists() {
+                let full = repo_dir.join(path);
+                if !full.exists() {
+                    // Auto-create a Python venv rather than failing with a hint.
+                    if path.contains(".venv") && path.contains("python") {
+                        // Derive .venv dir and its parent (the backend cwd) from the path.
+                        // e.g. "backend/.venv/bin/python" → cwd=backend, venv=.venv
+                        let venv_dir = full
+                            .parent() // bin/
+                            .and_then(|p| p.parent()); // .venv/
+                        let work_dir = venv_dir
+                            .and_then(|v| v.parent()) // backend/
+                            .unwrap_or(repo_dir);
+                        let venv_name = venv_dir
+                            .and_then(|v| v.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(".venv");
+                        // Prefer a versioned python binary if the manifest specifies one.
+                        let python_cmd = manifest
+                            .python_version
+                            .as_deref()
+                            .map(|v| format!("python{v}"))
+                            .unwrap_or_else(|| "python3".to_string());
+                        println!("  {DIM}Creating Python venv ({venv_name}) with {python_cmd}…{R}");
+                        let code = run_blocking(&python_cmd, &["-m", "venv", venv_name], work_dir);
+                        if code != 0 {
+                            println!("  {YLW}⚠{R}  Could not auto-create venv (exit {code})");
+                            println!("  {DIM}    {missing_hint}{R}");
+                            ok = false;
+                        }
+                        continue;
+                    }
                     println!("  {YLW}⚠{R}  {missing_hint}");
                     ok = false;
+                    continue;
+                }
+                // If this is a Python binary and a required version is set, verify it.
+                if let Some(ref required) = manifest.python_version {
+                    if path.contains("python") {
+                        if let Some(actual) = venv_python_version(&full) {
+                            if !actual.starts_with(required.as_str()) {
+                                println!(
+                                    "  {YLW}⚠{R}  venv uses Python {actual} but Python {required} is required"
+                                );
+                                println!(
+                                    "  {DIM}    → delete {path} directory and re-run ./dev.sh{R}"
+                                );
+                                ok = false;
+                            }
+                        }
+                    }
                 }
             }
             BootstrapDef::RunIfMissing {
@@ -475,6 +795,72 @@ pub fn run_manifest_bootstrap(repo_dir: &Path, manifest: &RepoManifest) -> bool 
                     if let Some((prog, args)) = command.split_first() {
                         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                         run_blocking(prog, &args_ref, &work_dir);
+                    }
+                }
+            }
+            BootstrapDef::SyncPip { requirements, pip } => {
+                let reqs_path = repo_dir.join(requirements);
+                let pip_path = repo_dir.join(pip);
+                if !reqs_path.exists() || !pip_path.exists() {
+                    continue;
+                }
+                // Sentinel lives inside the venv directory alongside the pip binary.
+                let sentinel = pip_path
+                    .parent()
+                    .map(|p| p.join(".launcher-reqs-hash"))
+                    .unwrap_or_else(|| repo_dir.join(".launcher-reqs-hash"));
+
+                let current_hash = file_sha256(&reqs_path);
+                let stored_hash = fs::read_to_string(&sentinel).ok();
+
+                if current_hash.as_deref() != stored_hash.as_deref() {
+                    println!("  {DIM}requirements.txt changed — running pip install…{R}");
+                    let pip_str = pip_path.to_string_lossy().into_owned();
+                    let reqs_str = reqs_path.to_string_lossy().into_owned();
+                    let code =
+                        run_blocking(&pip_str, &["install", "-q", "-r", &reqs_str], repo_dir);
+                    if code == 0 {
+                        if let Some(ref h) = current_hash {
+                            let _ = fs::write(&sentinel, h);
+                        }
+                        println!("  {GRN}✓{R}  pip install done");
+                    } else {
+                        println!("  {YLW}⚠{R}  pip install failed (exit {code})");
+                        ok = false;
+                    }
+                }
+            }
+            BootstrapDef::SyncYarn { yarn_lock, cwd } => {
+                let lock_path = repo_dir.join(yarn_lock);
+                if !lock_path.exists() {
+                    continue;
+                }
+                let work_dir = cwd
+                    .as_deref()
+                    .map(|c| repo_dir.join(c))
+                    .unwrap_or_else(|| repo_dir.to_owned());
+                // Sentinel lives in .yarn/ alongside install-state.gz.
+                let sentinel = work_dir.join(".yarn/.launcher-yarn-hash");
+                let install_state = work_dir.join(".yarn/install-state.gz");
+
+                let current_hash = file_sha256(&lock_path);
+                let stored_hash = fs::read_to_string(&sentinel).ok();
+
+                let needs_install =
+                    !install_state.exists() || current_hash.as_deref() != stored_hash.as_deref();
+
+                if needs_install {
+                    println!("  {DIM}yarn.lock changed — running yarn install…{R}");
+                    let code = run_blocking("yarn", &["install"], &work_dir);
+                    if code == 0 {
+                        if let Some(ref h) = current_hash {
+                            let _ = fs::create_dir_all(sentinel.parent().unwrap_or(&work_dir));
+                            let _ = fs::write(&sentinel, h);
+                        }
+                        println!("  {GRN}✓{R}  yarn install done");
+                    } else {
+                        println!("  {YLW}⚠{R}  yarn install failed (exit {code})");
+                        ok = false;
                     }
                 }
             }

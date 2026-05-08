@@ -1,6 +1,52 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Manipulate or inspect saved/running workspaces without entering the TUI.
+    Workspace(WorkspaceCommand),
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct WorkspaceCommand {
+    #[command(subcommand)]
+    pub action: WorkspaceAction,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorkspaceAction {
+    /// List known workspaces with their current runtime status.
+    List {
+        /// Emit JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one workspace, including live service state when a session is running.
+    Status {
+        /// Workspace hash (8 chars).
+        hash: String,
+        /// Emit JSON instead of the human-readable view.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a running workspace session.
+    Stop {
+        /// Workspace hash (8 chars).
+        hash: String,
+    },
+    /// Restart a running workspace, or a single service within it.
+    Restart {
+        /// Workspace hash (8 chars).
+        hash: String,
+        /// Restart one named service, e.g. copilot-backend.
+        #[arg(long, conflicts_with = "all")]
+        service: Option<String>,
+        /// Restart the full workspace stack.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+}
 
 #[derive(Parser)]
 #[command(
@@ -10,6 +56,10 @@ use clap::Parser;
     version
 )]
 pub struct Args {
+    /// Non-interactive workspace control commands.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     // ── Workspace shortcuts ───────────────────────────────────────────────────
     /// Open an existing workspace by its 8-char hash ID (shown in the workspace list).
     #[arg(long)]
@@ -83,4 +133,13 @@ pub struct Args {
     /// Same effect as setting FILIGRAN_WORKSPACE_ROOT.
     #[arg(long)]
     pub workspace_root: Option<PathBuf>,
+
+    // ── Internal subprocess flags (not shown in --help) ───────────────────────
+    /// [internal] This process is a session worker — skip the workspace selector.
+    #[arg(long, hide = true)]
+    pub session_worker: bool,
+
+    /// [internal] Force a clean start for this session (wipe Docker volumes etc.).
+    #[arg(long, hide = true)]
+    pub clean_start: bool,
 }

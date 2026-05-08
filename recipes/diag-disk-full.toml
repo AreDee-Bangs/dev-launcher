@@ -1,0 +1,15 @@
+id       = "diag-disk-full"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = ["no space left on device"]
+
+title = "Disk full"
+body = [
+    "  The filesystem has no space left.",
+    "  Free up disk space before restarting:",
+    "    df -h                          # check usage",
+    "    docker system prune -a         # remove unused Docker images/volumes",
+    "    du -sh ~/.dev-launcher/logs/   # check log size",
+]

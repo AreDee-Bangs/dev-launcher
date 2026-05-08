@@ -2,13 +2,48 @@
 
 `dev-launcher` is a multi-product stack launcher that creates and manages git worktrees for
 cross-product feature development (Filigran Copilot, OpenCTI, OpenAEV, and the ImportDoc
-connector). It can be run interactively or driven entirely by flags.
+connector). It can be run interactively, driven entirely by flags, or used as a non-interactive
+workspace control CLI for already-saved sessions.
 
 ## Synopsis
 
-```
+```sh
 dev-launcher [OPTIONS]
+dev-launcher workspace <SUBCOMMAND>
 ```
+
+## Workspace Control Commands
+
+These commands let you inspect or manipulate a saved workspace without entering the TUI.
+They are meant to work against a running session worker when one exists.
+
+```sh
+dev-launcher workspace list [--json]
+dev-launcher workspace status <HASH> [--json]
+dev-launcher workspace stop <HASH>
+dev-launcher workspace restart <HASH> [--service <NAME> | --all]
+```
+
+### Subcommands
+
+| Command | Description |
+|------|-------------|
+| `workspace list` | Lists saved workspaces with their runtime state (`running`, `detached`, `not_running`, `failed`, `degraded`). |
+| `workspace status <HASH>` | Shows one workspace in detail, including live service snapshot data when a session worker is publishing runtime state. |
+| `workspace stop <HASH>` | Stops a running workspace session. |
+| `workspace restart <HASH>` | Restarts the full running workspace session. |
+| `workspace restart <HASH> --service <NAME>` | Restarts one named service inside the running workspace. |
+
+### JSON Output
+
+Both `workspace list` and `workspace status` support `--json` for tool-friendly output.
+
+### Runtime Notes
+
+- `workspace restart` requires a running session worker.
+- `workspace stop` and `workspace restart` both work against attached and detached
+  sessions. A detached worker is briefly resumed via `SIGCONT` to handle the
+  request and then re-suspends itself, so the session stays detached.
 
 ## Workspace Shortcuts
 
@@ -63,6 +98,17 @@ These flags affect the current run only and are not persisted to the workspace c
 | `--no-openaev-front` | Skip the OpenAEV React frontend. Only has effect when OpenAEV is included in the workspace. |
 | `--logs-dir <PATH>` | Override the log directory. Each service writes a `.log` file there. Default: `/tmp/dev-launcher-logs/{workspace-hash}/`. |
 
+## Port Offset (dynamic)
+
+Each launch picks a port offset by scanning the host for free ports in steps
+of 10 (offset 0, 10, 20, …) and using the smallest one for which every base
+port the workspace needs is free. Nothing is persisted between launches, so
+running a single stack on a clean machine always lands on offset 0.
+
+The chosen offset shows up in `workspace status` / `workspace list` (as
+`+N`) once a session is running. Stopped workspaces display `-` because the
+offset is decided at launch time, not stored.
+
 ## Root Configuration
 
 | Flag | Argument | Description |
@@ -111,6 +157,24 @@ dev-launcher --no-opencti-front --no-openaev-front
 
 # Custom log directory
 dev-launcher --logs-dir /var/log/dev-launcher
+
+# List every saved workspace and its current runtime state
+dev-launcher workspace list
+
+# Same data in JSON
+dev-launcher workspace list --json
+
+# Inspect one running workspace
+dev-launcher workspace status 4850ae85
+
+# Restart one service inside a running workspace
+dev-launcher workspace restart 4850ae85 --service copilot-backend
+
+# Restart the full running workspace
+dev-launcher workspace restart 4850ae85 --all
+
+# Stop a running workspace
+dev-launcher workspace stop 4850ae85
 ```
 
 ## Exit Codes

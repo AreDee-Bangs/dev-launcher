@@ -1,0 +1,18 @@
+id       = "diag-port-conflict"
+health   = "any"
+log_tail = 50
+
+[[match]]
+any_of = [
+    "address already in use",
+    "eaddrinuse",
+]
+
+title = "Port conflict — another process is using this port"
+body = [
+    "  A required port is already bound by another process.",
+    "  Find the conflicting process:",
+    "    lsof -i :<port>",
+    "    kill -9 <PID>",
+    "  Or change the port in your .env file.",
+]
